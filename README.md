@@ -1,39 +1,10 @@
 # CommanderGuard
 
-在 macOS 菜单栏里查看 Desktop Commander 正在电脑上做什么。
+CommanderGuard 是 macOS 菜单栏里的 Desktop Commander 状态工具。它显示本机收到的命令、文件操作和单次调用耗时，也会用实际的远程 `ping` 检查命令通道。设备列表显示“在线”，不等于命令一定能到达这台 Mac；菜单会把这两种状态分开。
 
-把任务交给 ChatGPT 后，你可以继续做自己的事。CommanderGuard 会显示本机正在执行的命令或文件操作，以及这次工具调用已经用了多久。点开执行日志，就能回看每一步的动作和耗时。
+## 安装与更新
 
-它适合已经通过 Desktop Commander 远程操作 Mac、希望随时看一眼执行情况的人。当前版本针对本机 Remote Desktop Commander 服务和日志路径编写。
-
-## 与 Desktop Commander 的关系
-
-[Remote Desktop Commander](https://github.com/desktop-commander/remote-desktop-commander) 是 Desktop Commander 的官方远程 MCP 服务，让 ChatGPT 等客户端能够连接你的电脑并调用本机工具。底层工具项目是 [DesktopCommanderMCP](https://github.com/wonderwhy-er/DesktopCommanderMCP)，提供终端执行、文件搜索和编辑等能力。
-
-CommanderGuard 是单独运行的观察工具。Desktop Commander 负责接收和执行操作，CommanderGuard 读取已有日志并把执行情况显示在菜单栏里。安装本项目需要先有可用的 Remote Desktop Commander；安装脚本不会替你安装、登录、修改或重启它。
-
-## 能看到什么
-
-- 菜单栏显示当前动作和单次调用耗时。命令预览保留可读取的参数，例如 `python3` 后面的脚本、`grep` 的搜索条件和管道操作。
-- 文件操作显示目录与文件名。长命令在菜单栏中缩短，完整的安全预览可以在悬浮提示和执行日志中查看。
-- 执行日志按每次调用一条记录显示，最多保留本次运行中最近 100 个步骤，包含观察时间、动作、状态和耗时。
-- 本机 Commander 服务状态直接显示在菜单中。App 连接事件、错误和服务器登记信息放在日志窗口的“故障详情…”中。
-
-调用结束后，菜单栏会继续显示该动作和耗时 3 秒，方便看见很快完成的操作，随后恢复“当前无工具调用”。遇到日志缺失、读取中断或无法匹配的并发调用时，会显示“状态未确认”。
-
-## 时间和状态怎么理解
-
-计时对应一次本机工具调用，从观察到接收调用算到观察到返回。状态每秒最多刷新一次，时间按整秒显示；同一次采集中收到并结束的调用可能显示 `<1 秒`。这些是本机观察耗时，不是精确的服务端计时。
-
-一次 `start_process` 返回后，它启动的进程可能仍在运行。因此，“调用结束”不能证明测试已经跑完、云端已经收到结果，或整轮 Chat 任务已经完成。“当前无工具调用”也只表示当前没有已确认的本机调用。
-
-初次启动会从日志末尾开始观察。旧记录不会被当成正在执行的任务；在缺少新证据时，菜单栏可能暂时显示“状态未确认”。
-
-部分 App 刷新和响应恢复事件能显示会话名称，但目前还不能把 Commander 的每条命令准确关联到某个会话，也没有整轮任务计时。公共更新连接的打开、关闭或重连，只描述 App 的共享连接。
-
-## 安装与使用
-
-需要 macOS 和可用的 Swift 编译工具链。先确保本机 Remote Desktop Commander 能正常运行，再在项目目录执行：
+先安装并登录 [Remote Desktop Commander](https://github.com/desktop-commander/remote-desktop-commander)，确认它在本机运行。然后在本项目目录执行：
 
 ```bash
 ./build.sh
@@ -41,44 +12,52 @@ CommanderGuard 是单独运行的观察工具。Desktop Commander 负责接收�
 ./install.sh
 ```
 
-当前安装脚本使用固定项目路径 `/Volumes/ExtSSD/Projects/CommanderGuard`。应用安装到 `~/Applications/CommanderGuard.app`，同时创建登录自启项和桌面入口。菜单中的“执行日志…”会打开可复制文字、可滚动查看的原生窗口。
+安装脚本会构建并签名 Guard，把它放到 `~/Applications/CommanderGuard.app`，创建桌面入口和登录自启项，并重新启动 **CommanderGuard**。脚本目前使用固定项目路径 `/Volumes/ExtSSD/Projects/CommanderGuard`。它不会重启、重新登录或修改已经运行的 Desktop Commander 服务。以后若启用自动恢复，Guard 可能在确认通道失效且满足安全条件时重启该服务；见下文。
 
-“暂停防休眠（仅影响本机睡眠）”允许电脑恢复自动空闲睡眠，日志观察仍继续运行。点击“恢复防休眠”可重新启用；防休眠只在 Commander 服务运行时生效，不保证云端连接或任务持续运行。
+菜单里的“自动恢复 MCP 通道”可以单独开关。首次安装、且没有既有设置文件时，默认开启。如果正在使用 Commander，想让 Guard 只监测、不执行自动重启，可以关闭这个选项。防休眠开关与自动恢复开关互不影响。
 
-卸载：
+## 如何判断通道状态
+
+Guard 启动 90 秒后开始定期发送无副作用的 MCP `ping`。收到针对本机设备、请求编号匹配的 `pong`，才确认命令通道可用。菜单栏的 `●` 表示近期确认可用，`!` 表示服务未运行或通道明确报错，`?` 表示尚未确认、结果过期或网络等原因导致无法判断。
+
+当服务**连续三次明确返回“设备没有活动连接”**时，Guard 才会考虑自动恢复。普通超时、网络故障、登录失效以及无法识别的响应只会显示“状态未知”，不会触发重启。
+
+在重启前，Guard 还会确认云端没有待执行或执行中的调用、本机日志没有未结束或状态不明的调用，并核对 Commander 进程树中没有额外子进程。检查失败、日志有缺口、自动恢复被关闭或处于冷却期时，都会暂缓重启。每次尝试前会保存五分钟冷却记录，防止 Guard 自己重启后反复尝试。重启后，只有服务进程号变化且新 `ping` 成功，才报告恢复成功。
+
+这些检查旨在避免打断可观察到的工作，但无法保证识别所有独立运行的后台任务。通道恢复也不会重新执行命令、重试图片生成或继续发送聊天消息。
+
+## 操作记录与状态
+
+“执行日志…”显示本次运行中最多 100 次本机工具调用，包括经脱敏的命令预览、操作时间和耗时。一次 `start_process` 返回，仅表示启动调用结束；其后台进程可能仍在运行。本机调用返回也不能证明云端已收到结果或整轮聊天任务已完成。日志丢失、读取中断或调用无法匹配时，Guard 会标出“状态未确认”。
+
+“暂停防休眠（仅影响本机睡眠）”只释放 Guard 的防空闲睡眠设置，日志观察继续运行。它不能恢复 ChatGPT 的回答流，也不能保证远程任务持续运行。
+
+本机状态保存在 `~/Library/Application Support/CommanderGuard/`：
+
+- `status.json`：当前服务、通道和调用状态。
+- `timeline.jsonl`：脱敏事件时间线，最多 1 MiB，保留一个轮替副本。
+- `channel-recovery.json`：自动恢复开关及最近尝试时间，不含登录凭据。
+
+Guard 读取已有的本机登录信息来查询设备登记与待执行调用，并发送固定的 `ping`；它不写入或刷新登录凭据。状态和时间线不保存令牌、原始会话标识或命令结果。命令预览会隐藏常见凭据及内联脚本；自定义的秘密格式仍应避免放入命令行。
+
+## 单独检查与卸载
+
+离线自检不会启动 Guard 或操作 Commander 服务：
+
+```bash
+./build/CommanderGuard.app/Contents/MacOS/CommanderGuard --self-test
+```
+
+需要验证当前真实命令通道时，可手动运行一次只读探测；它不会执行自动恢复：
+
+```bash
+./build/CommanderGuard.app/Contents/MacOS/CommanderGuard --probe-channel
+```
+
+卸载 Guard：
 
 ```bash
 ./uninstall.sh
 ```
 
-卸载脚本移除本工具的应用、桌面入口和登录启动项，保留源代码及本机状态文件。
-
-## 能力边界
-
-CommanderGuard 提供本机执行记录，不能预防或修复 ChatGPT 云端响应超时，也不能仅凭没有调用就判断模型卡住或任务完成。它不会自动续发消息、重试工具、切换模型，也不管理 Shadowrocket、TunnelSentinel 或网络节点。
-
-服务器登记在线只表示设备的登记状态。防休眠可以避免本机因空闲睡眠影响执行，但不能恢复已经不可用的云端回答流。
-
-## 记录与隐私
-
-状态和时间线位于：
-
-- `~/Library/Application Support/CommanderGuard/status.json`：当前状态、调用耗时和安全处理后的命令预览。
-- `~/Library/Application Support/CommanderGuard/timeline.jsonl`：脱敏事件时间线，单文件最多 1 MiB，保留一个轮替副本。
-
-执行步骤、悬浮提示和 `status.json` 共用最多 1000 字符的命令预览。已识别的凭据参数、环境变量、请求头、带凭据的网址、JWT 和 UUID 会隐藏；动态命令展开、未闭合引号、控制字符和未完整读取的命令会显示说明文字。`-c`、`-e` 和 heredoc 内联脚本正文也会隐藏。预览只用于显示，不执行命令；隐藏规则无法识别所有自定义格式的秘密。
-
-时间线只保存固定事件、工具类别和时间，不保存命令正文、结果、URL、令牌或原始会话与调用标识。
-
-<details>
-<summary>日志读取与会话名称的技术说明</summary>
-
-观察器增量读取最多 3 个日期目录、8 个 ChatGPT App 日志和 Commander 日志。每个来源每次最多读取 64 KiB；Commander 调用行最多读取 4 KiB，App 日志行最多读取 8 KiB。缺失、不可读、轮换、截断及读取间隔会标记覆盖状态。
-
-App 事件需要匹配固定时间戳、`electron-message-handler` 来源和事件白名单。状态值只保留 `streaming`、`error`、`idle` 等固定类别；读取到 `idle` 不能证明任务成功结束。
-
-会话名称来自本机 `~/Library/Application Support/CommanderGuard/conversation-labels.json`。文件最大 64 KiB，只包含 `verified_at` 和 SHA-256 会话标识到名称的映射。只有同一条原始事件包含 `conversationId` 且命中名录时，才显示名称。名录不自动刷新，改名或新增会话后可能过期；它仅用于 App 事件，不用于推测 Commander 调用的归属。
-
-工具还会使用本机已有登录信息，只读查询 Commander 的服务器登记状态。该查询不修改服务或远端任务。
-
-</details>
+卸载脚本会移除 Guard 应用、桌面入口和登录启动项，保留项目源码及状态文件。

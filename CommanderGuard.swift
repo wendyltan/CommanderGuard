@@ -13,6 +13,10 @@ struct Snapshot {
     var checked = Date()
     var errorCount = 0
     var message = ""
+    var channelState = "启动宽限"
+    var channelDetail = "等待 Commander 与日志完成启动"
+    var channelFailures = 0
+    var channelChecked: Date?
     var activity = ActivitySummary()
     var timeline = TimelineSummary()
 }
@@ -28,6 +32,7 @@ struct ActivitySummary {
     var latestReceivedID: String?
     var returnedStepID: String?
     var error = false
+    var coverageGap = false
     var activeCount: Int { active.values.reduce(0, +) }
     var title: String { error ? "读取异常" : (tool.isEmpty ? state : tool) }
 }
@@ -367,6 +372,24 @@ func callState(_ activity: ActivitySummary) -> String {
     return uncertain ? "状态未确认" : "当前无工具调用"
 }
 
+func activitySafeForRecovery(_ activity: ActivitySummary) -> Bool {
+    !activity.error && !activity.coverageGap && activity.activeCount == 0 &&
+    !activity.state.contains("日志有间隔") && !activity.state.contains("读取异常") && !activity.state.contains("读取中断") &&
+    !activity.steps.contains { $0.duration == nil || $0.uncertain }
+}
+
+func recoveryConfirmed(oldPID: Int32, newPID: Int32?, probe: ChannelProbeResult) -> Bool {
+    guard let newPID, newPID != oldPID else { return false }
+    if case .healthy = probe { return true }
+    return false
+}
+
+func channelIndicator(service: String, state: String, checked: Date?, now: Date) -> String {
+    if service == "未运行" || state == "通道异常" || state == "通道不可用" { return "!" }
+    guard service == "运行中", let checked, now.timeIntervalSince(checked) >= 0, now.timeIntervalSince(checked) <= 75 else { return "?" }
+    return state == "通道畅通" || state == "通道已恢复" ? "●" : "?"
+}
+
 enum CommanderActivity {
     static let tools = ["read_file": "读取文件", "read_multiple_files": "读取文件", "read_process_output": "读取进程输出", "list_sessions": "查看终端会话", "list_processes": "查看进程", "list_directory": "查看目录", "search_files": "搜索文件", "start_search": "开始搜索", "get_more_search_results": "读取搜索结果", "stop_search": "停止搜索", "list_searches": "查看搜索任务", "get_file_info": "查看文件信息", "start_process": "启动进程", "interact_with_process": "操作进程", "kill_process": "结束进程", "force_terminate": "结束进程", "write_file": "写入文件", "edit_block": "编辑文件", "create_directory": "创建目录", "move_file": "移动文件", "get_config": "读取配置"]
     static let uuidPattern = try! NSRegularExpression(pattern: #"^🔧 Received tool call ([0-9a-fA-F-]{36}): ([a-z_]+) "#)
@@ -637,6 +660,7 @@ final class ActivityLogReader {
     private var lastTool = ""
     private var observedLive = false
     private var uncertain = false
+    private var coverageGap = false
     private var lastOutcome = "调用状态未确认"
     private(set) var summary = ActivitySummary()
     private let lineLimit = 4 * 1024
@@ -645,31 +669,36 @@ final class ActivityLogReader {
     init(url: URL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/RemoteDesktopCommander/stdout.log")) { self.url = url }
 
     func poll(now: Date = Date(), uptime: TimeInterval = ProcessInfo.processInfo.systemUptime) {
+        defer { summary.coverageGap = coverageGap }
         guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path), let size = attrs[.size] as? UInt64 else {
+            coverageGap = true
             invalidateSteps(); summary.steps = steps; active.removeAll(); summary.active.removeAll(); observedLive = false; uncertain = true; lastOutcome = "调用状态未确认"; summary.error = true; summary.state = "日志不可读 / 状态未知"; return
         }
         let id = (attrs[.systemFileNumber] as? NSNumber)?.uint64Value
         if !initialized || id != fileID || size < offset {
             let wasInitialized = initialized
             offset = size; fileID = id; initialized = true; partial.removeAll(); discarding = false; prefixEvent = ""
-            if wasInitialized { invalidateSteps() }; active.removeAll(); seen.removeAll(); recent.removeAll(); recentIDs.removeAll(); lastObserved = nil; lastTool = ""; observedLive = false; uncertain = wasInitialized; lastOutcome = "调用状态未确认"
+            if wasInitialized { invalidateSteps(); coverageGap = true }; active.removeAll(); seen.removeAll(); recent.removeAll(); recentIDs.removeAll(); lastObserved = nil; lastTool = ""; observedLive = false; uncertain = wasInitialized; lastOutcome = "调用状态未确认"
             let start = size > 64 * 1024 ? size - 64 * 1024 : 0
             if let handle = try? FileHandle(forReadingFrom: url) {
-                try? handle.seek(toOffset: start)
-                var tail = (try? handle.read(upToCount: Int(size - start))) ?? Data()
+                var tail = Data()
+                do { try handle.seek(toOffset: start); tail = try handle.read(upToCount: Int(size - start)) ?? Data() }
+                catch { coverageGap = true }
+                if tail.isEmpty && size > start { coverageGap = true }
                 try? handle.close()
                 if start > 0 {
                     if let newline = tail.firstIndex(of: 10) { tail.removeSubrange(...newline) }
                     else { tail.removeAll(); discarding = true }
                 }
                 consume(tail, live: false, now: now, uptime: uptime)
-            }
+            } else { coverageGap = true }
             summary = ActivitySummary(state: recent.isEmpty && !uncertain ? "未观察到新调用" : "调用状态未确认", tool: lastTool, observed: lastObserved, recent: recent, steps: steps, active: [:], error: false)
             return
         }
         if size == offset { if summary.error { summary.error = false; summary.state = "调用状态未确认（日志读取中断）" }; return }
-        guard let handle = try? FileHandle(forReadingFrom: url) else { invalidateSteps(); summary.steps = steps; active.removeAll(); summary.active.removeAll(); observedLive = false; uncertain = true; lastOutcome = "调用状态未确认"; summary.error = true; summary.state = "日志读取异常 / 状态未知"; return }
+        guard let handle = try? FileHandle(forReadingFrom: url) else { coverageGap = true; invalidateSteps(); summary.steps = steps; active.removeAll(); summary.active.removeAll(); observedLive = false; uncertain = true; lastOutcome = "调用状态未确认"; summary.error = true; summary.state = "日志读取异常 / 状态未知"; return }
         if size - offset > UInt64(ioLimit) {
+            coverageGap = true
             // ponytail: skip excess backlog in bounded time; a gap makes outstanding state unknown.
             offset = size - UInt64(min(ioLimit, Int(size)))
             try? handle.seek(toOffset: offset)
@@ -685,7 +714,7 @@ final class ActivityLogReader {
         }
         try? handle.seek(toOffset: offset)
         guard let data = try? handle.read(upToCount: Int(min(UInt64(ioLimit), size - offset))) else {
-            try? handle.close(); invalidateSteps(); summary.steps = steps; active.removeAll(); summary.active.removeAll(); observedLive = false; uncertain = true; lastOutcome = "调用状态未确认"; summary.error = true; summary.state = "日志读取异常 / 状态未知"; return
+            try? handle.close(); coverageGap = true; invalidateSteps(); summary.steps = steps; active.removeAll(); summary.active.removeAll(); observedLive = false; uncertain = true; lastOutcome = "调用状态未确认"; summary.error = true; summary.state = "日志读取异常 / 状态未知"; return
         }
         try? handle.close(); offset += UInt64(data.count)
         if !data.isEmpty { consume(data, live: true, now: now, uptime: uptime) }
@@ -719,7 +748,7 @@ final class ActivityLogReader {
            text.hasPrefix("🚀 Starting MCP Device") || text.hasPrefix("🛑 Shutting down device") {
             let key = text.hasPrefix("🚀") ? "service-start" : "service-stop"
             guard key != prefixEvent else { return }; prefixEvent = key
-            if live { active.removeAll(); observedLive = false; uncertain = true; lastOutcome = "调用状态未确认"; lastObserved = nil; summary.active.removeAll(); summary.state = "调用状态未确认" }
+            if live { coverageGap = true; active.removeAll(); observedLive = false; uncertain = true; lastOutcome = "调用状态未确认"; lastObserved = nil; summary.active.removeAll(); summary.state = "调用状态未确认" }
             if live { invalidateSteps(); summary.steps = steps }
             return
         }
@@ -845,6 +874,230 @@ final class Monitor: NSObject, URLSessionTaskDelegate {
             DispatchQueue.main.async { self.publicConfig = (url, key); query(url, key) }
         }.resume()
     }
+
+    /// Confirms that the server has no pending or executing calls before a recovery restart.
+    func checkOutstandingCalls(_ done: @escaping (Bool?, String?) -> Void) {
+        guard let (base, key) = publicConfig else { done(nil, "服务配置或监测状态未知"); return }
+        let file = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".desktop-commander-device/device.json")
+        guard let data = try? Data(contentsOf: file), let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let id = root["deviceId"] as? String, CloudState.validDeviceID(id),
+              let auth = root["session"] as? [String: Any], let token = auth["access_token"] as? String, !token.isEmpty else {
+            done(nil, "本机登录信息不可用"); return
+        }
+        var components = URLComponents(url: base.appendingPathComponent("rest/v1/mcp_remote_calls"), resolvingAgainstBaseURL: false)!
+        components.queryItems = [URLQueryItem(name: "select", value: "id"), URLQueryItem(name: "device_id", value: "eq.\(id)"), URLQueryItem(name: "status", value: "in.(pending,executing)"), URLQueryItem(name: "limit", value: "1")]
+        guard let url = components.url else { done(nil, "监测请求无效"); return }
+        var request = URLRequest(url: url, timeoutInterval: 8)
+        request.httpMethod = "GET"; request.setValue(key, forHTTPHeaderField: "apikey")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization"); request.setValue("application/json", forHTTPHeaderField: "Accept")
+        session.dataTask(with: request) { data, response, error in
+            DispatchQueue.main.async {
+                guard error == nil, let http = response as? HTTPURLResponse, http.statusCode == 200, let data,
+                      let rows = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+                    done(nil, "云端待执行调用状态未知"); return
+                }
+                done(rows.isEmpty, rows.isEmpty ? nil : "云端仍有待执行调用")
+            }
+        }.resume()
+    }
+}
+
+enum ChannelProbeResult {
+    case healthy
+    case noLiveConnection
+    case unknown(String)
+}
+
+struct ChannelWatchdogState {
+    let startedAt: Date
+    var lastProbe = Date.distantPast
+    var failures = 0
+    var status = "启动宽限"
+    var detail = "等待 Commander 与日志完成启动"
+    var recovering = false
+
+    func isDue(now: Date) -> Bool { now.timeIntervalSince(startedAt) >= 90 && now.timeIntervalSince(lastProbe) >= 30 && !recovering }
+    mutating func observed(_ result: ChannelProbeResult, now: Date) {
+        switch result {
+        case .healthy: failures = 0; status = "通道畅通"; detail = "MCP ping 已往返"
+        case .noLiveConnection: failures += 1; status = failures >= 3 ? "通道不可用" : "通道异常"; detail = "连续明确失败 \(failures)/3"
+        case .unknown(let reason): failures = 0; status = "通道状态未知"; detail = reason
+        }
+    }
+}
+
+struct ChannelRecoveryLedger: Codable {
+    var lastAttempt: Date?
+    var autoRecoveryEnabled = true
+
+    func canAttempt(at now: Date) -> Bool { lastAttempt.map { now.timeIntervalSince($0) >= 300 } ?? true }
+    mutating func recordAttempt(at now: Date) { lastAttempt = now }
+    static func load(from url: URL) -> ChannelRecoveryLedger {
+        guard FileManager.default.fileExists(atPath: url.path) else { return ChannelRecoveryLedger() }
+        guard (try? url.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) != true,
+              let data = try? Data(contentsOf: url), data.count <= 4096,
+              let ledger = try? JSONDecoder().decode(ChannelRecoveryLedger.self, from: data) else {
+            return ChannelRecoveryLedger(lastAttempt: nil, autoRecoveryEnabled: false)
+        }
+        return ledger
+    }
+    func save(to url: URL) -> Bool {
+        let directory = url.deletingLastPathComponent()
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            if (try? url.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == true { return false }
+            let data = try JSONEncoder().encode(self)
+            guard data.count <= 4096 else { return false }
+            try data.write(to: url, options: .atomic)
+            return chmod(url.path, S_IRUSR | S_IWUSR) == 0
+        } catch { return false }
+    }
+}
+
+/// Makes one bounded, read-only MCP ping. Credentials are loaded for each request and never surfaced.
+final class MCPChannelProbe: NSObject, URLSessionDataDelegate, URLSessionTaskDelegate {
+    private static let endpoint = URL(string: "https://mcp.desktopcommander.app/mcp")!
+    private static let maxResponseBytes = 16 * 1024
+    private var session: URLSession!
+    private var completion: ((ChannelProbeResult) -> Void)?
+    private var body = Data()
+    private var http: HTTPURLResponse?
+    private var requestID = UUID().uuidString
+    private var deviceID = ""
+
+    func run(_ done: @escaping (ChannelProbeResult) -> Void) {
+        completion = done
+        let file = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".desktop-commander-device/device.json")
+        guard let data = try? Data(contentsOf: file), let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let id = root["deviceId"] as? String, CloudState.validDeviceID(id),
+              let auth = root["session"] as? [String: Any], let token = auth["access_token"] as? String, !token.isEmpty else {
+            finish(.unknown("本机登录信息不可用")); return
+        }
+        deviceID = id
+        var request = URLRequest(url: Self.endpoint, timeoutInterval: 8)
+        request.httpMethod = "POST"
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["jsonrpc": "2.0", "id": requestID, "method": "tools/call", "params": ["name": "ping", "arguments": ["deviceId": id]]])
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json, text/event-stream", forHTTPHeaderField: "Accept")
+        request.setValue("2024-11-05", forHTTPHeaderField: "MCP-Protocol-Version")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 8; configuration.timeoutIntervalForResource = 10
+        session = URLSession(configuration: configuration, delegate: self, delegateQueue: OperationQueue())
+        session.dataTask(with: request).resume()
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) { completionHandler(nil) }
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse, completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+        guard let response = response as? HTTPURLResponse, response.url?.scheme == "https", response.url?.host == "mcp.desktopcommander.app" else {
+            completionHandler(.cancel); finish(.unknown("MCP 服务响应未知")); return
+        }
+        http = response
+        if let length = response.value(forHTTPHeaderField: "Content-Length").flatMap(Int.init), length > Self.maxResponseBytes {
+            completionHandler(.cancel); finish(.unknown("MCP 响应超过大小限制")); return
+        }
+        guard response.statusCode == 200 else { completionHandler(.cancel); finish(.unknown("MCP 服务不可用（HTTP \(response.statusCode)）")); return }
+        completionHandler(.allow)
+    }
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        guard body.count + data.count <= Self.maxResponseBytes else { dataTask.cancel(); finish(.unknown("MCP 响应超过大小限制")); return }
+        body.append(data)
+    }
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        guard error == nil, http?.statusCode == 200 else { finish(.unknown("MCP 网络请求未完成")); return }
+        finish(Self.classify(body, id: requestID, deviceID: deviceID))
+    }
+
+    private func finish(_ result: ChannelProbeResult) {
+        guard let done = completion else { return }
+        completion = nil; session?.invalidateAndCancel(); done(result)
+    }
+
+    static func classify(_ data: Data, id: String, deviceID: String) -> ChannelProbeResult {
+        guard let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any], root["jsonrpc"] as? String == "2.0", root["id"] as? String == id else {
+            return .unknown("MCP 响应格式或请求编号不匹配")
+        }
+        let noLive = "This Desktop Commander device has no live connection and cannot receive commands right now."
+        if let error = root["error"] as? [String: Any] {
+            let code = (error["data"] as? [String: Any])?["error_code"] as? String ?? error["error_code"] as? String
+            let message = error["message"] as? String ?? ""
+            return (code == nil || code == "INVALID_ARGUMENT") && message.hasPrefix(noLive) && message.contains("(\(deviceID))")
+                ? .noLiveConnection : .unknown("MCP 服务返回错误")
+        }
+        guard let result = root["result"] as? [String: Any], let content = result["content"] as? [[String: Any]] else {
+            return .unknown("MCP 响应内容未知")
+        }
+        let texts = content.compactMap { $0["type"] as? String == "text" ? $0["text"] as? String : nil }
+        guard texts.count == content.count, let first = texts.first else { return .unknown("MCP 响应内容未知") }
+        let structured = result["structuredContent"] as? [String: Any]
+        let isError = result["isError"] as? Bool == true
+        let structuredCode = structured?["error_code"] as? String
+        if isError, first.hasPrefix(noLive), first.contains("(\(deviceID))"), structuredCode == nil || structuredCode == "INVALID_ARGUMENT" {
+            return .noLiveConnection
+        }
+        guard !isError else { return .unknown("MCP 服务返回工具错误") }
+        guard texts.count == 2, first.range(of: #"^pong \d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z$"#, options: .regularExpression) != nil,
+              ISO8601DateFormatter.parse(String(first.dropFirst(5))) != nil,
+              texts[1].hasPrefix("\n[executed on device: "), texts[1].hasSuffix(" (\(deviceID))]") else {
+            return .unknown("MCP 未返回有效 ping 时间戳")
+        }
+        return .healthy
+    }
+}
+
+enum CommanderProcessTree {
+    private struct Entry { let pid: Int32; let parent: Int32; let command: String }
+
+    static func safe(servicePID: Int32, home: String = FileManager.default.homeDirectoryForCurrentUser.path) -> Bool {
+        let process = Process(); process.executableURL = URL(fileURLWithPath: "/bin/ps"); process.arguments = ["-axo", "pid=,ppid=,command="]
+        let output = Pipe(); process.standardOutput = output; process.standardError = Pipe()
+        do { try process.run() } catch { return false }
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 3) { if process.isRunning { process.terminate() } }
+        let data = output.fileHandleForReading.readDataToEndOfFile(); process.waitUntilExit()
+        return process.terminationStatus == 0 && safe(String(data: data, encoding: .utf8) ?? "", servicePID: servicePID, home: home)
+    }
+
+    static func safe(_ text: String, servicePID: Int32, home: String) -> Bool {
+        guard text.utf8.count <= 1024 * 1024 else { return false }
+        var entries: [Int32: Entry] = [:]
+        for line in text.split(separator: "\n") {
+            let fields = line.split(maxSplits: 2, whereSeparator: { $0 == " " || $0 == "\t" })
+            if line.trimmingCharacters(in: .whitespaces).isEmpty { continue }
+            guard fields.count == 3, let pid = Int32(fields[0]), let parent = Int32(fields[1]) else { return false }
+            entries[pid] = Entry(pid: pid, parent: parent, command: String(fields[2]))
+        }
+        guard let root = entries[servicePID], validRoot(root.command, home: home) else { return false }
+        var descendants: [Entry] = [], frontier = [servicePID], visited: Set<Int32> = [servicePID]
+        while let parent = frontier.popLast() {
+            for entry in entries.values where entry.parent == parent {
+                guard visited.insert(entry.pid).inserted else { return false }
+                descendants.append(entry); frontier.append(entry.pid)
+            }
+        }
+        var nodeCount = 0, helperCount = 0
+        for entry in descendants {
+            if validMCPChild(entry.command, home: home) { nodeCount += 1 }
+            else if validCaffeinate(entry.command, parent: servicePID) { helperCount += 1 }
+            else { return false }
+        }
+        return nodeCount == 1 && helperCount <= 1 && descendants.allSatisfy { entries[$0.pid]?.parent == servicePID }
+    }
+
+    private static func validRoot(_ command: String, home: String) -> Bool {
+        let args = command.split(whereSeparator: \.isWhitespace).map(String.init)
+        return args.count == 3 && validNode(args[0], home: home) && args[1] == "\(home)/.local/share/remote-desktop-commander/node_modules/@wonderwhy-er/desktop-commander/dist/index.js" && args[2] == "remote"
+    }
+    private static func validMCPChild(_ command: String, home: String) -> Bool {
+        let args = command.split(whereSeparator: \.isWhitespace).map(String.init)
+        return args.count == 2 && validNode(args[0], home: home) && args[1] == "\(home)/.local/share/remote-desktop-commander/node_modules/@wonderwhy-er/desktop-commander/dist/index.js"
+    }
+    private static func validNode(_ path: String, home: String) -> Bool {
+        path.hasPrefix("\(home)/.nvm/versions/node/v") && path.hasSuffix("/bin/node") && !path.contains("/../")
+    }
+    private static func validCaffeinate(_ command: String, parent: Int32) -> Bool {
+        let args = command.split(whereSeparator: \.isWhitespace).map(String.init)
+        return (args.first == "caffeinate" || args.first == "/usr/bin/caffeinate") && args.count == 3 && args[1] == "-w" && args[2] == String(parent)
+    }
 }
 
 extension ISO8601DateFormatter {
@@ -861,6 +1114,47 @@ extension ISO8601DateFormatter {
 func selfTest() {
     let now = Date(timeIntervalSince1970: 2_000_000_000)
     let fresh = now.addingTimeInterval(-300)
+    let device = "00000000-0000-4000-8000-000000000001"
+    func probeKind(_ value: ChannelProbeResult) -> Int {
+        switch value { case .healthy: return 0; case .noLiveConnection: return 1; case .unknown: return 2 }
+    }
+    func classifyProbe(_ object: [String: Any], id: String = "request") -> Int {
+        probeKind(MCPChannelProbe.classify(try! JSONSerialization.data(withJSONObject: object), id: id, deviceID: device))
+    }
+    let pong: [String: Any] = ["jsonrpc": "2.0", "id": "request", "result": ["content": [["type": "text", "text": "pong 2026-10-03T02:00:18.395Z"], ["type": "text", "text": "\n[executed on device: Mac-mini.local (\(device))]"]]]]
+    precondition(classifyProbe(pong) == 0 && classifyProbe(pong, id: "other") == 2)
+    var falsePong = pong; falsePong["result"] = ["isError": true, "content": [["type": "text", "text": "pong 2026-10-03T02:00:18.395Z"], ["type": "text", "text": "\n[executed on device: Mac-mini.local (\(device))]"]]]
+    precondition(classifyProbe(falsePong) == 2)
+    let noLive = "This Desktop Commander device has no live connection and cannot receive commands right now. Restart the terminal running it, then try again. [device: Mac-mini.local (\(device))]"
+    precondition(classifyProbe(["jsonrpc": "2.0", "id": "request", "error": ["code": -32602, "message": noLive]]) == 1)
+    precondition(classifyProbe(["jsonrpc": "2.0", "id": "request", "error": ["code": -32602, "message": noLive, "data": ["error_code": "OTHER"]]]) == 2)
+    precondition(classifyProbe(["jsonrpc": "2.0", "id": "request", "result": ["isError": true, "content": [["type": "text", "text": noLive]], "structuredContent": ["error_code": "INVALID_ARGUMENT"]]]) == 1)
+    var watchdogTest = ChannelWatchdogState(startedAt: now)
+    precondition(!watchdogTest.isDue(now: now.addingTimeInterval(89)) && watchdogTest.isDue(now: now.addingTimeInterval(90)))
+    watchdogTest.lastProbe = now.addingTimeInterval(90)
+    precondition(!watchdogTest.isDue(now: now.addingTimeInterval(119)) && watchdogTest.isDue(now: now.addingTimeInterval(120)))
+    for n in 1...3 { watchdogTest.observed(.noLiveConnection, now: now.addingTimeInterval(Double(90 + n * 30))); precondition(watchdogTest.failures == n) }
+    watchdogTest.observed(.unknown("网络未知"), now: now.addingTimeInterval(200)); precondition(watchdogTest.failures == 0)
+    watchdogTest.observed(.healthy, now: now.addingTimeInterval(230)); precondition(watchdogTest.status == "通道畅通")
+    var ledgerTest = ChannelRecoveryLedger(); ledgerTest.recordAttempt(at: now)
+    precondition(!ledgerTest.canAttempt(at: now.addingTimeInterval(299)) && ledgerTest.canAttempt(at: now.addingTimeInterval(300)))
+    precondition(!recoveryConfirmed(oldPID: 100, newPID: nil, probe: .healthy))
+    precondition(!recoveryConfirmed(oldPID: 100, newPID: 100, probe: .healthy))
+    precondition(!recoveryConfirmed(oldPID: 100, newPID: 101, probe: .unknown("未知")))
+    precondition(recoveryConfirmed(oldPID: 100, newPID: 101, probe: .healthy))
+    precondition(activitySafeForRecovery(ActivitySummary(state: "未观察到新调用")))
+    precondition(!activitySafeForRecovery(ActivitySummary(state: "未观察到新调用", coverageGap: true)))
+    precondition(!activitySafeForRecovery(ActivitySummary(state: "收到调用（处理中）", active: ["read_file": 1])))
+    let rootCommand = "/test/.nvm/versions/node/v22.0.0/bin/node /test/.local/share/remote-desktop-commander/node_modules/@wonderwhy-er/desktop-commander/dist/index.js"
+    let safeTree = "100 1 \(rootCommand) remote\n101 100 \(rootCommand)\n102 100 /usr/bin/caffeinate -w 100\n"
+    precondition(CommanderProcessTree.safe(safeTree, servicePID: 100, home: "/test"))
+    precondition(!CommanderProcessTree.safe(safeTree + "103 101 sleep 30\n", servicePID: 100, home: "/test"))
+    precondition(!CommanderProcessTree.safe(safeTree.replacingOccurrences(of: "/test/.nvm/versions/node/v22.0.0/bin/node", with: "/tmp/node"), servicePID: 100, home: "/test"))
+    precondition(channelIndicator(service: "运行中", state: "启动宽限", checked: nil, now: now) == "?")
+    precondition(channelIndicator(service: "运行中", state: "通道畅通", checked: now.addingTimeInterval(-30), now: now) == "●")
+    precondition(channelIndicator(service: "运行中", state: "通道畅通", checked: now.addingTimeInterval(-76), now: now) == "?")
+    precondition(channelIndicator(service: "运行中", state: "通道不可用", checked: now, now: now) == "!")
+    precondition(channelIndicator(service: "未运行", state: "通道畅通", checked: now, now: now) == "!")
     precondition(CloudState.classify(status: "online", lastSeen: fresh, now: now) == "服务器登记在线")
     precondition(CloudState.classify(status: "offline", lastSeen: fresh, now: now).contains("离线"))
     precondition(CloudState.classify(status: nil, lastSeen: nil, now: now).contains("未知"))
@@ -1006,10 +1300,15 @@ func selfTest() {
     let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
     try! FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: dir) }
+    let ledgerFile = dir.appendingPathComponent("recovery.json")
+    precondition(ledgerTest.save(to: ledgerFile))
+    precondition(!ChannelRecoveryLedger.load(from: ledgerFile).canAttempt(at: now.addingTimeInterval(299)))
+    try! Data("invalid".utf8).write(to: ledgerFile)
+    precondition(!ChannelRecoveryLedger.load(from: ledgerFile).autoRecoveryEnabled)
     let log = dir.appendingPathComponent("stdout.log")
     FileManager.default.createFile(atPath: log.path, contents: Data())
     let reader = ActivityLogReader(url: log)
-    reader.poll(); precondition(reader.summary.state == "未观察到新调用")
+    reader.poll(); precondition(reader.summary.state == "未观察到新调用" && !reader.summary.coverageGap)
     func append(_ s: String) { let f = try! FileHandle(forWritingTo: log); try! f.seekToEnd(); try! f.write(contentsOf: Data(s.utf8)); try! f.close() }
     append("🔧 Received tool call \(safeID): read_file {\n")
     reader.poll(now: now, uptime: 10); precondition(reader.summary.active["read_file"] == 1 && reader.summary.steps.first?.startedAt == now)
@@ -1055,7 +1354,7 @@ func selfTest() {
     append("🔧 Received tool call 323e4567-e89b-12d3-a456-426614174000: read_file {" + String(repeating: "x", count: 30_000))
     reader.poll(); precondition(reader.summary.active["read_file"] == 1)
     append(String(repeating: "z", count: 300_000))
-    reader.poll(); precondition(reader.summary.active.isEmpty && reader.summary.state.contains("未确认"))
+    reader.poll(); precondition(reader.summary.active.isEmpty && reader.summary.state.contains("未确认") && reader.summary.coverageGap)
     append("🚀 Starting MCP Device...\n🔧 Received tool call 523e4567-e89b-12d3-a456-426614174000: read_file {live}\n")
     reader.poll(); precondition(reader.summary.active["read_file"] == 1)
     append("🛑 Shutting down device...\n")
@@ -1063,6 +1362,8 @@ func selfTest() {
     // Truncation clears inferred activity and never calls an old start live.
     try! Data("✅ Tool call read_file completed: old\n".utf8).write(to: log)
     reader.poll(); precondition(reader.summary.active.isEmpty && reader.summary.state == "调用状态未确认")
+    append("🔧 Received tool call 723e4567-e89b-12d3-a456-426614174000: list_directory {}\n✅ Tool call list_directory completed: result\n")
+    reader.poll(); precondition(reader.summary.active.isEmpty && reader.summary.coverageGap && !activitySafeForRecovery(reader.summary))
     let oldLog = dir.appendingPathComponent("old.log")
     try! FileManager.default.moveItem(at: log, to: oldLog)
     FileManager.default.createFile(atPath: log.path, contents: Data("🔧 Received tool call 423e4567-e89b-12d3-a456-426614174000: read_file {old start}\n".utf8))
@@ -1195,11 +1496,19 @@ func selfTest() {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var item: NSStatusItem!
     private var timer: Timer?
+    private var channelTimer: Timer?
     private var assertion: IOPMAssertionID = 0
     private var paused = false
     private var snapshot = Snapshot()
     private var summaryLines: [NSMenuItem] = []
     private var guardItem: NSMenuItem!
+    private var recoveryItem: NSMenuItem!
+    private let recoveryURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/CommanderGuard/channel-recovery.json")
+    private var recoveryLedger = ChannelRecoveryLedger.load(from: FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/CommanderGuard/channel-recovery.json"))
+    private var watchdog = ChannelWatchdogState(startedAt: Date())
+    private var channelBusy = false
+    private var lastActivityPoll = Date.distantPast
+    private var recoveryLaunched = false
     private var logWindow: NSWindow?
     private var logTextView: NSTextView?
     private var logDetailsButton: NSButton?
@@ -1215,15 +1524,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         rebuild()
         poll()
         timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { _ in self.poll() }
+        channelTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { _ in self.pollChannel() }
         activityTimer = Timer(timeInterval: 1, repeats: true) { _ in self.pollActivity() }
         RunLoop.main.add(activityTimer!, forMode: .common)
         pollActivity()
     }
-    func applicationWillTerminate(_ n: Notification) { timer?.invalidate(); activityTimer?.invalidate(); releaseAssertion() }
+    func applicationWillTerminate(_ n: Notification) { timer?.invalidate(); channelTimer?.invalidate(); activityTimer?.invalidate(); releaseAssertion() }
     private func rebuild() {
         let m = NSMenu()
-        ["连接：未知", "动作：未观察到新调用"].forEach { let x = NSMenuItem(title: $0, action: nil, keyEquivalent: ""); x.isEnabled = false; m.addItem(x); summaryLines.append(x) }
+        ["连接：未知", "通道：启动宽限", "动作：未观察到新调用"].forEach { let x = NSMenuItem(title: $0, action: nil, keyEquivalent: ""); x.isEnabled = false; m.addItem(x); summaryLines.append(x) }
         let recent = NSMenuItem(title: "执行日志…", action: #selector(openLogWindow), keyEquivalent: ""); recent.target = self; m.addItem(recent)
+        recoveryItem = NSMenuItem(title: "自动恢复 MCP 通道", action: #selector(toggleAutoRecovery), keyEquivalent: ""); recoveryItem.target = self; recoveryItem.state = recoveryLedger.autoRecoveryEnabled ? .on : .off; m.addItem(recoveryItem)
         guardItem = NSMenuItem(title: "暂停防休眠（仅影响本机睡眠）", action: #selector(togglePause), keyEquivalent: ""); guardItem.target = self; m.addItem(guardItem)
         m.addItem(.separator())
         let quit = NSMenuItem(title: "退出", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"); quit.target = NSApplication.shared; m.addItem(quit)
@@ -1245,6 +1556,110 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         render()
     }
+    private func pollChannel() {
+        let now = Date()
+        guard !channelBusy, watchdog.isDue(now: now) else { return }
+        watchdog.lastProbe = now
+        guard snapshot.service == "运行中" else { recordProbe(.unknown("Commander 服务未运行"), now: now); return }
+        guard activitySafeForRecovery(snapshot.activity) else {
+            recordProbe(.unknown("本机调用活跃或日志状态不完整"), now: now); return
+        }
+        channelBusy = true
+        MCPChannelProbe().run { result in
+            DispatchQueue.main.async {
+                self.channelBusy = false
+                self.recordProbe(result, now: Date())
+                if case .noLiveConnection = result, self.watchdog.failures >= 3 { self.considerRecovery() }
+            }
+        }
+    }
+    private func recordProbe(_ result: ChannelProbeResult, now: Date) {
+        watchdog.observed(result, now: now)
+        snapshot.channelState = watchdog.status; snapshot.channelDetail = watchdog.detail
+        snapshot.channelFailures = watchdog.failures; snapshot.channelChecked = now
+        render()
+    }
+    private func considerRecovery() {
+        guard recoveryLedger.autoRecoveryEnabled else { snapshot.channelDetail = "自动恢复已关闭"; render(); return }
+        guard recoveryLedger.canAttempt(at: Date()) else { snapshot.channelDetail = "处于持久化冷却期"; render(); return }
+        guard activitySafeForRecovery(snapshot.activity) else { snapshot.channelDetail = "本机调用或日志状态阻止恢复"; render(); return }
+        watchdog.recovering = true
+        recoveryLaunched = false
+        DispatchQueue.global(qos: .utility).async {
+            guard let pid = self.servicePID(), CommanderProcessTree.safe(servicePID: pid) else {
+                DispatchQueue.main.async { self.abortRecovery("进程树未知或含其他子进程；未重启") }
+                return
+            }
+            DispatchQueue.main.async {
+                guard self.recoveryGateOpen(oldPID: pid) else { self.abortRecovery("本机调用状态或自动恢复设置已变化；未重启"); return }
+                Monitor.shared.checkOutstandingCalls { idle, error in
+                    guard idle == true else { self.abortRecovery(error ?? "云端待执行调用状态未知；未重启"); return }
+                    guard self.recoveryGateOpen(oldPID: pid) else { self.abortRecovery("本机调用状态或自动恢复设置已变化；未重启"); return }
+                    DispatchQueue.global(qos: .utility).async {
+                        let safe = self.servicePID() == pid && CommanderProcessTree.safe(servicePID: pid)
+                        DispatchQueue.main.async {
+                            guard safe, self.recoveryGateOpen(oldPID: pid) else { self.abortRecovery("服务进程或本机调用状态已变化；未重启"); return }
+                            self.startRecovery(oldPID: pid)
+                        }
+                    }
+                }
+            }
+        }
+    }
+    private func recoveryGateOpen(oldPID: Int32) -> Bool {
+        watchdog.recovering && recoveryLedger.autoRecoveryEnabled && recoveryLedger.canAttempt(at: Date()) &&
+        snapshot.service == "运行中" && activitySafeForRecovery(snapshot.activity) && !activityBusy &&
+        Date().timeIntervalSince(lastActivityPoll) < 3
+    }
+    private func abortRecovery(_ detail: String) {
+        watchdog.recovering = false; recoveryLaunched = false; snapshot.channelDetail = detail; render()
+    }
+    private func startRecovery(oldPID: Int32) {
+        guard recoveryGateOpen(oldPID: oldPID) else { abortRecovery("恢复前状态已变化；未重启"); return }
+        recoveryLedger.recordAttempt(at: Date())
+        guard recoveryLedger.save(to: recoveryURL) else { abortRecovery("无法安全保存冷却记录；未重启"); return }
+        snapshot.channelState = "正在恢复通道"; snapshot.channelDetail = "冷却已保存，正在重启固定的 Commander 服务"; render()
+        let p = Process(); p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        p.arguments = ["kickstart", "-k", "gui/\(getuid())/com.wuwendi.remote-desktop-commander"]
+        p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice
+        do { try p.run() } catch { recoveryFinished(oldPID: oldPID, newPID: nil, result: .unknown("launchctl 无法启动")); return }
+        recoveryLaunched = true
+        DispatchQueue.global(qos: .utility).async {
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 5) { if p.isRunning { p.terminate() } }
+            p.waitUntilExit()
+            guard p.terminationStatus == 0 else { DispatchQueue.main.async { self.recoveryFinished(oldPID: oldPID, newPID: nil, result: .unknown("launchctl 重启失败")) }; return }
+            var newPID: Int32?
+            for _ in 0..<10 {
+                Thread.sleep(forTimeInterval: 1)
+                if let current = self.servicePID(), current != oldPID { newPID = current; break }
+            }
+            guard let newPID else { DispatchQueue.main.async { self.recoveryFinished(oldPID: oldPID, newPID: nil, result: .unknown("重启后服务 PID 未变化")) }; return }
+            MCPChannelProbe().run { result in DispatchQueue.main.async { self.recoveryFinished(oldPID: oldPID, newPID: newPID, result: result) } }
+        }
+    }
+    private func recoveryFinished(oldPID: Int32, newPID: Int32?, result: ChannelProbeResult) {
+        watchdog.recovering = false; recoveryLaunched = false
+        if recoveryConfirmed(oldPID: oldPID, newPID: newPID, probe: result) {
+            watchdog.failures = 0; snapshot.channelState = "通道已恢复"; snapshot.channelDetail = "服务 PID 已变化，后续 MCP ping 成功"
+        } else {
+            snapshot.channelState = "恢复尚未确认"; snapshot.channelDetail = newPID == nil ? (watchdog.detail + "；" + probeDescription(result)) : "服务已重启，但后续 MCP ping 未成功（\(probeDescription(result))）"
+        }
+        snapshot.channelFailures = watchdog.failures; snapshot.channelChecked = Date(); render()
+    }
+    private func probeDescription(_ result: ChannelProbeResult) -> String {
+        switch result { case .healthy: return "ping 成功"; case .noLiveConnection: return "设备连接仍不可用"; case .unknown(let message): return message }
+    }
+    private func servicePID() -> Int32? {
+        let p = Process(); p.executableURL = URL(fileURLWithPath: "/bin/launchctl"); p.arguments = ["print", "gui/\(getuid())/com.wuwendi.remote-desktop-commander"]
+        let out = Pipe(); p.standardOutput = out; p.standardError = FileHandle.nullDevice
+        do { try p.run() } catch { return nil }
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 3) { if p.isRunning { p.terminate() } }
+        let data = out.fileHandleForReading.readDataToEndOfFile(); p.waitUntilExit()
+        guard p.terminationStatus == 0, let text = String(data: data, encoding: .utf8), text.contains("state = running"),
+              let match = text.range(of: #"(?m)^\s*pid = ([0-9]+)\s*$"#, options: .regularExpression),
+              let pidRange = text[match].range(of: #"[0-9]+"#, options: .regularExpression) else { return nil }
+        return Int32(text[pidRange])
+    }
     private func pollActivity() {
         guard !activityBusy else { return }
         activityBusy = true
@@ -1253,7 +1668,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.timelineReader.poll()
             let value = self.activityReader.summary
             let timeline = self.timelineReader.summary
-            DispatchQueue.main.async { self.snapshot.activity = value; self.snapshot.timeline = timeline; self.activityBusy = false; self.render() }
+            DispatchQueue.main.async { self.snapshot.activity = value; self.snapshot.timeline = timeline; self.lastActivityPoll = Date(); self.activityBusy = false; self.render() }
         }
     }
     private func serviceRunning() -> Bool {
@@ -1274,25 +1689,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     private func releaseAssertion() { if assertion != 0 { IOPMAssertionRelease(assertion); assertion = 0 } }
     private func render() {
-        guard summaryLines.count == 2 else { return }
+        guard summaryLines.count == 3 else { return }
         let latestAppEvent = snapshot.timeline.latestAppEvent.map { event in
             let time = ISO8601DateFormatter.parse(event.observedAt).map { DateFormatter.localizedString(from: $0, dateStyle: .none, timeStyle: .medium) } ?? "时间未知"
             return "\(appEventLabel(event)) · \(time)"
         } ?? "未观察到新事件"
         let activity = snapshot.activity
         let clockText: (Date) -> String = { DateFormatter.localizedString(from: $0, dateStyle: .none, timeStyle: .medium) }
-        let connection = snapshot.service == "运行中" ? "●" : (snapshot.service == "未运行" ? "!" : "?")
+        let connection = channelIndicator(service: snapshot.service, state: snapshot.channelState, checked: snapshot.channelChecked, now: Date())
         let connectionText = "Commander 服务\(snapshot.service == "运行中" ? "运行中" : (snapshot.service == "未运行" ? "未运行" : "状态未知"))"
         summaryLines[0].title = "状态：\(connectionText)"
+        summaryLines[1].title = "通道：\(snapshot.channelState) · \(snapshot.channelDetail)"
         let uptime = ProcessInfo.processInfo.systemUptime
         if let step = currentCallStep(activity) {
             let elapsed = durationText(step.elapsed(at: ProcessInfo.processInfo.systemUptime))
             let timing = step.uncertain ? "耗时未确认" : "等待返回 \(elapsed)"
-            summaryLines[1].title = "动作：\(middleTruncate(CommanderActivity.menuDetail(step.detail), limit: 80)) · \(clockText(step.startedAt)) · \(timing)"
+            summaryLines[2].title = "动作：\(middleTruncate(CommanderActivity.menuDetail(step.detail), limit: 80)) · \(clockText(step.startedAt)) · \(timing)"
         } else if let step = recentlyReturnedCall(activity, uptime: uptime) {
-            summaryLines[1].title = "动作：\(middleTruncate(CommanderActivity.menuDetail(step.detail), limit: 80)) · 调用耗时 \(durationText(step.duration))"
+            summaryLines[2].title = "动作：\(middleTruncate(CommanderActivity.menuDetail(step.detail), limit: 80)) · 调用耗时 \(durationText(step.duration))"
         } else {
-            summaryLines[1].title = "动作：\(callState(activity))"
+            summaryLines[2].title = "动作：\(callState(activity))"
         }
         let activeStep = currentCallStep(activity)
         let callStatus = callState(activity)
@@ -1304,7 +1720,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         item.button?.title = "DC \(connection)\(barTimer.isEmpty ? (barDuration.map { " \($0)" } ?? "") : " \(barTimer)") · \(shortAction)"
         let origin = "最近一次本机观察；\(conversationLabelNote(snapshot.timeline.conversationLabelsVerifiedAt)) 无新事件不表示空闲或完成。"
         let age = activity.observed.map { DateFormatter.localizedString(from: $0, dateStyle: .none, timeStyle: .medium) } ?? "未知"
-        item.button?.toolTip = "\(connectionText)\n\(returnedStep == nil ? "" : "本机调用已返回 · ")\(barAction)\(barDuration.map { " · 调用耗时 \($0)" } ?? "") · \(callStatus) · \(age)\n\(origin)"
+        item.button?.toolTip = "\(connectionText)\n通道：\(snapshot.channelState) · \(snapshot.channelDetail)\n\(returnedStep == nil ? "" : "本机调用已返回 · ")\(barAction)\(barDuration.map { " · 调用耗时 \($0)" } ?? "") · \(callStatus) · \(age)\n\(origin)"
         writeStatus()
         if logWindow?.isVisible == true { renderLogWindow(latestAppEvent: latestAppEvent) }
     }
@@ -1328,12 +1744,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let currentState = callState(snapshot.activity)
         let timelineRows: [[String: Any]] = snapshot.timeline.events.map { ["source": $0.source, "event": $0.event, "conversation_title": $0.conversationTitle as Any? ?? NSNull(), "source_timestamp": $0.sourceAt as Any? ?? NSNull(), "observed_at": $0.observedAt] }
         let lastAppEvent: [String: Any] = snapshot.timeline.latestAppEvent.map { ["event": $0.event, "conversation_title": $0.conversationTitle as Any? ?? NSNull(), "source_timestamp": $0.sourceAt as Any? ?? NSNull(), "observed_at": $0.observedAt] } ?? [:]
-        let object: [String: Any] = ["service": snapshot.service, "cloud": snapshot.cloud, "last_seen": snapshot.lastSeen.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "checked_at": ISO8601DateFormatter.flex.string(from: snapshot.checked), "error_count": snapshot.errorCount, "paused": paused, "idle_prevention": assertion != 0, "message": snapshot.message, "menu": ["menubar_title": item.button?.title ?? "", "connection": summaryLines.first?.title ?? "", "action": summaryLines.count > 1 ? summaryLines[1].title : "", "execution_step_rows": rows, "execution_steps": safeSteps, "tool_call_elapsed_seconds": callElapsed as Any? ?? NSNull(), "tool_call_state": currentState, "recent_actions": snapshot.activity.recent], "activity": ["state": snapshot.activity.state, "tool": snapshot.activity.tool, "active_count": snapshot.activity.activeCount, "observed_at": snapshot.activity.observed.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "recent": snapshot.activity.recent, "error": snapshot.activity.error], "timeline": ["coverage": snapshot.timeline.coverage, "commander_errors_this_run": snapshot.timeline.commanderErrors, "conversation_labels_verified_at": snapshot.timeline.conversationLabelsVerifiedAt as Any? ?? NSNull(), "last_chatgpt_app_event": lastAppEvent, "events": timelineRows]]
+        let object: [String: Any] = ["service": snapshot.service, "cloud": snapshot.cloud, "last_seen": snapshot.lastSeen.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "checked_at": ISO8601DateFormatter.flex.string(from: snapshot.checked), "error_count": snapshot.errorCount, "paused": paused, "idle_prevention": assertion != 0, "message": snapshot.message, "channel": ["state": snapshot.channelState, "detail": snapshot.channelDetail, "consecutive_no_live": snapshot.channelFailures, "checked_at": snapshot.channelChecked.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "auto_recovery_enabled": recoveryLedger.autoRecoveryEnabled, "last_recovery_attempt": recoveryLedger.lastAttempt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull()], "menu": ["menubar_title": item.button?.title ?? "", "connection": summaryLines.first?.title ?? "", "channel": summaryLines[1].title, "action": summaryLines[2].title, "execution_step_rows": rows, "execution_steps": safeSteps, "tool_call_elapsed_seconds": callElapsed as Any? ?? NSNull(), "tool_call_state": currentState, "recent_actions": snapshot.activity.recent], "activity": ["state": snapshot.activity.state, "tool": snapshot.activity.tool, "active_count": snapshot.activity.activeCount, "observed_at": snapshot.activity.observed.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "recent": snapshot.activity.recent, "error": snapshot.activity.error, "coverage_gap": snapshot.activity.coverageGap], "timeline": ["coverage": snapshot.timeline.coverage, "commander_errors_this_run": snapshot.timeline.commanderErrors, "conversation_labels_verified_at": snapshot.timeline.conversationLabelsVerifiedAt as Any? ?? NSNull(), "last_chatgpt_app_event": lastAppEvent, "events": timelineRows]]
         guard let d = try? JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys]) else { return }
         do { try d.write(to: dir.appendingPathComponent("status.json"), options: .atomic) }
         catch { fputs("CommanderGuard: unable to write sanitized status file\n", stderr) }
     }
     @objc private func togglePause() { paused.toggle(); updateGuard(); render() }
+    @objc private func toggleAutoRecovery() {
+        var next = recoveryLedger; next.autoRecoveryEnabled.toggle()
+        guard next.save(to: recoveryURL) else { snapshot.channelDetail = "自动恢复设置无法保存"; render(); return }
+        recoveryLedger = next; recoveryItem.state = next.autoRecoveryEnabled ? .on : .off
+        if !next.autoRecoveryEnabled && watchdog.recovering && !recoveryLaunched { abortRecovery("自动恢复已关闭；未开始重启") }
+        else { render() }
+    }
     @objc private func openLogWindow() {
         if logWindow == nil {
             let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 760, height: 560), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
@@ -1404,6 +1827,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 }
 
 if CommandLine.arguments.contains("--self-test") { selfTest() }
+else if CommandLine.arguments.contains("--probe-channel") {
+    MCPChannelProbe().run { result in
+        let state: String
+        let code: Int32
+        switch result { case .healthy: state = "通道畅通"; code = 0; case .noLiveConnection: state = "设备无实时连接"; code = 2; case .unknown: state = "通道状态未知"; code = 1 }
+        if let data = try? JSONSerialization.data(withJSONObject: ["channel": state, "checked_at": ISO8601DateFormatter.flex.string(from: Date())], options: [.sortedKeys]), let text = String(data: data, encoding: .utf8) { print(text) }
+        exit(code)
+    }
+    dispatchMain()
+}
 else if CommandLine.arguments.contains("--check") {
     Monitor.shared.check { state, seen, error in
         let safe: [String: Any] = ["cloud": state, "last_seen": seen.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "checked_at": ISO8601DateFormatter.flex.string(from: Date()), "message": error ?? ""]
