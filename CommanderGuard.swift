@@ -20,6 +20,7 @@ struct Snapshot {
     var toolExecutionState = "未验证"
     var toolExecutionDetail = "尚未检查本机工具执行"
     var toolExecutionChecked: Date?
+    var toolHistory = ToolHistorySummary()
     var activity = ActivitySummary()
     var timeline = TimelineSummary()
 }
@@ -59,6 +60,31 @@ struct ActivityStep {
     var historical = false
     var finished = false
     func elapsed(at uptime: TimeInterval) -> TimeInterval? { uncertain || historical ? nil : duration ?? max(0, uptime - startedUptime) }
+}
+
+struct ToolHistoryRecord {
+    let fingerprint: String
+    let timestamp: Date
+    let tool: String
+    let duration: TimeInterval?
+    let returned: Bool
+    let failed: Bool
+    var label: String { CommanderActivity.tools[tool] ?? "本机工具调用" }
+    var resultLabel: String { failed ? "工具调用返回错误" : (returned ? "工具调用已返回" : "返回状态未知") }
+    var cloudReceiptLabel: String { "云端结果接收未知" }
+    var processCaveat: String? { tool == "start_process" && returned && !failed ? "调用已返回；后台进程仍可能运行" : nil }
+}
+
+struct ToolHistorySummary {
+    var state = "尚未读取"
+    var sourceAvailable = false
+    var bootstrapLimited = false
+    var coverageGap = false
+    var gapReason = ""
+    var malformedLines = 0
+    var backlogBytes: UInt64 = 0
+    var latest: ToolHistoryRecord?
+    var recent: [ToolHistoryRecord] = []
 }
 
 func activityStepRows(_ steps: [ActivityStep], uptime: TimeInterval) -> [String] {
@@ -1002,6 +1028,129 @@ enum CommanderActivity {
         return !["token", "secret", "credential", "password", "apikey", "api_key"].contains(where: lower.contains) && (compact.count < 28 || Set(compact).count <= 10)
     }
 
+}
+
+/// Reads Desktop Commander's bounded JSONL history without retaining arguments or output bodies.
+/// The history has no reliable call id, so these records remain a separate evidence source and
+/// are never merged into stdout-derived ActivityStep rows by timestamp.
+final class ToolHistoryReader {
+    private let url: URL
+    private var offset: UInt64 = 0
+    private var fileID: UInt64?
+    private var initialized = false
+    private var partial = Data()
+    private var discarding = false
+    private var recent = [ToolHistoryRecord]()
+    private var seen = Set<String>()
+    private let bootstrapLimit: UInt64 = 512 * 1024
+    private let readLimit: UInt64 = 256 * 1024
+    private let lineLimit = 64 * 1024
+    private(set) var summary = ToolHistorySummary()
+
+    init(url: URL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude-server-commander/tool-history.jsonl")) { self.url = url }
+
+    func poll() {
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let size = (attrs[.size] as? NSNumber)?.uint64Value,
+              let id = (attrs[.systemFileNumber] as? NSNumber)?.uint64Value else {
+            summary.sourceAvailable = false; summary.state = "结构化历史不可用"; return
+        }
+        summary.sourceAvailable = true
+        if !initialized {
+            bootstrap(size: size, id: id); return
+        }
+        if fileID != id || size < offset {
+            summary.coverageGap = true
+            summary.gapReason = fileID != id ? "结构化历史已轮换" : "结构化历史已截断"
+            partial.removeAll(keepingCapacity: true); discarding = false
+            bootstrap(size: size, id: id); return
+        }
+        guard size > offset else {
+            summary.backlogBytes = 0
+            summary.state = summary.coverageGap ? "结构化历史可读 · 覆盖有缺口" : "结构化历史读取正常"
+            publish(); return
+        }
+        guard let handle = try? FileHandle(forReadingFrom: url) else { summary.state = "结构化历史读取失败"; return }
+        var data = Data()
+        do {
+            var statBuffer = stat()
+            guard fstat(handle.fileDescriptor, &statBuffer) == 0, UInt64(statBuffer.st_ino) == id, UInt64(statBuffer.st_size) >= offset else { throw CocoaError(.fileReadUnknown) }
+            try handle.seek(toOffset: offset)
+            data = try handle.read(upToCount: Int(min(readLimit, size - offset))) ?? Data()
+            if size > offset && data.isEmpty { throw CocoaError(.fileReadUnknown) }
+        } catch {
+            try? handle.close(); summary.state = "结构化历史读取失败"; return
+        }
+        try? handle.close(); offset += UInt64(data.count)
+        consume(data)
+        summary.backlogBytes = size - offset
+        summary.state = summary.backlogBytes > 0 ? "结构化历史追赶中" : (summary.coverageGap ? "结构化历史可读 · 覆盖有缺口" : "结构化历史读取正常")
+        publish()
+    }
+
+    private func bootstrap(size: UInt64, id: UInt64) {
+        initialized = true; fileID = id; partial.removeAll(keepingCapacity: true); discarding = false
+        let start = size > bootstrapLimit ? size - bootstrapLimit : 0
+        summary.bootstrapLimited = start > 0
+        guard size > 0 else { offset = 0; summary.state = "结构化历史为空"; publish(); return }
+        guard let handle = try? FileHandle(forReadingFrom: url) else { offset = size; summary.state = "结构化历史读取失败"; return }
+        var data = Data()
+        do {
+            var statBuffer = stat()
+            guard fstat(handle.fileDescriptor, &statBuffer) == 0, UInt64(statBuffer.st_ino) == id, UInt64(statBuffer.st_size) >= size else { throw CocoaError(.fileReadUnknown) }
+            try handle.seek(toOffset: start)
+            data = try handle.read(upToCount: Int(size - start)) ?? Data()
+        } catch {
+            try? handle.close(); offset = size; summary.state = "结构化历史读取失败"; return
+        }
+        try? handle.close(); offset = size
+        if start > 0, let firstNewline = data.firstIndex(of: 10) { data = Data(data[data.index(after: firstNewline)...]) }
+        else if start > 0 { data.removeAll() }
+        consume(data)
+        summary.backlogBytes = 0
+        summary.state = summary.coverageGap ? "结构化历史可读 · 覆盖有缺口" : (summary.bootstrapLimited ? "最近结构化历史已读取" : "结构化历史读取正常")
+        publish()
+    }
+
+    private func consume(_ data: Data) {
+        for byte in data {
+            if byte == 10 {
+                if !discarding && !partial.isEmpty { parseLine(partial) }
+                partial.removeAll(keepingCapacity: true); discarding = false
+            } else if !discarding {
+                if partial.count < lineLimit { partial.append(byte) }
+                else { discarding = true; summary.coverageGap = true; summary.gapReason = "结构化历史存在超长记录"; summary.malformedLines += 1 }
+            }
+        }
+    }
+
+    private func parseLine(_ data: Data) {
+        guard data.count <= lineLimit,
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let rawTime = object["timestamp"] as? String, let timestamp = ISO8601DateFormatter.parse(rawTime),
+              let tool = object["toolName"] as? String, tool.range(of: #"^[A-Za-z0-9_-]{1,64}$"#, options: .regularExpression) != nil else {
+            summary.coverageGap = true; summary.gapReason = "结构化历史包含损坏记录"; summary.malformedLines += 1; return
+        }
+        let duration: TimeInterval?
+        if let number = object["duration"] as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(), number.doubleValue.isFinite, number.doubleValue >= 0, number.doubleValue <= 86_400_000 {
+            duration = number.doubleValue / 1000
+        } else { duration = nil }
+        let output = object["output"] as? [String: Any]
+        let returned = object.keys.contains("output") && !(object["output"] is NSNull)
+        let failed = output?["isError"] as? Bool == true
+        let fingerprint = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        guard !seen.contains(fingerprint) else { return }
+        let record = ToolHistoryRecord(fingerprint: fingerprint, timestamp: timestamp, tool: tool, duration: duration, returned: returned, failed: failed)
+        recent.insert(record, at: 0); seen.insert(fingerprint)
+        if recent.count > 100 {
+            let removed = recent.removeLast(); seen.remove(removed.fingerprint)
+        }
+    }
+
+    private func publish() {
+        summary.recent = recent
+        summary.latest = recent.max(by: { $0.timestamp < $1.timestamp })
+    }
 }
 
 /// Reads only bounded log prefixes. Bootstrap supplies recent labels, never live-running state.
@@ -1957,6 +2106,43 @@ func selfTest() {
     precondition(!ChannelRecoveryLedger.load(from: ledgerFile).canAttempt(at: now.addingTimeInterval(299)))
     try! Data("invalid".utf8).write(to: ledgerFile)
     precondition(!ChannelRecoveryLedger.load(from: ledgerFile).autoRecoveryEnabled)
+
+    let missingHistory = ToolHistoryReader(url: dir.appendingPathComponent("missing-history.jsonl")); missingHistory.poll()
+    precondition(!missingHistory.summary.sourceAvailable && missingHistory.summary.state == "结构化历史不可用")
+    let historyFile = dir.appendingPathComponent("tool-history.jsonl")
+    func historyLine(time: String, tool: String, duration: Any, output: Any = ["content": [["type": "text", "text": "private result"]]]) -> Data {
+        let object: [String: Any] = ["timestamp": time, "toolName": tool, "arguments": ["command": "private command"], "duration": duration, "output": output]
+        return try! JSONSerialization.data(withJSONObject: object) + Data([10])
+    }
+    let firstHistoryTime = "2026-10-05T01:02:03.000Z", secondHistoryTime = "2026-10-05T01:02:04.000Z"
+    var historyData = historyLine(time: firstHistoryTime, tool: "start_process", duration: 1500)
+    historyData.append(historyLine(time: secondHistoryTime, tool: "read_file", duration: 25))
+    try! historyData.write(to: historyFile)
+    let historyReader = ToolHistoryReader(url: historyFile); historyReader.poll()
+    precondition(historyReader.summary.sourceAvailable && historyReader.summary.recent.count == 2 && !historyReader.summary.coverageGap)
+    precondition(historyReader.summary.latest?.tool == "read_file" && historyReader.summary.latest?.duration == 0.025 && historyReader.summary.latest?.resultLabel == "工具调用已返回")
+    precondition(historyReader.summary.recent.first(where: { $0.tool == "start_process" })?.processCaveat == "调用已返回；后台进程仍可能运行")
+    let partialLine = historyLine(time: "2026-10-05T01:02:05.000Z", tool: "list_directory", duration: 7).dropLast()
+    let partialHandle = try! FileHandle(forWritingTo: historyFile); try! partialHandle.seekToEnd(); try! partialHandle.write(contentsOf: partialLine); try! partialHandle.close()
+    historyReader.poll(); precondition(historyReader.summary.recent.count == 2)
+    let finishPartial = try! FileHandle(forWritingTo: historyFile); try! finishPartial.seekToEnd(); try! finishPartial.write(contentsOf: Data([10])); try! finishPartial.close()
+    historyReader.poll(); precondition(historyReader.summary.latest?.tool == "list_directory" && historyReader.summary.recent.count == 3)
+    let malformedHandle = try! FileHandle(forWritingTo: historyFile); try! malformedHandle.seekToEnd(); try! malformedHandle.write(contentsOf: Data("{broken json}\n".utf8)); try! malformedHandle.close()
+    historyReader.poll(); precondition(historyReader.summary.coverageGap && historyReader.summary.malformedLines == 1 && historyReader.summary.recent.count == 3)
+    let rotatedHistory = dir.appendingPathComponent("tool-history.old.jsonl")
+    try! FileManager.default.moveItem(at: historyFile, to: rotatedHistory)
+    try! historyLine(time: "2026-10-05T01:02:06.000Z", tool: "get_config", duration: 3).write(to: historyFile)
+    historyReader.poll(); precondition(historyReader.summary.coverageGap && historyReader.summary.gapReason == "结构化历史已轮换" && historyReader.summary.latest?.tool == "get_config")
+    let duplicateLine = historyLine(time: "2026-10-05T01:02:06.000Z", tool: "get_config", duration: 3)
+    let duplicateHandle = try! FileHandle(forWritingTo: historyFile); try! duplicateHandle.seekToEnd(); try! duplicateHandle.write(contentsOf: duplicateLine); try! duplicateHandle.close()
+    let countBeforeDuplicate = historyReader.summary.recent.count; historyReader.poll(); precondition(historyReader.summary.recent.count == countBeforeDuplicate)
+    let failedHistoryFile = dir.appendingPathComponent("tool-history-failed.jsonl")
+    try! historyLine(time: "2026-10-05T01:02:07.000Z", tool: "read_file", duration: 11, output: ["content": [["type": "text", "text": "private error"]], "isError": true]).write(to: failedHistoryFile)
+    let failedHistoryReader = ToolHistoryReader(url: failedHistoryFile); failedHistoryReader.poll()
+    precondition(failedHistoryReader.summary.latest?.failed == true && failedHistoryReader.summary.latest?.resultLabel == "工具调用返回错误")
+    try! Data().write(to: historyFile)
+    historyReader.poll(); precondition(historyReader.summary.coverageGap && historyReader.summary.gapReason == "结构化历史已截断")
+
     let log = dir.appendingPathComponent("stdout.log")
     FileManager.default.createFile(atPath: log.path, contents: Data("🚀 Starting MCP Device...\n".utf8))
     let reader = ActivityLogReader(url: log)
@@ -2376,6 +2562,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private var recordSteps: [ActivityStep] = []
     private var selectedRecordID: String?
     private let activityReader = ActivityLogReader(errorURL: FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/RemoteDesktopCommander/stderr.log"))
+    private let toolHistoryReader = ToolHistoryReader()
+    private var lastToolHistoryPoll = Date.distantPast
     private var verifiedRestart: (old: Int32, new: Int32)?
     private let timelineReader = TimelineReader()
     private var activityBusy = false
@@ -2650,15 +2838,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private func pollActivity() {
         guard !activityBusy else { return }
         let restart = verifiedRestart; verifiedRestart = nil
+        let now = Date(), pollHistory = now.timeIntervalSince(lastToolHistoryPoll) >= 5
+        if pollHistory { lastToolHistoryPoll = now }
         activityBusy = true
         DispatchQueue.global(qos: .utility).async {
             if let restart { self.activityReader.confirmedProcessRestart(oldPID: restart.old, newPID: restart.new, oldProcessExited: true) }
             self.activityReader.poll()
+            if pollHistory { self.toolHistoryReader.poll() }
             self.timelineReader.poll()
             let value = self.activityReader.summary
+            let history = self.toolHistoryReader.summary
             let timeline = self.timelineReader.summary
             DispatchQueue.main.async {
-                self.snapshot.activity = value; self.snapshot.timeline = timeline; self.lastActivityPoll = Date(); self.activityBusy = false
+                self.snapshot.activity = value; self.snapshot.toolHistory = history; self.snapshot.timeline = timeline; self.lastActivityPoll = Date(); self.activityBusy = false
                 self.refreshToolExecutionFromActivity(value)
                 self.render()
             }
@@ -2730,6 +2922,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         guard let value else { return "未确认" }
         return value < 1 ? "<1 秒" : "\(Int(value)) 秒"
     }
+    private func toolHistoryLatestSummary() -> String {
+        guard let record = snapshot.toolHistory.latest else { return "暂无结构化记录" }
+        let duration = record.duration.map(durationText) ?? "耗时未确认"
+        let caveat = record.processCaveat.map { " · \($0)" } ?? ""
+        return "\(prominentStamp(record.timestamp)) · \(record.label) · \(record.resultLabel) · \(duration)\(caveat) · \(record.cloudReceiptLabel)"
+    }
     private func middleTruncate(_ value: String, limit: Int) -> String {
         guard value.count > limit else { return value }
         let prefix = String(value.prefix(12)), suffix = String(value.suffix(limit - prefix.count - 1))
@@ -2750,6 +2948,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let diagnosis = currentDiagnosis()
         var object: [String: Any] = ["chatgpt": ["answer": chat.answer, "update_connection": chat.connection, "coverage": snapshot.timeline.coverage, "delivery_timeout_directly_observable": false, "limitation": chat.deliveryLimit], "service": snapshot.service, "cloud": snapshot.cloud, "last_seen": snapshot.lastSeen.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "checked_at": ISO8601DateFormatter.flex.string(from: snapshot.checked), "error_count": snapshot.errorCount, "paused": paused, "idle_prevention": assertion != 0, "message": snapshot.message, "channel": ["state": snapshot.channelState, "detail": snapshot.channelDetail, "consecutive_no_live": snapshot.channelFailures, "checked_at": snapshot.channelChecked.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "auto_recovery_enabled": recoveryLedger.autoRecoveryEnabled, "last_recovery_attempt": recoveryLedger.lastAttempt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "last_ping_at": lastPingAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "last_ping_result": lastPingResult, "check_deferred_reason": deferredReason, "recovery_status": recoveryAvailability(), "last_recovery_result": lastRecoveryOutcome as Any? ?? NSNull()], "menu": ["menubar_title": item.button?.title ?? "", "menubar_has_icon": item.button?.image != nil, "connection": summaryLines[0].title, "channel": summaryLines[0].title, "tool_execution": summaryLines[1].title, "action": summaryLines[2].title, "recovery": summaryLines[3].title, "chatgpt": summaryLines[4].title, "execution_step_rows": rows, "execution_steps": safeSteps, "tool_call_elapsed_seconds": callElapsed as Any? ?? NSNull(), "tool_call_state": currentState, "recent_actions": snapshot.activity.recent], "activity": ["state": snapshot.activity.state, "tool": snapshot.activity.tool, "active_count": snapshot.activity.activeCount, "observed_at": snapshot.activity.observed.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "recent": snapshot.activity.recent, "error": snapshot.activity.error, "coverage_gap": snapshot.activity.coverageGap, "gap_reason": snapshot.activity.gapReason, "gap_first_at": snapshot.activity.gapFirstAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "gap_last_at": snapshot.activity.gapLastAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "backlog_bytes": snapshot.activity.backlogBytes, "catching_up": snapshot.activity.catchingUp, "pending_line": snapshot.activity.pendingLine, "idle_proven": snapshot.activity.idleProven], "timeline": ["coverage": snapshot.timeline.coverage, "commander_errors_this_run": snapshot.timeline.commanderErrors, "conversation_labels_verified_at": snapshot.timeline.conversationLabelsVerifiedAt as Any? ?? NSNull(), "last_chatgpt_app_event": lastAppEvent, "events": timelineRows]]
         object["tool_execution"] = ["state": snapshot.toolExecutionState, "detail": snapshot.toolExecutionDetail, "checked_at": snapshot.toolExecutionChecked.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "fresh": toolExecutionFresh(snapshot, now: Date()), "evidence_ttl_seconds": Int(toolExecutionEvidenceTTL), "probe_deferred_reason": toolProbeDeferredReason]
+        let latestHistory: [String: Any] = snapshot.toolHistory.latest.map { record in ["tool": record.tool, "label": record.label, "timestamp": ISO8601DateFormatter.flex.string(from: record.timestamp), "duration_seconds": record.duration as Any? ?? NSNull(), "result": record.resultLabel, "cloud_receipt": record.cloudReceiptLabel, "process_caveat": record.processCaveat as Any? ?? NSNull()] } ?? [:]
+        object["tool_history"] = ["state": snapshot.toolHistory.state, "source_available": snapshot.toolHistory.sourceAvailable, "bootstrap_limited": snapshot.toolHistory.bootstrapLimited, "coverage_gap": snapshot.toolHistory.coverageGap, "gap_reason": snapshot.toolHistory.gapReason, "malformed_lines": snapshot.toolHistory.malformedLines, "backlog_bytes": snapshot.toolHistory.backlogBytes, "latest": latestHistory, "limitation": "结构化历史无可靠调用编号，不按时间与会话或 stdout 记录合并"]
         object["diagnosis"] = ["title": diagnosis.title, "started_at": diagnosis.startedAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "last_seen_at": diagnosis.lastSeenAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "next_action": diagnosis.nextAction, "evidence": diagnosis.evidence, "network_guardian": diagnosis.network.safeSummary]
         guard let d = try? JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys]) else { return }
         do { try d.write(to: dir.appendingPathComponent("status.json"), options: .atomic) }
@@ -3009,7 +3209,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                 section("Commander 诊断依据", subtitle: "不重复顶部状态与时间，只显示额外证据", rows: [("服务", snapshot.service), ("云端登记", snapshot.cloud), ("通道说明", displayPingResult(snapshot.channelDetail)), ("工具依据", snapshot.toolExecutionDetail), ("工具检查暂缓", toolProbeBusy ? "正在检查" : toolProbeDeferredReason), ("手动检查", displayPingResult(manualNotice ?? deferredReason))]),
                 section("自动恢复", rows: [("状态", recoveryAvailability()), ("冷却剩余", remaining.map { "\($0) 秒" } ?? "无"), ("最近尝试", stamp(recoveryLedger.lastAttempt)), ("最近结果", lastRecoveryOutcome ?? (recoveryLedger.lastAttempt == nil ? "暂无恢复尝试" : "本次运行未观察到结果"))]),
                 section("ChatGPT 观察范围", subtitle: "回答状态与更新连接已在顶部显示", rows: [("监控范围", "仅当前本机 App 的固定事件；其他设备或网页提示可能不可见"), ("覆盖限制", chat.deliveryLimit), ("处理建议", "回原对话确认回答状态，核对操作记录后再决定是否继续")]),
-                section("日志覆盖", rows: [("本机活动", callState(activity)), ("调用日志", activity.error ? "暂时不可读" : activity.coverageGap ? "覆盖缺口 · \(activity.gapReason)" : activity.catchingUp ? "追赶中 · 剩余 \(activity.backlogBytes) 字节" : "当前未发现覆盖缺口"), ("缺口首次", stamp(activity.gapFirstAt)), ("缺口最近", stamp(activity.gapLastAt)), ("时间线", snapshot.timeline.coverage)]),
+                section("日志覆盖", rows: [("本机活动", callState(activity)), ("调用日志", activity.error ? "暂时不可读" : activity.coverageGap ? "覆盖缺口 · \(activity.gapReason)" : activity.catchingUp ? "追赶中 · 剩余 \(activity.backlogBytes) 字节" : "当前未发现覆盖缺口"), ("结构化历史", snapshot.toolHistory.state), ("最近结构化记录", toolHistoryLatestSummary()), ("结构化限制", "无可靠调用编号；不按时间与会话或上方记录强行合并，也不能单独证明空闲"), ("缺口首次", stamp(activity.gapFirstAt)), ("缺口最近", stamp(activity.gapLastAt)), ("时间线", snapshot.timeline.coverage)]),
                 section("连接与异常", subtitle: "最多 20 条 · 新事件在前", rows: recent.isEmpty ? [("记录", "暂无连接事件")] : recent)
             ])
         }
