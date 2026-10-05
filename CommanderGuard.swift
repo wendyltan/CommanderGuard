@@ -2995,13 +2995,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             setSections([
                 section("当前需要处理", rows: [("判断", diagnosis.title), ("下一步", diagnosis.nextAction), ("首次观察", stamp(diagnosis.startedAt)), ("最近观察", stamp(diagnosis.lastSeenAt)), ("说明", diagnosis.evidence)]),
                 section("当前活动", subtitle: "仅表示本机已观察到的调用", rows: [("状态", action), ("日志", activity.error ? "暂时不可读" : activity.coverageGap ? "覆盖缺口 · \(activity.gapReason)" : activity.catchingUp ? "追赶中" : "读取正常")]),
-                section("链路分层", subtitle: "四层分别判断，任一层成功不替代其他层", rows: [
-                    ("消息通道", "\(channelSummary(snapshot, now: Date())) · \(stamp(lastPingAt))"),
-                    ("工具执行", "\(toolExecutionSummary(now: Date())) · \(stamp(snapshot.toolExecutionChecked))"),
-                    ("ChatGPT 回答", snapshot.timeline.latestAppIssue == nil ? chat.answer : "原回答恢复未确认"),
-                    ("网络路径", "\(networkLayerStatus(diagnosis.network)) · \(stamp(diagnosis.network.updatedAt))")
-                ]),
-                section("最近事件", subtitle: "新事件在前 · 更多细节见连接诊断", rows: recent.isEmpty ? [("记录", "暂无连接或异常事件")] : recent)
+                section("最近事件", subtitle: "顶部四张状态卡已显示当前链路状态；这里仅保留事件经过", rows: recent.isEmpty ? [("记录", "暂无连接或异常事件")] : recent)
             ])
         } else {
             let diagnosis = currentDiagnosis()
@@ -3011,10 +3005,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             }
             setSections([
                 section("诊断与下一步", rows: [("判断", diagnosis.title), ("建议", diagnosis.nextAction), ("首次观察", stamp(diagnosis.startedAt)), ("最近观察", stamp(diagnosis.lastSeenAt)), ("证据范围", diagnosis.evidence)]),
-                section("网络守护", rows: [("选定状态", diagnosis.network.safeSummary)]),
-                section("Commander 链路", rows: [("服务", snapshot.service), ("云端登记", snapshot.cloud), ("消息通道", channelSummary(snapshot, now: Date())), ("通道说明", displayPingResult(snapshot.channelDetail)), ("通道检查", stamp(lastPingAt)), ("工具执行", toolExecutionSummary(now: Date())), ("工具检查", stamp(snapshot.toolExecutionChecked)), ("工具依据", snapshot.toolExecutionDetail), ("工具检查暂缓", toolProbeBusy ? "正在检查" : toolProbeDeferredReason), ("手动检查", displayPingResult(manualNotice ?? deferredReason))]),
+                section("网络守护证据", subtitle: "顶部卡片只显示结论；这里保留判断依据", rows: [("选定状态", diagnosis.network.safeSummary)]),
+                section("Commander 诊断依据", subtitle: "不重复顶部状态与时间，只显示额外证据", rows: [("服务", snapshot.service), ("云端登记", snapshot.cloud), ("通道说明", displayPingResult(snapshot.channelDetail)), ("工具依据", snapshot.toolExecutionDetail), ("工具检查暂缓", toolProbeBusy ? "正在检查" : toolProbeDeferredReason), ("手动检查", displayPingResult(manualNotice ?? deferredReason))]),
                 section("自动恢复", rows: [("状态", recoveryAvailability()), ("冷却剩余", remaining.map { "\($0) 秒" } ?? "无"), ("最近尝试", stamp(recoveryLedger.lastAttempt)), ("最近结果", lastRecoveryOutcome ?? (recoveryLedger.lastAttempt == nil ? "暂无恢复尝试" : "本次运行未观察到结果"))]),
-                section("ChatGPT 回答与连接", rows: [("回答事件", chat.answer), ("更新连接", chat.connection), ("监控范围", "仅当前本机 App 的固定事件；其他设备或网页提示可能不可见"), ("覆盖限制", chat.deliveryLimit), ("处理建议", "回原对话确认回答状态，核对操作记录后再决定是否继续")]),
+                section("ChatGPT 观察范围", subtitle: "回答状态与更新连接已在顶部显示", rows: [("监控范围", "仅当前本机 App 的固定事件；其他设备或网页提示可能不可见"), ("覆盖限制", chat.deliveryLimit), ("处理建议", "回原对话确认回答状态，核对操作记录后再决定是否继续")]),
                 section("日志覆盖", rows: [("本机活动", callState(activity)), ("调用日志", activity.error ? "暂时不可读" : activity.coverageGap ? "覆盖缺口 · \(activity.gapReason)" : activity.catchingUp ? "追赶中 · 剩余 \(activity.backlogBytes) 字节" : "当前未发现覆盖缺口"), ("缺口首次", stamp(activity.gapFirstAt)), ("缺口最近", stamp(activity.gapLastAt)), ("时间线", snapshot.timeline.coverage)]),
                 section("连接与异常", subtitle: "最多 20 条 · 新事件在前", rows: recent.isEmpty ? [("记录", "暂无连接事件")] : recent)
             ])
