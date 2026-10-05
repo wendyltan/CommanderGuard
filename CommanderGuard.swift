@@ -17,6 +17,9 @@ struct Snapshot {
     var channelDetail = "等待 Commander 与日志完成启动"
     var channelFailures = 0
     var channelChecked: Date?
+    var toolExecutionState = "未验证"
+    var toolExecutionDetail = "尚未检查本机工具执行"
+    var toolExecutionChecked: Date?
     var activity = ActivitySummary()
     var timeline = TimelineSummary()
 }
@@ -33,6 +36,13 @@ struct ActivitySummary {
     var returnedStepID: String?
     var error = false
     var coverageGap = false
+    var gapReason = ""
+    var gapFirstAt: Date?
+    var gapLastAt: Date?
+    var backlogBytes: UInt64 = 0
+    var idleProven = false
+    var pendingLine = false
+    var catchingUp: Bool { backlogBytes > 0 }
     var activeCount: Int { active.values.reduce(0, +) }
     var title: String { error ? "读取异常" : (tool.isEmpty ? state : tool) }
 }
@@ -46,20 +56,39 @@ struct ActivityStep {
     var duration: TimeInterval?
     var uncertain = false
     var failed = false
-    func elapsed(at uptime: TimeInterval) -> TimeInterval? { uncertain ? nil : duration ?? max(0, uptime - startedUptime) }
+    var historical = false
+    var finished = false
+    func elapsed(at uptime: TimeInterval) -> TimeInterval? { uncertain || historical ? nil : duration ?? max(0, uptime - startedUptime) }
 }
 
 func activityStepRows(_ steps: [ActivityStep], uptime: TimeInterval) -> [String] {
     let clock = DateFormatter(); clock.dateFormat = "HH:mm:ss"
     return steps.map { step in
-        let symbol = step.uncertain ? "?" : (step.failed ? "!" : (step.duration != nil ? "✓" : "●"))
-        let duration = step.uncertain ? "未确认" : (step.duration == nil ? "进行中 \(barCallClock(step, uptime: uptime))" : barCallClock(step, uptime: uptime))
-        return "\(clock.string(from: step.startedAt))  \(symbol)  \(step.detail)  · \(duration)"
+        let symbol = step.historical && step.finished ? (step.failed ? "!" : "✓") : (step.uncertain ? "?" : (step.failed ? "!" : (step.finished || step.duration != nil ? "✓" : "●")))
+        let duration = step.historical ? (step.finished ? "已返回 · 耗时未知" : "开始时间未知 · 状态未确认") : (step.uncertain ? "未确认" : (step.duration == nil ? "进行中 \(barCallClock(step, uptime: uptime))" : barCallClock(step, uptime: uptime)))
+        return "\(step.historical ? "时间未知" : clock.string(from: step.startedAt))  \(symbol)  \(step.detail)  · \(duration)"
     }
 }
 
 func visibleTimelineEvents(_ events: [TimelineEvent]) -> [TimelineEvent] {
     events.filter { $0.source == "chatgpt_app" || $0.event.hasPrefix("Commander错误:") || $0.event.hasPrefix("调用error:") }
+}
+
+func groupedTimelineEvents(_ events: [TimelineEvent], window: TimeInterval = 1) -> [(TimelineEvent, Int)] {
+    var groups: [(TimelineEvent, Int)] = []
+    for event in events {
+        let date = ISO8601DateFormatter.parse(event.sourceAt ?? event.observedAt)
+        if let index = groups.indices.last,
+           groups[index].0.source == event.source,
+           groups[index].0.event == event.event,
+           groups[index].0.conversationTitle == event.conversationTitle,
+           groups[index].0.failureKind == event.failureKind,
+           let priorDate = ISO8601DateFormatter.parse(groups[index].0.sourceAt ?? groups[index].0.observedAt),
+           let date, abs(priorDate.timeIntervalSince(date)) <= window {
+            groups[index].1 += 1
+        } else { groups.append((event, 1)) }
+    }
+    return groups
 }
 
 struct TimelineEvent: Codable {
@@ -68,9 +97,11 @@ struct TimelineEvent: Codable {
     let sourceAt: String?
     let observedAt: String
     let conversationTitle: String?
+    let failureKind: String?
 
-    init(source: String, event: String, sourceAt: String?, observedAt: String, conversationTitle: String? = nil) {
+    init(source: String, event: String, sourceAt: String?, observedAt: String, conversationTitle: String? = nil, failureKind: String? = nil) {
         self.source = source; self.event = event; self.sourceAt = sourceAt; self.observedAt = observedAt; self.conversationTitle = conversationTitle
+        self.failureKind = failureKind
     }
 }
 
@@ -80,7 +111,244 @@ struct TimelineSummary {
     var history: [TimelineEvent] = []
     var commanderErrors = 0
     var latestAppEvent: TimelineEvent?
+    var latestAppIssue: TimelineEvent?
     var conversationLabelsVerifiedAt: String?
+}
+
+struct NetworkGuardianStatus {
+    let updatedAt: Date?
+    let healthy: Bool?
+    let proxyAvailable: Bool?
+    let tunnelState: String
+    let manualPause: Bool?
+    let newLogFailures: Double?
+    let recentFailureScore: Double?
+
+    static func read(_ url: URL, now: Date) -> NetworkGuardianStatus {
+        func unknown() -> NetworkGuardianStatus { NetworkGuardianStatus(updatedAt: nil, healthy: nil, proxyAvailable: nil, tunnelState: "unknown", manualPause: nil, newLogFailures: nil, recentFailureScore: nil) }
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              attributes[.type] as? FileAttributeType == .typeRegular,
+              let size = attributes[.size] as? NSNumber, size.intValue <= 64 * 1024,
+              let data = try? Data(contentsOf: url), data.count <= 64 * 1024,
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let rawDate = object["updated_at"] as? String,
+              rawDate.range(of: #"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})$"#, options: .regularExpression) != nil,
+              let updatedAt = ISO8601DateFormatter.parse(rawDate), now.timeIntervalSince(updatedAt) >= 0,
+              now.timeIntervalSince(updatedAt) <= 120,
+              let healthyNumber = object["healthy"] as? NSNumber, CFGetTypeID(healthyNumber) == CFBooleanGetTypeID(),
+              let proxyNumber = object["proxy_available"] as? NSNumber, CFGetTypeID(proxyNumber) == CFBooleanGetTypeID(),
+              let healthy = object["healthy"] as? Bool, let proxyAvailable = object["proxy_available"] as? Bool,
+              let tunnel = object["tunnel_state"] as? String,
+              ["running", "down", "unknown"].contains(tunnel) else { return unknown() }
+        let manualNumber = object["manual_pause"] as? NSNumber
+        let manualPause = manualNumber.flatMap { CFGetTypeID($0) == CFBooleanGetTypeID() ? object["manual_pause"] as? Bool : nil }
+        func bounded(_ key: String) -> Double? {
+            guard let value = object[key] as? NSNumber else { return nil }
+            guard CFGetTypeID(value) != CFBooleanGetTypeID() else { return nil }
+            let number = value.doubleValue
+            return number.isFinite && (0...1_000_000).contains(number) ? number : nil
+        }
+        guard object["manual_pause"] == nil || manualPause != nil,
+              ["new_log_failures", "recent_failure_score"].allSatisfy({ object[$0] == nil || bounded($0) != nil }) else { return unknown() }
+        return NetworkGuardianStatus(updatedAt: updatedAt, healthy: healthy, proxyAvailable: proxyAvailable,
+                                     tunnelState: tunnel, manualPause: manualPause,
+                                     newLogFailures: bounded("new_log_failures"), recentFailureScore: bounded("recent_failure_score"))
+    }
+
+    var safeSummary: String {
+        guard let updatedAt else { return "网络守护状态未知（文件缺失、格式无效或超过 120 秒）" }
+        let health = healthy.map { $0 ? "网页探测正常（不验证持久连接）" : "网页探测失败" } ?? "网页探测未知"
+        let proxy = proxyAvailable.map { $0 ? "可用" : "不可用" } ?? "未知"
+        let pause = manualPause == true ? " · 手动暂停" : ""
+        let failures = newLogFailures.map { " · 新日志失败 \(String(format: "%.4g", $0))" } ?? ""
+        let score = recentFailureScore.map { " · 近期失败分数 \(String(format: "%.4g", $0))" } ?? ""
+        let clock = DateFormatter(); clock.dateFormat = "HH:mm:ss"
+        let tunnel = ["running": "运行中", "down": "未运行", "unknown": "未知"][tunnelState] ?? "未知"
+        return "\(health) · 代理\(proxy) · 隧道\(tunnel)\(pause)\(failures)\(score) · 更新 \(clock.string(from: updatedAt))"
+    }
+}
+
+struct IncidentDiagnosis {
+    let title: String
+    let startedAt: Date?
+    let lastSeenAt: Date?
+    let nextAction: String
+    let evidence: String
+    let network: NetworkGuardianStatus
+
+    static func make(timeline: TimelineSummary, activity: ActivitySummary, network: NetworkGuardianStatus, service: String = "未知", channelState: String = "未知", now: Date) -> IncidentDiagnosis {
+        let retained = timeline.history + (timeline.latestAppIssue.map { [$0] } ?? [])
+        var seen = Set<String>()
+        let events = retained.filter { event in
+            let key = "\(event.source)|\(event.event)|\(event.sourceAt ?? "")|\(event.observedAt)"
+            return seen.insert(key).inserted
+        }.compactMap { event -> (TimelineEvent, Date)? in
+            let raw = event.source == "chatgpt_app" ? (event.sourceAt ?? event.observedAt) : event.observedAt
+            guard let date = ISO8601DateFormatter.parse(raw), now.timeIntervalSince(date) >= 0 else { return nil }
+            return (event, date)
+        }
+        let recent = events.filter { now.timeIntervalSince($0.1) <= 900 }
+        let closeNames: Set<String> = ["chatgpt_pubsub_transport_closed", "chatgpt_pubsub_connection_failed", "chatgpt_pubsub_reconnect_scheduled", "chatgpt_pubsub_reconnect_exhausted"]
+        let appDisruptions = recent.filter { $0.0.source == "chatgpt_app" && closeNames.contains($0.0.event.components(separatedBy: " · ").first ?? "") }
+        let latestOpen = recent.filter { $0.0.source == "chatgpt_app" && $0.0.event == "chatgpt_pubsub_transport_opened" }.map(\.1).max()
+        let closeEvents = appDisruptions.filter { $0.0.event == "chatgpt_pubsub_transport_closed" }
+        let groupedCloses = groupedTimelineEvents(closeEvents.sorted { $0.1 < $1.1 }.map(\.0))
+        let answerIssues = events.filter { event, _ in
+            event.source == "chatgpt_app" && (event.event == "chatgpt_completion_transport_recovery_started" || event.event == "chatgpt_completion_transport_recovery_poll_failed" || event.event == "chatgpt_conversation_refetch_completed · error")
+        }
+        let appIssue = answerIssues.filter { now.timeIntervalSince($0.1) <= 900 }.max { $0.1 < $1.1 }
+        let oldAnswerIssue = answerIssues.max { $0.1 < $1.1 }
+        let appDisruption = appDisruptions.max { $0.1 < $1.1 }
+        let commanderConnectivity = recent.filter { $0.0.source == "commander" && ["Commander错误: 通道错误", "Commander错误: 通道订阅超时", "Commander错误: 通道关闭"].contains($0.0.event) }
+        let commanderIssue = recent.filter { $0.0.source == "commander" && ($0.0.event.hasPrefix("Commander错误:") || $0.0.event.hasPrefix("调用error:")) }.max { $0.1 < $1.1 }
+        let appAt = appDisruption?.1
+        let guardianBad = network.healthy == false || network.proxyAvailable == false || network.tunnelState == "down" || (network.newLogFailures ?? 0) > 0 || (network.recentFailureScore ?? 0) > 0
+        let matchedCommander = appAt.flatMap { appDate in commanderConnectivity.filter { abs($0.1.timeIntervalSince(appDate)) <= 10 }.min { abs($0.1.timeIntervalSince(appDate)) < abs($1.1.timeIntervalSince(appDate)) } }
+        let shared = appAt != nil && matchedCommander != nil
+        let unknownActivity = activity.error || activity.coverageGap || activity.catchingUp || !activity.idleProven || activity.state.contains("未确认") || activity.state.contains("未知")
+        let busyActivity = activity.activeCount > 0
+        let coverageUnknown = ["缺失", "不可读", "缺口", "读取失败", "截断", "轮换", "队列已满", "追赶中", "初次读取"].contains { timeline.coverage.contains($0) }
+        let reopened = latestOpen.map { open in appAt.map { open > $0 } ?? false } ?? false
+        let serviceIssue = service == "未运行" || ["通道异常", "通道不可用", "恢复尚未确认"].contains(channelState)
+        let networkIssue = network.updatedAt != nil && guardianBad
+        let title: String
+        let action: String
+        let evidence: String
+        var relevantDates: [Date] = []
+        var lastObservedOverride: Date?
+        if serviceIssue {
+            title = service == "未运行" ? "Commander 服务当前未运行" : "Commander 命令通道检查异常"
+            action = "查看本机服务与操作记录；确认调用状态后再决定下一步。"
+            evidence = "ping 只检查本机命令通道响应；未验证实际工具执行或 ChatGPT 回答。"
+        } else if shared {
+            title = "App 与 Commander 连接近期同时异常"
+            action = "检查网络连接；回到原对话核对回答，再决定是否继续。"
+            evidence = "Commander 使用本机观察时间；时间接近提示可能共享连接问题，但不证明根因或会话归属。"
+            relevantDates = [appAt, matchedCommander?.1].compactMap { $0 }
+        } else if let appIssue {
+            title = "ChatGPT 回答异常仍未确认恢复"
+            action = "回到原对话确认回答状态；不要因 ping 或公开 HTTP 成功而重发。"
+            evidence = "回答异常独立保留；通道 ping 只检查本机命令通道。"
+            relevantDates = [appIssue.1]
+        } else if let appDisruption {
+            title = "ChatGPT 更新连接近期中断" + (groupedCloses.count > 1 ? " · 近15分钟 \(groupedCloses.count) 个关闭时段" : "") + (reopened ? "，之后观察到重新连接" : "")
+            action = "回到 ChatGPT App 检查连接，并确认原回答状态。"
+            evidence = "重新连接不证明回答恢复；这是 App 事件，不等同于 Commander ping。"
+            relevantDates = closeEvents.map(\.1)
+            if relevantDates.isEmpty { relevantDates = [appDisruption.1] }
+            if reopened, let latestOpen { relevantDates.append(latestOpen) }
+        } else if let commanderIssue {
+            title = commanderIssue.0.event.hasPrefix("调用error:") ? "Commander 本机操作近期出现异常" : "Commander 连接近期出现异常"
+            action = unknownActivity || busyActivity ? "先查看操作记录并确认本机调用状态；当前不建议重启或重试。" : "查看对应本机操作记录，确认结果后再继续。"
+            evidence = "Commander 时间是本机观察时间；记录不证明云端完成。"
+            relevantDates = [commanderIssue.1]
+        } else if networkIssue {
+            title = "网络守护近期报告网络异常"
+            action = "检查网络守护当前状态与网络连接；此状态不说明 ChatGPT 回答结果。"
+            evidence = "网页探测失败或隧道状态只是选定的本机状态；不证明 ChatGPT 持久连接根因。"
+            lastObservedOverride = network.updatedAt
+        } else if coverageUnknown {
+            title = "诊断覆盖存在缺口"
+            action = "先确认日志重新可读，再查看原对话与本机操作记录。"
+            evidence = "日志缺失或覆盖缺口不能证明当前连接或回答正常。"
+            relevantDates = activity.coverageGap ? [activity.gapFirstAt, activity.gapLastAt].compactMap { $0 } : []
+        } else if let oldAnswerIssue {
+            title = "较早的 ChatGPT 回答异常仍未确认"
+            action = "回到原对话确认回答状态；近期 ping 不会清除此异常。"
+            evidence = "回答异常独立保留；通道 ping 只检查本机命令通道。"
+            relevantDates = [oldAnswerIssue.1]
+        } else if busyActivity {
+            title = "本机调用进行中"
+            action = "等待当前调用返回，再查看操作记录确认结果。"
+            evidence = "本机调用仍在进行；当前不建议重启或重试。"
+            relevantDates = []
+        } else if unknownActivity {
+            title = "本机调用状态未确认"
+            action = "先查看操作记录并等待日志状态明确；当前不建议重启或重试。"
+            evidence = "日志缺口、活动调用或未知状态不能当作空闲。"
+            relevantDates = []
+        } else {
+            title = "当前没有可操作的近期异常"
+            action = "如仍有问题，检查原对话中的回答与本机操作记录。"
+            evidence = "ping 成功仅代表该次本机命令通道探测往返，不验证 ChatGPT 回答或工具执行。"
+            relevantDates = []
+        }
+        return IncidentDiagnosis(title: title, startedAt: relevantDates.min(), lastSeenAt: lastObservedOverride ?? relevantDates.max(), nextAction: action, evidence: evidence, network: network)
+    }
+}
+
+
+/// Safe, passive summary for fixed ChatGPT App events already sanitized by TimelineReader.
+/// Never accepts or retains URLs, conversation IDs, message bodies, or raw errors.
+struct ChatMonitorEvidence {
+    let kind: String
+    let observedAt: String
+    let outcome: String? // accepted only as one of TimelineReader’s fixed refetch statuses
+    let failureKind: String? // fixed classification; never a raw App error
+}
+
+struct ChatMonitorSummary {
+    let answer: String
+    let connection: String
+    let deliveryLimit = "Message delivery timed out 没有可读的专属结构化事件；响应恢复尝试只是前兆，不代表该提示已出现"
+
+    var menuLine: String { "ChatGPT：" + (answer.components(separatedBy: "；").first ?? answer) }
+}
+
+func chatMonitorSummary(events: [ChatMonitorEvidence], timelineCoverage: String) -> ChatMonitorSummary {
+    let unreadable = ["不可读", "缺口", "缺失", "读取失败", "轮换或截断", "新日志路径", "队列已满", "追赶中", "初次读取"].contains { timelineCoverage.contains($0) }
+    let stamp: (String) -> String = { raw in
+        let parser = ISO8601DateFormatter(); parser.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        guard let date = parser.date(from: raw) ?? ISO8601DateFormatter().date(from: raw) else { return "时间未知" }
+        let f = DateFormatter(); f.locale = Locale(identifier: "zh_CN"); f.dateFormat = "MM-dd HH:mm:ss"
+        return f.string(from: date)
+    }
+
+    let answerEvents = events.filter {
+        $0.kind == "chatgpt_completion_transport_recovery_started" || $0.kind == "chatgpt_completion_transport_recovery_poll_failed" ||
+        ($0.kind == "chatgpt_conversation_refetch_completed" && $0.outcome == "error")
+    }
+    let answer: String
+    if let latest = answerEvents.max(by: { $0.observedAt < $1.observedAt || ($0.observedAt == $1.observedAt && $0.failureKind == nil && $1.failureKind != nil) }) {
+        let type = latest.kind == "chatgpt_completion_transport_recovery_poll_failed" ? "回答恢复检查失败" : latest.kind == "chatgpt_completion_transport_recovery_started" ? (latest.failureKind == "resume_unavailable" ? "恢复流不可用" : "响应流恢复尝试") : "对话状态刷新失败"
+        answer = "最近异常：\(type) · \(stamp(latest.observedAt))；恢复情况未确认"
+    } else if unreadable {
+        answer = "日志不可读或有缺口；回答状态未知"
+    } else {
+        answer = "尚未观察到可识别的回答异常"
+    }
+
+    let connectionEvents = events.filter {
+        ["chatgpt_pubsub_reconnect_exhausted", "chatgpt_pubsub_connection_failed", "chatgpt_pubsub_transport_closed", "chatgpt_pubsub_reconnect_scheduled", "chatgpt_pubsub_transport_opened"].contains($0.kind)
+    }
+    let connection: String
+    if let latest = connectionEvents.max(by: { $0.observedAt < $1.observedAt }) {
+        let detail: String
+        switch latest.kind {
+        case "chatgpt_pubsub_reconnect_exhausted": detail = "更新连接重连已耗尽"
+        case "chatgpt_pubsub_connection_failed": detail = "更新连接失败"
+        case "chatgpt_pubsub_transport_closed": detail = "更新连接已关闭"
+        case "chatgpt_pubsub_reconnect_scheduled": detail = "更新连接准备重连"
+        default: detail = "更新连接已建立"
+        }
+        let next = latest.kind == "chatgpt_pubsub_transport_opened" ? "仍需单独确认回答是否恢复" : "检查 ChatGPT 网络连接；恢复后确认原回答状态"
+        connection = "\(detail) · \(stamp(latest.observedAt))；\(next)"
+    } else if unreadable {
+        connection = "连接状态未知（日志不可读或有缺口）"
+    } else {
+        connection = "暂无连接异常事件；连接事件缺失不代表回答成功"
+    }
+    return ChatMonitorSummary(answer: answer, connection: connection)
+}
+
+
+func chatMonitorSummary(_ timeline: TimelineSummary) -> ChatMonitorSummary {
+    let retained = timeline.history + (timeline.latestAppIssue.map { [$0] } ?? [])
+    let evidence = retained.filter { $0.source == "chatgpt_app" }.map { event -> ChatMonitorEvidence in
+        let parts = event.event.components(separatedBy: " · ")
+        return ChatMonitorEvidence(kind: parts[0], observedAt: event.sourceAt ?? event.observedAt, outcome: parts.count > 1 ? parts[1] : nil, failureKind: event.failureKind)
+    }
+    return chatMonitorSummary(events: evidence, timelineCoverage: timeline.coverage)
 }
 
 struct ConversationLabelCatalog {
@@ -135,10 +403,16 @@ func appEventLabel(_ event: TimelineEvent) -> String {
     case "chatgpt_pubsub_transport_closed": return "更新连接已关闭"
     case "chatgpt_pubsub_transport_opened": return "更新连接已建立"
     case "chatgpt_pubsub_reconnect_scheduled": return "更新连接准备重连"
-    case "chatgpt_completion_transport_recovery_started": return "\(title) · 响应恢复尝试"
+    case "chatgpt_pubsub_reconnect_exhausted": return "更新连接重连已耗尽；可回到 App 尝试恢复"
+    case "chatgpt_completion_transport_recovery_completed": return "\(title) · 已记录回答恢复完成（其他异常仍需确认）"
+    case "chatgpt_completion_transport_recovery_poll_failed": return "\(title) · 回答恢复检查失败"
+    case "chatgpt_pubsub_connection_failed": return "更新连接失败"
+    case "chatgpt_completion_transport_recovery_started": return "\(title) · \(event.failureKind == "resume_unavailable" ? "恢复流不可用" : "响应恢复尝试")"
     case "chatgpt_conversation_refetch_started": return "\(title) · 对话状态开始刷新"
     case "chatgpt_conversation_refetch_completed":
-        let status = ["streaming": "界面响应中", "error": "界面错误", "idle": "界面空闲"][parts.count > 1 ? parts[1] : ""] ?? "状态未确认"
+        let outcome = parts.count > 1 ? parts[1] : ""
+        if outcome == "error" { return "\(title) · 对话状态刷新失败" }
+        let status = ["streaming": "界面响应中", "idle": "界面空闲"][outcome] ?? "状态未确认"
         return "\(title) · 对话状态刷新（\(status)）"
     default: return "未知 App 事件"
     }
@@ -150,6 +424,35 @@ func conversationLabelNote(_ verifiedAt: String?) -> String {
         let formatter = DateFormatter(); formatter.dateFormat = "MM-dd HH:mm"; return formatter.string(from: date)
     } ?? "未知"
     return "会话名录核对于 \(localTime)；Commander 调用归属未确认。"
+}
+
+// Examine only the bounded structured error field; never persist its payload.
+func appRecoveryFailure(_ fields: String) -> String? {
+    guard let start = fields.range(of: #"(?:^|\s)error="#, options: .regularExpression)?.upperBound,
+          fields[start...].first == "{" else { return nil }
+    var depth = 0, quoted = false, escaped = false
+    for index in fields[start...].indices {
+        let character = fields[index]
+        if quoted {
+            if escaped { escaped = false }
+            else if character == "\\" { escaped = true }
+            else if character == "\"" { quoted = false }
+        } else if character == "\"" { quoted = true }
+        else if character == "{" { depth += 1 }
+        else if character == "}" {
+            depth -= 1
+            if depth == 0 {
+                let bytes = Data(fields[start...index].utf8)
+                guard let object = (try? JSONSerialization.jsonObject(with: bytes)) as? [String: Any],
+                      object["type"] as? String == "fetch-stream-error", object["responseStatus"] as? Int == 404,
+                      let body = object["error"] as? String,
+                      let detail = (try? JSONSerialization.jsonObject(with: Data(body.utf8))) as? [String: Any],
+                      detail["detail"] as? String == "Resume stream unavailable" else { return nil }
+                return "resume_unavailable"
+            }
+        }
+    }
+    return nil
 }
 
 /// Passively tails only anchored Commander records and fixed ChatGPT App events.
@@ -171,6 +474,7 @@ final class TimelineReader {
     private var pendingBytes = 0
     private var commanderErrors = 0
     private var latestAppEvent: TimelineEvent?
+    private var latestAppIssue: TimelineEvent?
     private var coverage = "初次读取中"
     private let maxRead = 64 * 1024
     private let maxLine = 8 * 1024
@@ -183,7 +487,7 @@ final class TimelineReader {
         loadJournal()
     }
 
-    var summary: TimelineSummary { TimelineSummary(coverage: coverage, events: Array(events.suffix(12)), history: Array(events.suffix(500)), commanderErrors: commanderErrors, latestAppEvent: latestAppEvent, conversationLabelsVerifiedAt: conversationLabels.verifiedAt) }
+    var summary: TimelineSummary { TimelineSummary(coverage: coverage, events: Array(events.suffix(12)), history: Array(events.suffix(500)), commanderErrors: commanderErrors, latestAppEvent: latestAppEvent, latestAppIssue: latestAppIssue, conversationLabelsVerifiedAt: conversationLabels.verifiedAt) }
 
     func poll(now: Date = Date()) {
         var found = false
@@ -215,7 +519,13 @@ final class TimelineReader {
         else if appLogsMissing { coverage = "App 日志缺失 · Commander 调用归属未确认" }
         else if commanderMissing { coverage = "Commander stdout 日志缺失 · Commander 调用归属未确认" }
         else if let commanderErrorLog, !manager.fileExists(atPath: commanderErrorLog.path) { coverage = "Commander 错误日志缺失 · 调用归属未确认" }
-        else if !coverageGap { coverage = "已覆盖当前日志 · Commander 调用归属未确认" }
+        else if !coverageGap {
+            let catchingUp = logs.contains { url in
+                guard let size = (try? manager.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.uint64Value, let cursor = cursors[url.path] else { return true }
+                return size > cursor.offset
+            }
+            coverage = catchingUp ? "App 日志追赶中 · Commander 调用归属未确认" : "已覆盖当前日志 · Commander 调用归属未确认"
+        }
         initialPollComplete = true
         saveIfNeeded()
     }
@@ -226,9 +536,10 @@ final class TimelineReader {
         let inode = (attributes[.systemFileNumber] as? NSNumber)?.uint64Value
         var cursor = cursors[key]
         if cursor == nil {
-            let offset = size
-            if initialPollComplete { coverageGap = true; coverage = "新日志路径 · 覆盖有缺口" }
+            let offset = source == "chatgpt_app" ? (size > 2 * 1024 * 1024 ? size - 2 * 1024 * 1024 : 0) : size
+            if initialPollComplete && offset > 0 { coverageGap = true; coverage = "新日志路径跳过了旧记录 · 覆盖有缺口" }
             cursor = Cursor(offset: offset, inode: inode); cursors[key] = cursor; partial[key] = Data()
+            discarding[key] = source == "chatgpt_app" && offset > 0
             if offset == size { return }
         }
         if cursor!.inode != inode || size < cursor!.offset { coverageGap = true; coverage = "日志轮换或截断 · 覆盖有缺口"; cursors[key] = Cursor(offset: size, inode: inode); partial[key] = Data(); discarding[key] = false; return }
@@ -247,7 +558,18 @@ final class TimelineReader {
         var line = partial[key] ?? Data(), dropping = discarding[key] ?? false
         for byte in data {
             if byte == 10 { parse(line, source: source, now: now); line.removeAll(keepingCapacity: true); dropping = false }
-            else if !dropping { if line.count < maxLine { line.append(byte) } else { dropping = true } }
+            else if !dropping {
+                if line.count < maxLine { line.append(byte) }
+                else {
+                    if source == "chatgpt_app" {
+                        let prefix = String(decoding: line, as: UTF8.self)
+                        if appLine.firstMatch(in: prefix, range: NSRange(prefix.startIndex..., in: prefix)) != nil {
+                            coverageGap = true; coverage = "App 事件过长 · 覆盖有缺口"
+                        }
+                    }
+                    dropping = true
+                }
+            }
         }
         partial[key] = line; discarding[key] = dropping
     }
@@ -267,7 +589,7 @@ final class TimelineReader {
         let range = NSRange(line.startIndex..., in: line)
         guard let match = appLine.firstMatch(in: line, range: range), let nameRange = Range(match.range(at: 2), in: line), let dateRange = Range(match.range(at: 1), in: line) else { return }
         let name = String(line[nameRange])
-        let allowed = ["chatgpt_pubsub_transport_closed", "chatgpt_pubsub_transport_opened", "chatgpt_pubsub_reconnect_scheduled", "chatgpt_completion_transport_recovery_started", "chatgpt_conversation_refetch_started", "chatgpt_conversation_refetch_completed"]
+        let allowed = ["chatgpt_pubsub_transport_closed", "chatgpt_pubsub_transport_opened", "chatgpt_pubsub_reconnect_scheduled", "chatgpt_pubsub_connection_failed", "chatgpt_pubsub_reconnect_exhausted", "chatgpt_completion_transport_recovery_completed", "chatgpt_completion_transport_recovery_poll_failed", "chatgpt_completion_transport_recovery_started", "chatgpt_conversation_refetch_started", "chatgpt_conversation_refetch_completed"]
         guard allowed.contains(name) else { return }
         var label = name
         let rest = Range(match.range(at: 3), in: line).map { String(line[$0]) } ?? ""
@@ -275,21 +597,31 @@ final class TimelineReader {
             guard let status = rest.split(separator: " ").first(where: { $0.hasPrefix("statusAfter=") }).map({ String($0.dropFirst("statusAfter=".count)) }), ["streaming", "error", "idle"].contains(status) else { return }
             label += " · \(status)"
         }
-        let title = ["chatgpt_completion_transport_recovery_started", "chatgpt_conversation_refetch_started", "chatgpt_conversation_refetch_completed"].contains(name) ? conversationLabels.title(in: rest) : nil
-        append(TimelineEvent(source: source, event: label, sourceAt: String(line[dateRange]), observedAt: ISO8601DateFormatter.flex.string(from: now), conversationTitle: title))
+        let title = ["chatgpt_completion_transport_recovery_completed", "chatgpt_completion_transport_recovery_poll_failed", "chatgpt_completion_transport_recovery_started", "chatgpt_conversation_refetch_started", "chatgpt_conversation_refetch_completed"].contains(name) ? conversationLabels.title(in: rest) : nil
+        let failureKind = name == "chatgpt_completion_transport_recovery_started" ? appRecoveryFailure(rest) : nil
+        append(TimelineEvent(source: source, event: label, sourceAt: String(line[dateRange]), observedAt: ISO8601DateFormatter.flex.string(from: now), conversationTitle: title, failureKind: failureKind))
     }
 
     private func append(_ event: TimelineEvent) {
+        if event.source == "chatgpt_app", events.contains(where: { $0.source == event.source && $0.sourceAt == event.sourceAt && $0.event == event.event && $0.failureKind == event.failureKind && $0.conversationTitle == event.conversationTitle }) { return }
         events.append(event)
         if let row = try? JSONEncoder().encode(event), pendingBytes + row.count + 1 <= maxJournal / 2 { pending.append(event); pendingBytes += row.count + 1 }
         else { coverageGap = true; coverage = "时间线有缺口 · 保存队列已满" }
         if event.source == "commander" && (event.event.contains("错误") || event.event.contains("error")) { commanderErrors += 1 }
         if event.source == "chatgpt_app" { latestAppEvent = event }
+        rememberAppIssue(event)
         if events.count > 5000 { events.removeFirst(events.count - 5000) }
+    }
+
+    private func rememberAppIssue(_ event: TimelineEvent) {
+        guard event.source == "chatgpt_app", event.event == "chatgpt_completion_transport_recovery_started" || event.event == "chatgpt_completion_transport_recovery_poll_failed" || event.event == "chatgpt_conversation_refetch_completed · error" else { return }
+        let stamp = event.sourceAt ?? event.observedAt
+        if latestAppIssue == nil || stamp > (latestAppIssue!.sourceAt ?? latestAppIssue!.observedAt) || (stamp == (latestAppIssue!.sourceAt ?? latestAppIssue!.observedAt) && event.failureKind != nil) { latestAppIssue = event }
     }
 
     private func valid(_ event: TimelineEvent) -> Bool {
         guard ISO8601DateFormatter.parse(event.observedAt) != nil else { return false }
+        guard event.failureKind == nil || (event.source == "chatgpt_app" && event.event == "chatgpt_completion_transport_recovery_started" && event.failureKind == "resume_unavailable") else { return false }
         if event.source == "commander" {
             guard event.conversationTitle == nil else { return false }
             if event.event.hasPrefix("Commander错误: ") { return event.sourceAt == nil && Set(["回传结果写入失败", "通道能力写入失败", "调用认领失败", "心跳写入失败", "心跳失败", "认证刷新失败", "认证刷新异常", "通道错误", "通道订阅超时", "通道关闭", "调用处理器拒绝", "调用处理器异常", "失败结果报告失败"]).contains(String(event.event.dropFirst("Commander错误: ".count))) }
@@ -299,9 +631,9 @@ final class TimelineReader {
         }
         guard event.source == "chatgpt_app", let stamp = event.sourceAt, ISO8601DateFormatter.parse(stamp) != nil else { return false }
         let parts = event.event.components(separatedBy: " · ")
-        let allNames: Set<String> = ["chatgpt_pubsub_transport_closed", "chatgpt_pubsub_transport_opened", "chatgpt_pubsub_reconnect_scheduled", "chatgpt_completion_transport_recovery_started", "chatgpt_conversation_refetch_started", "chatgpt_conversation_refetch_completed"]
+        let allNames: Set<String> = ["chatgpt_pubsub_transport_closed", "chatgpt_pubsub_transport_opened", "chatgpt_pubsub_reconnect_scheduled", "chatgpt_pubsub_connection_failed", "chatgpt_pubsub_reconnect_exhausted", "chatgpt_completion_transport_recovery_completed", "chatgpt_completion_transport_recovery_poll_failed", "chatgpt_completion_transport_recovery_started", "chatgpt_conversation_refetch_started", "chatgpt_conversation_refetch_completed"]
         guard let name = parts.first, allNames.contains(name) else { return false }
-        let canHaveTitle = ["chatgpt_completion_transport_recovery_started", "chatgpt_conversation_refetch_started", "chatgpt_conversation_refetch_completed"].contains(name)
+        let canHaveTitle = ["chatgpt_completion_transport_recovery_completed", "chatgpt_completion_transport_recovery_poll_failed", "chatgpt_completion_transport_recovery_started", "chatgpt_conversation_refetch_started", "chatgpt_conversation_refetch_completed"].contains(name)
         guard event.conversationTitle.map(ConversationLabelCatalog.isValidTitle) ?? true,
               canHaveTitle || event.conversationTitle == nil else { return false }
         return name == "chatgpt_conversation_refetch_completed" ? (parts.count == 2 && ["streaming", "error", "idle"].contains(parts[1])) : parts.count == 1
@@ -312,7 +644,7 @@ final class TimelineReader {
         for file in [journal.appendingPathExtension("bak"), journal] {
             guard let size = try? manager.attributesOfItem(atPath: file.path)[.size] as? NSNumber, size.intValue <= maxJournal, let data = try? Data(contentsOf: file) else { continue }
             for line in data.split(separator: 10).suffix(2500) {
-                if let event = try? JSONDecoder().decode(TimelineEvent.self, from: Data(line)), valid(event) { events.append(event); if event.source == "chatgpt_app" { latestAppEvent = event } }
+                if let event = try? JSONDecoder().decode(TimelineEvent.self, from: Data(line)), valid(event) { events.append(event); if event.source == "chatgpt_app" { latestAppEvent = event }; rememberAppIssue(event) }
             }
         }
         if events.count > 5000 { events = Array(events.suffix(5000)) }
@@ -346,7 +678,7 @@ func barCallClock(_ step: ActivityStep?, uptime: TimeInterval) -> String {
 
 func currentCallStep(_ activity: ActivitySummary) -> ActivityStep? {
     guard activity.activeCount > 0, !activity.error, !activity.state.contains("调用状态未确认"), !activity.state.contains("日志读取异常"), !activity.state.contains("状态未知") else { return nil }
-    return activity.steps.first { activity.active[$0.tool, default: 0] > 0 && $0.duration == nil }
+    return activity.steps.first { activity.active[$0.tool, default: 0] > 0 && !$0.finished && $0.duration == nil }
 }
 
 func recentlyReturnedCall(_ activity: ActivitySummary, uptime: TimeInterval) -> ActivityStep? {
@@ -368,14 +700,33 @@ func callState(_ activity: ActivitySummary) -> String {
         guard let step = currentCallStep(activity) else { return "状态未确认" }
         return step.uncertain ? "耗时未确认" : "等待返回"
     }
-    let uncertain = activity.error || activity.state.contains("调用状态未确认") || activity.state.contains("日志读取异常") || activity.state.contains("状态未知")
-    return uncertain ? "状态未确认" : "当前无工具调用"
+    let uncertain = !activity.idleProven || activity.error || activity.coverageGap || activity.catchingUp || activity.state.contains("调用状态未确认") || activity.state.contains("日志读取异常") || activity.state.contains("状态未知")
+    return uncertain ? "状态未确认" : "未观察到新调用"
 }
 
 func activitySafeForRecovery(_ activity: ActivitySummary) -> Bool {
-    !activity.error && !activity.coverageGap && activity.activeCount == 0 &&
-    !activity.state.contains("日志有间隔") && !activity.state.contains("读取异常") && !activity.state.contains("读取中断") &&
-    !activity.steps.contains { $0.duration == nil || $0.uncertain }
+    activity.idleProven && !activity.error && !activity.coverageGap && !activity.catchingUp && activity.activeCount == 0 &&
+    !activity.state.contains("未确认") && !activity.state.contains("状态未知") &&
+    !activity.state.contains("日志有间隔") && !activity.state.contains("读取异常") && !activity.state.contains("读取中断")
+}
+
+let toolExecutionEvidenceTTL: TimeInterval = 120
+
+func recentSuccessfulToolExecution(_ activity: ActivitySummary, now: Date, maxAge: TimeInterval = toolExecutionEvidenceTTL) -> Date? {
+    activity.steps.compactMap { step -> Date? in
+        guard step.finished, !step.failed, !step.uncertain, !step.historical,
+              step.tool != "ping", step.tool != "list_sessions",
+              let duration = step.duration, duration.isFinite, duration >= 0 else { return nil }
+        let finishedAt = step.startedAt.addingTimeInterval(duration)
+        let age = now.timeIntervalSince(finishedAt)
+        return age >= 0 && age <= maxAge ? finishedAt : nil
+    }.max()
+}
+
+func toolExecutionFresh(_ snapshot: Snapshot, now: Date, maxAge: TimeInterval = toolExecutionEvidenceTTL) -> Bool {
+    guard snapshot.toolExecutionState == "已验证", let checked = snapshot.toolExecutionChecked else { return false }
+    let age = now.timeIntervalSince(checked)
+    return age >= 0 && age <= maxAge
 }
 
 func recoveryConfirmed(oldPID: Int32, newPID: Int32?, probe: ChannelProbeResult) -> Bool {
@@ -390,25 +741,37 @@ func channelIndicator(service: String, state: String, checked: Date?, now: Date)
     return state == "通道畅通" || state == "通道已恢复" ? "●" : "?"
 }
 
+func channelSummary(_ snapshot: Snapshot, now: Date) -> String {
+    if snapshot.service == "未运行" { return "Commander 服务未运行" }
+    if snapshot.channelState == "通道畅通" || snapshot.channelState == "通道已恢复" {
+        if channelIndicator(service: snapshot.service, state: snapshot.channelState, checked: snapshot.channelChecked, now: now) != "●" { return "待复查（上次通道探测成功）" }
+        return "通道可回应"
+    }
+    return ["启动宽限": "启动等待中", "通道异常": "异常", "通道不可用": "不可用", "通道状态未知": "未确认", "正在恢复通道": "正在恢复", "恢复尚未确认": "恢复尚未确认"][snapshot.channelState] ?? snapshot.channelState
+}
+
 enum CommanderActivity {
     static let tools = ["read_file": "读取文件", "read_multiple_files": "读取文件", "read_process_output": "读取进程输出", "list_sessions": "查看终端会话", "list_processes": "查看进程", "list_directory": "查看目录", "search_files": "搜索文件", "start_search": "开始搜索", "get_more_search_results": "读取搜索结果", "stop_search": "停止搜索", "list_searches": "查看搜索任务", "get_file_info": "查看文件信息", "start_process": "启动进程", "interact_with_process": "操作进程", "kill_process": "结束进程", "force_terminate": "结束进程", "write_file": "写入文件", "edit_block": "编辑文件", "create_directory": "创建目录", "move_file": "移动文件", "get_config": "读取配置"]
-    static let uuidPattern = try! NSRegularExpression(pattern: #"^🔧 Received tool call ([0-9a-fA-F-]{36}): ([a-z_]+) "#)
-    static let completionPattern = try! NSRegularExpression(pattern: #"^[✅❌] Tool call ([a-z_]+) (completed|failed):"#)
+    static let uuidPattern = try! NSRegularExpression(pattern: #"^🔧 Received tool call ([0-9a-fA-F-]{36}): ([A-Za-z0-9_-]+) "#)
+    static let completionPattern = try! NSRegularExpression(pattern: #"^[✅❌] Tool call ([A-Za-z0-9_-]+) (completed|failed):"#)
 
-    static func parse(_ bytes: Data) -> (String, String, String, String)? {
-        guard let line = String(data: bytes, encoding: .utf8) else { return nil }
+    static func parse(_ bytes: Data, partial: Bool = false) -> (String, String, String, String)? {
+        // A bounded prefix may end inside a UTF-8 scalar; discard only that incomplete suffix.
+        let line = partial ? (0...3).lazy.compactMap { trim in
+            trim <= bytes.count ? String(data: Data(bytes.prefix(bytes.count - trim)), encoding: .utf8) : nil
+        }.first : String(data: bytes, encoding: .utf8)
+        guard let line else { return nil }
         let range = NSRange(line.startIndex..., in: line)
         if let m = uuidPattern.firstMatch(in: line, range: range), let idRange = Range(m.range(at: 1), in: line), let toolRange = Range(m.range(at: 2), in: line) {
             let id = String(line[idRange]), tool = String(line[toolRange])
-            guard UUID(uuidString: id) != nil, tools[tool] != nil else { return nil }
+            guard UUID(uuidString: id) != nil else { return nil }
             guard let separator = line.range(of: ": \(tool) ") else { return nil }
             let args = String(line[separator.upperBound...])
             return (id, tool, "received", detail(tool: tool, args: args))
         }
         if let m = completionPattern.firstMatch(in: line, range: range), let toolRange = Range(m.range(at: 1), in: line), let resultRange = Range(m.range(at: 2), in: line) {
             let tool = String(line[toolRange])
-            guard tools[tool] != nil else { return nil }
-            return ("", tool, String(line[resultRange]), tools[tool]!)
+            return ("", tool, String(line[resultRange]), tools[tool] ?? "本机工具调用")
         }
         return nil
     }
@@ -431,7 +794,7 @@ enum CommanderActivity {
         case "start_process": return processDetail(args)
         case "search_files", "start_search": return "搜索文件内容"
         case "get_more_search_results", "list_searches": return "查看搜索结果"
-        default: return tools[tool] ?? "本机操作"
+        default: return tools[tool] ?? "本机工具调用"
         }
     }
 
@@ -644,14 +1007,24 @@ enum CommanderActivity {
 /// Reads only bounded log prefixes. Bootstrap supplies recent labels, never live-running state.
 final class ActivityLogReader {
     private let url: URL
+    private let errorURL: URL?
     private var offset: UInt64 = 0
     private var fileID: UInt64?
     private var initialized = false
+    private var searchEnd: UInt64?
+    private var searchSize: UInt64 = 0
+    private var replaying = false
+    private var provenEpoch = false
+    private var freshEmptyLog = false
     private var partial = Data()
     private var discarding = false
     private var prefixEvent = ""
-    // ponytail: retain the last 256 IDs; long-delayed older replays are outside this bounded cache.
-    private var seen = [String]()
+    private var errorOffset: UInt64 = 0
+    private var errorFileID: UInt64?
+    private var errorPartial = Data()
+    private var errorDiscarding = false
+    // Keep every observed ID for this reader lifetime: an old replay must never look like a new call.
+    private var seen = Set<String>()
     private var active = [String: Int]()
     private var steps = [ActivityStep]()
     private var recent = [String]()
@@ -661,98 +1034,245 @@ final class ActivityLogReader {
     private var observedLive = false
     private var uncertain = false
     private var coverageGap = false
+    private var gapReason = ""
+    private var gapFirstAt: Date?
+    private var gapLastAt: Date?
     private var lastOutcome = "调用状态未确认"
     private(set) var summary = ActivitySummary()
     private let lineLimit = 4 * 1024
     private let ioLimit = 64 * 1024
 
-    init(url: URL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/RemoteDesktopCommander/stdout.log")) { self.url = url }
+    init(url: URL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/RemoteDesktopCommander/stdout.log"), errorURL: URL? = nil) { self.url = url; self.errorURL = errorURL }
 
     func poll(now: Date = Date(), uptime: TimeInterval = ProcessInfo.processInfo.systemUptime) {
-        defer { summary.coverageGap = coverageGap }
+        defer {
+            summary.coverageGap = coverageGap
+            summary.gapReason = gapReason
+            summary.gapFirstAt = gapFirstAt
+            summary.gapLastAt = gapLastAt
+            summary.pendingLine = !partial.isEmpty || discarding || !errorPartial.isEmpty || errorDiscarding
+            summary.idleProven = provenEpoch && !replaying && !coverageGap && !summary.error && !summary.catchingUp && !summary.pendingLine
+        }
+        defer { pollErrors(now: now, uptime: uptime) }
         guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path), let size = attrs[.size] as? UInt64 else {
-            coverageGap = true
-            invalidateSteps(); summary.steps = steps; active.removeAll(); summary.active.removeAll(); observedLive = false; uncertain = true; lastOutcome = "调用状态未确认"; summary.error = true; summary.state = "日志不可读 / 状态未知"; return
+            if initialized && !FileManager.default.fileExists(atPath: url.path) { markGap("调用日志暂时不存在", now: now) }
+            summary.error = true; summary.state = "日志不可读 / 状态未知"; return
         }
         let id = (attrs[.systemFileNumber] as? NSNumber)?.uint64Value
-        if !initialized || id != fileID || size < offset {
-            let wasInitialized = initialized
-            offset = size; fileID = id; initialized = true; partial.removeAll(); discarding = false; prefixEvent = ""
-            if wasInitialized { invalidateSteps(); coverageGap = true }; active.removeAll(); seen.removeAll(); recent.removeAll(); recentIDs.removeAll(); lastObserved = nil; lastTool = ""; observedLive = false; uncertain = wasInitialized; lastOutcome = "调用状态未确认"
-            let start = size > 64 * 1024 ? size - 64 * 1024 : 0
-            if let handle = try? FileHandle(forReadingFrom: url) {
-                var tail = Data()
-                do { try handle.seek(toOffset: start); tail = try handle.read(upToCount: Int(size - start)) ?? Data() }
-                catch { coverageGap = true }
-                if tail.isEmpty && size > start { coverageGap = true }
-                try? handle.close()
-                if start > 0 {
-                    if let newline = tail.firstIndex(of: 10) { tail.removeSubrange(...newline) }
-                    else { tail.removeAll(); discarding = true }
+        guard id != nil else { summary.error = true; summary.state = "日志身份未确认 / 状态未知"; return }
+        if !initialized {
+            initialized = true; fileID = id; searchEnd = size; searchSize = size
+            summary.backlogBytes = size; summary.state = "查找当前服务日志中"
+            if size == 0 { searchEnd = nil; freshEmptyLog = true; summary.backlogBytes = 0; summary.state = "等待服务启动记录" }
+            return
+        } else if id != fileID || size < offset {
+            markGap(id != fileID ? "调用日志已轮换" : "调用日志已截断", now: now)
+            offset = size; fileID = id; replaying = false; provenEpoch = false
+            partial.removeAll(); discarding = false; prefixEvent = ""
+            invalidateSteps(); active.removeAll(); seen.removeAll(); recent.removeAll(); recentIDs.removeAll()
+            lastObserved = nil; lastTool = ""; observedLive = false; uncertain = true; lastOutcome = "调用状态未确认"
+            summary.active = [:]; summary.steps = steps; summary.state = "调用状态未确认"
+            return
+        }
+        if let end = searchEnd {
+            guard size >= searchSize else { markGap("查找期间调用日志已截断", now: now); searchEnd = nil; summary.state = "调用状态未确认"; return }
+            let marker = Data("🚀 Starting MCP Device...\n".utf8)
+            let start = end > 4 * 1024 * 1024 ? end - 4 * 1024 * 1024 : 0
+            let readStart = start > 0 ? start - 1 : 0
+            let readEnd = min(searchSize, end + UInt64(marker.count))
+            guard let handle = try? FileHandle(forReadingFrom: url) else { summary.error = true; summary.state = "日志读取异常 / 状态未知"; return }
+            var block = Data()
+            do {
+                var statBuffer = stat()
+                guard fstat(handle.fileDescriptor, &statBuffer) == 0,
+                      UInt64(statBuffer.st_ino) == id, UInt64(statBuffer.st_size) >= searchSize else { throw CocoaError(.fileReadUnknown) }
+                try handle.seek(toOffset: readStart)
+                block = try handle.read(upToCount: Int(readEnd - readStart)) ?? Data()
+                if block.count != Int(readEnd - readStart) { throw CocoaError(.fileReadUnknown) }
+            } catch {
+                try? handle.close(); summary.error = true; summary.state = "日志读取异常 / 状态未知"; return
+            }
+            try? handle.close(); summary.error = false
+            var markerOffset: UInt64?
+            var upper = block.count
+            while let found = block.range(of: marker, options: .backwards, in: 0..<upper) {
+                let absolute = readStart + UInt64(found.lowerBound)
+                if absolute < end && (found.lowerBound == 0 ? readStart == 0 : block[found.lowerBound - 1] == 10) {
+                    markerOffset = absolute; break
                 }
-                consume(tail, live: false, now: now, uptime: uptime)
-            } else { coverageGap = true }
-            summary = ActivitySummary(state: recent.isEmpty && !uncertain ? "未观察到新调用" : "调用状态未确认", tool: lastTool, observed: lastObserved, recent: recent, steps: steps, active: [:], error: false)
-            return
+                upper = found.lowerBound
+            }
+            if let markerOffset {
+                offset = markerOffset
+                searchEnd = nil; replaying = true; summary.backlogBytes = size - offset
+            } else if start == 0 {
+                searchEnd = nil; offset = size; summary.backlogBytes = 0
+                summary.state = "当前日志缺少服务启动记录"; return
+            } else {
+                searchEnd = start; summary.backlogBytes = size; summary.state = "查找当前服务日志中"; return
+            }
         }
-        if size == offset { if summary.error { summary.error = false; summary.state = "调用状态未确认（日志读取中断）" }; return }
-        guard let handle = try? FileHandle(forReadingFrom: url) else { coverageGap = true; invalidateSteps(); summary.steps = steps; active.removeAll(); summary.active.removeAll(); observedLive = false; uncertain = true; lastOutcome = "调用状态未确认"; summary.error = true; summary.state = "日志读取异常 / 状态未知"; return }
-        if size - offset > UInt64(ioLimit) {
-            coverageGap = true
-            // ponytail: skip excess backlog in bounded time; a gap makes outstanding state unknown.
-            offset = size - UInt64(min(ioLimit, Int(size)))
-            try? handle.seek(toOffset: offset)
-            invalidateSteps(); active.removeAll(); partial.removeAll(); discarding = false; prefixEvent = ""
-            observedLive = false; uncertain = true; lastOutcome = "调用状态未确认"; lastObserved = nil
-            var tail = (try? handle.read(upToCount: Int(size - offset))) ?? Data()
-            try? handle.close(); offset = size
-            if let newline = tail.firstIndex(of: 10) { tail.removeSubrange(...newline) }
-            else { tail.removeAll(); discarding = true }
-            consume(tail, live: false, now: now, uptime: uptime)
-            summary = ActivitySummary(state: "调用状态未确认（日志有间隔）", tool: lastTool, observed: lastObserved, recent: recent, steps: steps, active: [:], error: false)
-            return
+        if size == offset && !summary.error {
+            summary.backlogBytes = 0; summary.state = activityState(); return
         }
-        try? handle.seek(toOffset: offset)
-        guard let data = try? handle.read(upToCount: Int(min(UInt64(ioLimit), size - offset))) else {
-            try? handle.close(); coverageGap = true; invalidateSteps(); summary.steps = steps; active.removeAll(); summary.active.removeAll(); observedLive = false; uncertain = true; lastOutcome = "调用状态未确认"; summary.error = true; summary.state = "日志读取异常 / 状态未知"; return
+        guard let handle = try? FileHandle(forReadingFrom: url) else { summary.error = true; summary.state = "日志读取异常 / 状态未知"; return }
+        var data = Data()
+        do {
+            var statBuffer = stat()
+            guard fstat(handle.fileDescriptor, &statBuffer) == 0,
+                  UInt64(statBuffer.st_ino) == id, UInt64(statBuffer.st_size) >= offset else {
+                throw CocoaError(.fileReadUnknown)
+            }
+            try handle.seek(toOffset: offset)
+            let limit = replaying ? 4 * 1024 * 1024 : ioLimit
+            if size > offset { data = try handle.read(upToCount: Int(min(UInt64(limit), size - offset))) ?? Data() }
+            if size > offset && data.isEmpty { throw CocoaError(.fileReadUnknown) }
+        } catch {
+            try? handle.close(); summary.error = true; summary.state = "日志读取异常 / 状态未知"; return
         }
         try? handle.close(); offset += UInt64(data.count)
         if !data.isEmpty { consume(data, live: true, now: now, uptime: uptime) }
+        if replaying && offset == size { replaying = false }
         summary.error = false
+        summary.backlogBytes = size - offset
         summary.active = active
         summary.recent = recent
         summary.steps = steps
         summary.observed = lastObserved
         summary.observedUptime = lastObserved == nil ? nil : summary.observedUptime
-        summary.state = !observedLive ? (uncertain || !recent.isEmpty ? "调用状态未确认" : "未观察到新调用") : (active.isEmpty ? lastOutcome : "收到调用（处理中）")
+        summary.state = replaying || summary.catchingUp ? "调用日志追赶中" : activityState()
+    }
+
+    private func activityState() -> String {
+        !provenEpoch ? "调用状态未确认" : (!observedLive ? (uncertain ? "调用状态未确认" : "未观察到新调用") : (active.isEmpty ? lastOutcome : "收到调用（处理中）"))
+    }
+
+    private func markGap(_ reason: String, now: Date) {
+        if !coverageGap { gapFirstAt = now }
+        coverageGap = true; gapReason = reason; gapLastAt = now
+    }
+
+    @discardableResult func confirmedProcessRestart(oldPID: Int32, newPID: Int32, oldProcessExited: Bool) -> Bool {
+        guard oldPID > 0, newPID > 0, oldPID != newPID, oldProcessExited else { return false }
+        offset = 0; fileID = nil; initialized = false; searchEnd = nil; searchSize = 0
+        replaying = false; provenEpoch = false; freshEmptyLog = false
+        partial.removeAll(); discarding = false; prefixEvent = ""
+        active.removeAll(); seen.removeAll(); steps.removeAll(); recent.removeAll(); recentIDs.removeAll()
+        observedLive = false; uncertain = true; lastOutcome = "调用状态未确认"; lastObserved = nil; lastTool = ""
+        errorOffset = 0; errorFileID = nil; errorPartial.removeAll(); errorDiscarding = false
+        coverageGap = false; gapReason = ""; gapFirstAt = nil; gapLastAt = nil
+        summary = ActivitySummary(state: "正在重建新服务进程的调用记录")
+        return true
+    }
+
+    private func pollErrors(now: Date, uptime: TimeInterval) {
+        guard let errorURL else { return }
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: errorURL.path),
+              let size = attrs[.size] as? UInt64,
+              let id = (attrs[.systemFileNumber] as? NSNumber)?.uint64Value else {
+            summary.error = true; summary.state = "错误日志不可读 / 状态未知"; return
+        }
+        if errorFileID == nil { errorFileID = id; errorOffset = size; return }
+        if replaying || searchEnd != nil { return }
+        if id != errorFileID || size < errorOffset {
+            markGap(id != errorFileID ? "错误日志已轮换" : "错误日志已截断", now: now)
+            errorFileID = id; errorOffset = size; errorPartial.removeAll(); errorDiscarding = false; return
+        }
+        guard size > errorOffset else { return }
+        guard let handle = try? FileHandle(forReadingFrom: errorURL) else { summary.error = true; summary.state = "错误日志读取异常 / 状态未知"; return }
+        var data = Data()
+        do {
+            var statBuffer = stat()
+            guard fstat(handle.fileDescriptor, &statBuffer) == 0,
+                  UInt64(statBuffer.st_ino) == id, UInt64(statBuffer.st_size) >= errorOffset else {
+                throw CocoaError(.fileReadUnknown)
+            }
+            try handle.seek(toOffset: errorOffset)
+            data = try handle.read(upToCount: Int(min(UInt64(ioLimit), size - errorOffset))) ?? Data()
+            if data.isEmpty { throw CocoaError(.fileReadUnknown) }
+        } catch {
+            try? handle.close(); summary.error = true; summary.state = "错误日志读取异常 / 状态未知"; return
+        }
+        try? handle.close(); errorOffset += UInt64(data.count)
+        for byte in data {
+            if byte == 10 {
+                if !errorDiscarding {
+                    if let event = CommanderActivity.parse(errorPartial), event.2 == "failed" {
+                        let known = active[event.1, default: 0] > 0
+                        if !known { markGap("错误终态没有对应的开始记录", now: now) }
+                        self.handle(event, live: true, now: now, uptime: uptime)
+                    } else if let prefix = String(data: errorPartial, encoding: .utf8), prefix.hasPrefix("❌ Tool call ") {
+                        markGap("错误事件格式无法识别", now: now)
+                    }
+                }
+                errorPartial.removeAll(keepingCapacity: true); errorDiscarding = false
+            } else if errorPartial.count < lineLimit { errorPartial.append(byte) }
+            else if !errorDiscarding {
+                if errorPartial.starts(with: Data("❌ Tool call ".utf8)) {
+                    if let event = CommanderActivity.parse(errorPartial, partial: true), event.2 == "failed" {
+                        if active[event.1, default: 0] == 0 { markGap("错误终态没有对应的开始记录", now: now) }
+                        self.handle(event, live: true, now: now, uptime: uptime)
+                    } else { markGap("错误事件前缀超过读取上限", now: now) }
+                }
+                errorDiscarding = true
+            }
+        }
+        summary.backlogBytes += size - errorOffset
+        summary.active = active; summary.steps = steps
+        if !summary.error { summary.state = summary.catchingUp ? "调用日志追赶中" : activityState() }
     }
 
     private func consume(_ data: Data, live: Bool, now: Date, uptime: TimeInterval) {
         for byte in data {
             if byte == 10 {
-                if !discarding { emit(partial, live: live, now: now, uptime: uptime) }
+                if !discarding { emit(partial, live: live, complete: true, now: now, uptime: uptime) }
                 partial.removeAll(keepingCapacity: true); discarding = false; prefixEvent = ""
             } else if !discarding {
                 if partial.count < lineLimit { partial.append(byte) }
                 else {
+                    if live,
+                       (partial.starts(with: Data("🔧 Received tool call ".utf8)) || partial.starts(with: Data("✅ Tool call ".utf8)) || partial.starts(with: Data("❌ Tool call ".utf8))),
+                       CommanderActivity.parse(partial, partial: true) == nil { markGap("调用事件前缀超过读取上限", now: now) }
                     discarding = true
-                    emit(partial, live: live, now: now, uptime: uptime)
+                    emit(partial, live: live, complete: false, now: now, uptime: uptime)
                 }
             }
         }
-        if live && !discarding && !partial.isEmpty { emit(partial, live: true, now: now, uptime: uptime) }
+        if live && !discarding && !partial.isEmpty { emit(partial, live: true, complete: false, now: now, uptime: uptime) }
     }
 
-    private func emit(_ bytes: Data, live: Bool, now: Date, uptime: TimeInterval) {
+    private func emit(_ bytes: Data, live: Bool, complete: Bool, now: Date, uptime: TimeInterval) {
+        if live && freshEmptyLog {
+            let marker = Data("🚀 Starting MCP Device...".utf8)
+            if !bytes.starts(with: marker) && !marker.starts(with: bytes) { freshEmptyLog = false }
+        }
         if let text = String(data: bytes, encoding: .utf8),
            text.hasPrefix("🚀 Starting MCP Device") || text.hasPrefix("🛑 Shutting down device") {
             let key = text.hasPrefix("🚀") ? "service-start" : "service-stop"
             guard key != prefixEvent else { return }; prefixEvent = key
-            if live { coverageGap = true; active.removeAll(); observedLive = false; uncertain = true; lastOutcome = "调用状态未确认"; lastObserved = nil; summary.active.removeAll(); summary.state = "调用状态未确认" }
+            if live {
+                if replaying {
+                    // The retained start marker begins a new service epoch before it can accept calls.
+                    provenEpoch = key == "service-start"; uncertain = !provenEpoch
+                } else if key == "service-start" && freshEmptyLog && !coverageGap {
+                    provenEpoch = true; uncertain = false; freshEmptyLog = false
+                } else {
+                    markGap(key == "service-start" ? "服务启动时旧调用状态未确认" : "服务停止时调用状态未确认", now: now)
+                    provenEpoch = false; uncertain = true
+                }
+                active.removeAll(); seen.removeAll(); observedLive = false; lastOutcome = "调用状态未确认"; lastObserved = nil; summary.active.removeAll(); summary.state = "调用状态未确认"
+            }
             if live { invalidateSteps(); summary.steps = steps }
             return
         }
-        guard let event = CommanderActivity.parse(bytes) else { return }
+        guard let event = CommanderActivity.parse(bytes, partial: !complete) else {
+            if live && complete,
+               bytes.starts(with: Data("🔧 Received tool call ".utf8)) || bytes.starts(with: Data("✅ Tool call ".utf8)) || bytes.starts(with: Data("❌ Tool call ".utf8)) {
+                markGap("调用事件格式无法识别", now: now)
+            }
+            return
+        }
+        if live && !provenEpoch { freshEmptyLog = false }
         let key = "\(event.0)|\(event.1)|\(event.2)|\(event.3)"
         guard key != prefixEvent else { return }
         prefixEvent = key
@@ -765,25 +1285,26 @@ final class ActivityLogReader {
             if seen.contains(id) {
                 if live && summary.latestReceivedID == id {
                     lastTool = detail; summary.tool = detail
-                    if let i = steps.firstIndex(where: { $0.id == id && $0.duration == nil && !$0.uncertain }) { steps[i].detail = detail }
+                    if let i = steps.firstIndex(where: { $0.id == id && !$0.finished && $0.duration == nil && !$0.uncertain }) { steps[i].detail = detail }
                     summary.steps = steps
                 }
                 return
             }
             lastTool = detail
             summary.tool = detail
-            seen.append(id); if seen.count > 256 { seen.removeFirst() }
+            seen.insert(id)
             let recentLabel = "收到：\(detail)"
             if recent.first != recentLabel { recent.insert(recentLabel, at: 0); recentIDs.insert(id, at: 0) }
             else if !recentIDs.isEmpty { recentIDs[0] = id }
             recent = Array(recent.prefix(3)); recentIDs = Array(recentIDs.prefix(3))
-            if live { observedLive = true; uncertain = false; lastOutcome = "收到调用（处理中）"; summary.returnedStepID = nil; active[tool, default: 0] += 1; summary.tool = detail; summary.observed = now; summary.observedUptime = uptime; summary.latestReceivedID = id; lastObserved = now }
-            if live { steps.insert(ActivityStep(id: id, tool: tool, detail: detail, startedAt: now, startedUptime: uptime), at: 0); steps = Array(steps.prefix(100)); summary.steps = steps }
+            if live { observedLive = true; lastOutcome = "收到调用（处理中）"; summary.returnedStepID = nil; active[tool, default: 0] += 1; summary.tool = detail; summary.observed = now; summary.observedUptime = uptime; summary.latestReceivedID = id; lastObserved = now }
+            if live { steps.insert(ActivityStep(id: id, tool: tool, detail: detail, startedAt: now, startedUptime: uptime, uncertain: replaying, historical: replaying), at: 0); steps = Array(steps.prefix(100)); summary.steps = steps }
         } else {
             if live {
-                observedLive = true; uncertain = false; lastOutcome = result == "completed" ? "本机已返回（云端结果未知）" : "本机异常（云端结果未知）"; summary.returnedStepID = nil; lastObserved = now; summary.observedUptime = uptime
-                let candidates = steps.indices.filter { steps[$0].tool == tool && steps[$0].duration == nil && !steps[$0].uncertain }
-                if candidates.count == 1 && active[tool] == 1 { let i = candidates[0]; steps[i].duration = max(0, uptime - steps[i].startedUptime); steps[i].failed = result == "failed"; if result == "completed" { summary.returnedStepID = steps[i].id } }
+                if active[tool, default: 0] == 0 { markGap("调用结束缺少对应的开始记录", now: now) }
+                observedLive = true; lastOutcome = result == "completed" ? "本机已返回（云端结果未知）" : "本机异常（云端结果未知）"; summary.returnedStepID = nil; lastObserved = now; summary.observedUptime = uptime
+                let candidates = steps.indices.filter { steps[$0].tool == tool && !steps[$0].finished && steps[$0].duration == nil }
+                if candidates.count == 1 && active[tool] == 1 { let i = candidates[0]; steps[i].finished = true; if !steps[i].historical && !steps[i].uncertain { steps[i].duration = max(0, uptime - steps[i].startedUptime) }; steps[i].failed = result == "failed"; if result == "completed" && !steps[i].historical { summary.returnedStepID = steps[i].id } }
                 else { for i in candidates { steps[i].uncertain = true } }
                 if let count = active[tool], count > 0 { if count == 1 { active.removeValue(forKey: tool) } else { active[tool] = count - 1 } }
                 summary.steps = steps
@@ -791,7 +1312,7 @@ final class ActivityLogReader {
         }
     }
 
-    private func invalidateSteps() { for i in steps.indices where steps[i].duration == nil { steps[i].uncertain = true } }
+    private func invalidateSteps() { for i in steps.indices where !steps[i].finished && steps[i].duration == nil { steps[i].uncertain = true } }
 }
 
 enum CloudState {
@@ -924,6 +1445,11 @@ struct ChannelWatchdogState {
         case .unknown(let reason): failures = 0; status = "通道状态未知"; detail = reason
         }
     }
+    mutating func observedManual(_ result: ChannelProbeResult, now: Date) {
+        if case .noLiveConnection = result {
+            failures = 0; status = "通道异常"; detail = "手动检查：设备连接不可用"
+        } else { observed(result, now: now) }
+    }
 }
 
 struct ChannelRecoveryLedger: Codable {
@@ -1045,6 +1571,97 @@ final class MCPChannelProbe: NSObject, URLSessionDataDelegate, URLSessionTaskDel
     }
 }
 
+enum ToolExecutionProbeResult {
+    case verified
+    case failed(String)
+    case unknown(String)
+}
+
+/// Verifies the real local tool-execution path with a bounded, read-only tool call.
+/// The list_sessions payload is intentionally discarded; only the fixed result class and device attribution survive.
+final class MCPToolExecutionProbe: NSObject, URLSessionDataDelegate, URLSessionTaskDelegate {
+    private static let endpoint = URL(string: "https://mcp.desktopcommander.app/mcp")!
+    static let maxResponseBytes = 32 * 1024
+    private var session: URLSession!
+    private var completion: ((ToolExecutionProbeResult) -> Void)?
+    private var body = Data()
+    private var http: HTTPURLResponse?
+    private var requestID = UUID().uuidString
+    private var deviceID = ""
+
+    func run(_ done: @escaping (ToolExecutionProbeResult) -> Void) {
+        completion = done
+        let file = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".desktop-commander-device/device.json")
+        guard let data = try? Data(contentsOf: file), let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let id = root["deviceId"] as? String, CloudState.validDeviceID(id),
+              let auth = root["session"] as? [String: Any], let token = auth["access_token"] as? String, !token.isEmpty else {
+            finish(.unknown("本机登录信息不可用")); return
+        }
+        deviceID = id
+        var request = URLRequest(url: Self.endpoint, timeoutInterval: 8)
+        request.httpMethod = "POST"
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["jsonrpc": "2.0", "id": requestID, "method": "tools/call", "params": ["name": "list_sessions", "arguments": ["deviceId": id]]])
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json, text/event-stream", forHTTPHeaderField: "Accept")
+        request.setValue("2024-11-05", forHTTPHeaderField: "MCP-Protocol-Version")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 8; configuration.timeoutIntervalForResource = 10
+        session = URLSession(configuration: configuration, delegate: self, delegateQueue: OperationQueue())
+        session.dataTask(with: request).resume()
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) { completionHandler(nil) }
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse, completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+        guard let response = response as? HTTPURLResponse, response.url?.scheme == "https", response.url?.host == "mcp.desktopcommander.app" else {
+            completionHandler(.cancel); finish(.unknown("工具服务响应未知")); return
+        }
+        http = response
+        if let length = response.value(forHTTPHeaderField: "Content-Length").flatMap(Int.init), length > Self.maxResponseBytes {
+            completionHandler(.cancel); finish(.unknown("工具检查响应超过大小限制")); return
+        }
+        guard response.statusCode == 200 else { completionHandler(.cancel); finish(.unknown("工具服务不可用（HTTP \(response.statusCode)）")); return }
+        completionHandler(.allow)
+    }
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        guard body.count + data.count <= Self.maxResponseBytes else { dataTask.cancel(); finish(.unknown("工具检查响应超过大小限制")); return }
+        body.append(data)
+    }
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        if let failure = Self.transportFailure(error: error, statusCode: http?.statusCode) { finish(failure); return }
+        finish(Self.classify(body, id: requestID, deviceID: deviceID))
+    }
+    static func transportFailure(error: Error?, statusCode: Int?) -> ToolExecutionProbeResult? {
+        if error != nil || statusCode != 200 { return .unknown("工具检查网络请求未完成") }
+        return nil
+    }
+    private func finish(_ result: ToolExecutionProbeResult) {
+        guard let done = completion else { return }
+        completion = nil; session?.invalidateAndCancel(); done(result)
+    }
+    static func classify(_ data: Data, id: String, deviceID: String) -> ToolExecutionProbeResult {
+        guard data.count <= Self.maxResponseBytes else { return .unknown("工具检查响应超过大小限制") }
+        guard let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any], root["jsonrpc"] as? String == "2.0", root["id"] as? String == id else {
+            return .unknown("工具响应格式或请求编号不匹配")
+        }
+        if let error = root["error"] as? [String: Any] {
+            let message = error["message"] as? String ?? ""
+            return message.contains(deviceID) && message.contains("no live connection") ? .failed("设备连接不可用") : .unknown("工具服务返回错误")
+        }
+        guard let result = root["result"] as? [String: Any], let content = result["content"] as? [[String: Any]], !content.isEmpty else {
+            return .unknown("工具响应内容未知")
+        }
+        let texts = content.compactMap { $0["type"] as? String == "text" ? $0["text"] as? String : nil }
+        guard texts.count == content.count else { return .unknown("工具响应包含未知内容") }
+        if result["isError"] as? Bool == true { return .failed("本机工具返回错误") }
+        let markerPattern = #"^\n?\[executed on device: .+ \("# + NSRegularExpression.escapedPattern(for: deviceID) + #"\)\]$"#
+        let attributed = texts.filter { $0.range(of: markerPattern, options: .regularExpression) != nil }
+        if attributed.count == 1 { return .verified }
+        if texts.contains(where: { $0.contains("[executed on device:") }) { return .unknown("工具响应设备不匹配") }
+        return .unknown("工具响应缺少设备归属")
+    }
+}
+
 enum CommanderProcessTree {
     private struct Entry { let pid: Int32; let parent: Int32; let command: String }
 
@@ -1129,6 +1746,23 @@ func selfTest() {
     precondition(classifyProbe(["jsonrpc": "2.0", "id": "request", "error": ["code": -32602, "message": noLive]]) == 1)
     precondition(classifyProbe(["jsonrpc": "2.0", "id": "request", "error": ["code": -32602, "message": noLive, "data": ["error_code": "OTHER"]]]) == 2)
     precondition(classifyProbe(["jsonrpc": "2.0", "id": "request", "result": ["isError": true, "content": [["type": "text", "text": noLive]], "structuredContent": ["error_code": "INVALID_ARGUMENT"]]]) == 1)
+    func toolProbeKind(_ value: ToolExecutionProbeResult) -> Int {
+        switch value { case .verified: return 0; case .failed: return 1; case .unknown: return 2 }
+    }
+    func classifyTool(_ object: [String: Any], id: String = "tool-request") -> Int {
+        toolProbeKind(MCPToolExecutionProbe.classify(try! JSONSerialization.data(withJSONObject: object), id: id, deviceID: device))
+    }
+    let toolOK: [String: Any] = ["jsonrpc": "2.0", "id": "tool-request", "result": ["content": [["type": "text", "text": "No active terminal sessions"], ["type": "text", "text": "\n[executed on device: Mac-mini.local (\(device))]"]]]]
+    precondition(classifyTool(toolOK) == 0 && classifyTool(toolOK, id: "wrong") == 2)
+    let wrongDevice: [String: Any] = ["jsonrpc": "2.0", "id": "tool-request", "result": ["content": [["type": "text", "text": "ok"], ["type": "text", "text": "\n[executed on device: Other Mac (00000000-0000-4000-8000-000000000099)]"]]]]
+    precondition(classifyTool(wrongDevice) == 2)
+    let toolError: [String: Any] = ["jsonrpc": "2.0", "id": "tool-request", "result": ["isError": true, "content": [["type": "text", "text": "failed"]]]]
+    precondition(classifyTool(toolError) == 1)
+    precondition(classifyTool(["jsonrpc": "2.0", "id": "tool-request", "result": ["content": []]]) == 2)
+    precondition(toolProbeKind(MCPToolExecutionProbe.classify(Data(repeating: 65, count: MCPToolExecutionProbe.maxResponseBytes + 1), id: "tool-request", deviceID: device)) == 2)
+    let timeoutError = NSError(domain: NSURLErrorDomain, code: NSURLErrorTimedOut)
+    precondition(toolProbeKind(MCPToolExecutionProbe.transportFailure(error: timeoutError, statusCode: nil)!) == 2)
+    precondition(MCPToolExecutionProbe.transportFailure(error: nil, statusCode: 200) == nil)
     var watchdogTest = ChannelWatchdogState(startedAt: now)
     precondition(!watchdogTest.isDue(now: now.addingTimeInterval(89)) && watchdogTest.isDue(now: now.addingTimeInterval(90)))
     watchdogTest.lastProbe = now.addingTimeInterval(90)
@@ -1136,14 +1770,18 @@ func selfTest() {
     for n in 1...3 { watchdogTest.observed(.noLiveConnection, now: now.addingTimeInterval(Double(90 + n * 30))); precondition(watchdogTest.failures == n) }
     watchdogTest.observed(.unknown("网络未知"), now: now.addingTimeInterval(200)); precondition(watchdogTest.failures == 0)
     watchdogTest.observed(.healthy, now: now.addingTimeInterval(230)); precondition(watchdogTest.status == "通道畅通")
+    for _ in 0..<5 { watchdogTest.observedManual(.noLiveConnection, now: now); precondition(watchdogTest.failures == 0 && watchdogTest.status == "通道异常") }
+    watchdogTest.observed(.noLiveConnection, now: now); precondition(watchdogTest.failures == 1)
+    watchdogTest.observedManual(.healthy, now: now); precondition(watchdogTest.failures == 0 && watchdogTest.status == "通道畅通")
     var ledgerTest = ChannelRecoveryLedger(); ledgerTest.recordAttempt(at: now)
     precondition(!ledgerTest.canAttempt(at: now.addingTimeInterval(299)) && ledgerTest.canAttempt(at: now.addingTimeInterval(300)))
     precondition(!recoveryConfirmed(oldPID: 100, newPID: nil, probe: .healthy))
     precondition(!recoveryConfirmed(oldPID: 100, newPID: 100, probe: .healthy))
     precondition(!recoveryConfirmed(oldPID: 100, newPID: 101, probe: .unknown("未知")))
     precondition(recoveryConfirmed(oldPID: 100, newPID: 101, probe: .healthy))
-    precondition(activitySafeForRecovery(ActivitySummary(state: "未观察到新调用")))
+    precondition(activitySafeForRecovery(ActivitySummary(state: "未观察到新调用", idleProven: true)))
     precondition(!activitySafeForRecovery(ActivitySummary(state: "未观察到新调用", coverageGap: true)))
+    precondition(callState(ActivitySummary(state: "未观察到新调用", coverageGap: true)) == "状态未确认")
     precondition(!activitySafeForRecovery(ActivitySummary(state: "收到调用（处理中）", active: ["read_file": 1])))
     let rootCommand = "/test/.nvm/versions/node/v22.0.0/bin/node /test/.local/share/remote-desktop-commander/node_modules/@wonderwhy-er/desktop-commander/dist/index.js"
     let safeTree = "100 1 \(rootCommand) remote\n101 100 \(rootCommand)\n102 100 /usr/bin/caffeinate -w 100\n"
@@ -1155,6 +1793,11 @@ func selfTest() {
     precondition(channelIndicator(service: "运行中", state: "通道畅通", checked: now.addingTimeInterval(-76), now: now) == "?")
     precondition(channelIndicator(service: "运行中", state: "通道不可用", checked: now, now: now) == "!")
     precondition(channelIndicator(service: "未运行", state: "通道畅通", checked: now, now: now) == "!")
+    var displaySnapshot = Snapshot(service: "运行中", channelState: "通道畅通", channelChecked: now)
+    precondition(channelSummary(displaySnapshot, now: now) == "通道可回应")
+    precondition(channelSummary(displaySnapshot, now: now.addingTimeInterval(76)) == "待复查（上次通道探测成功）")
+    displaySnapshot.service = "未运行"
+    precondition(channelSummary(displaySnapshot, now: now) == "Commander 服务未运行")
     precondition(CloudState.classify(status: "online", lastSeen: fresh, now: now) == "服务器登记在线")
     precondition(CloudState.classify(status: "offline", lastSeen: fresh, now: now).contains("离线"))
     precondition(CloudState.classify(status: nil, lastSeen: nil, now: now).contains("未知"))
@@ -1172,8 +1815,17 @@ func selfTest() {
     precondition(barCallClock(nil, uptime: 11) == "待调用")
     precondition(barCallClock(pending, uptime: 12) == "2 秒")
     precondition(barCallClock(pending, uptime: 13) == "3 秒")
-    var completed = pending; completed.duration = 2
+    var completed = pending; completed.duration = 2; completed.finished = true
     precondition(barCallClock(completed, uptime: 99) == "2 秒")
+    let evidenceActivity = ActivitySummary(steps: [completed])
+    precondition(recentSuccessfulToolExecution(evidenceActivity, now: now.addingTimeInterval(2)) == now.addingTimeInterval(2))
+    precondition(recentSuccessfulToolExecution(evidenceActivity, now: now.addingTimeInterval(123)) == nil)
+    var toolSnapshot = Snapshot(); toolSnapshot.toolExecutionState = "已验证"; toolSnapshot.toolExecutionChecked = now
+    precondition(toolExecutionFresh(toolSnapshot, now: now.addingTimeInterval(120)))
+    precondition(!toolExecutionFresh(toolSnapshot, now: now.addingTimeInterval(121)))
+    precondition(evidenceActivity.steps[0].tool == "read_file", "Tool evidence fixture changed")
+    var probeOnly = completed; probeOnly = ActivityStep(id: probeOnly.id, tool: "list_sessions", detail: probeOnly.detail, startedAt: probeOnly.startedAt, startedUptime: probeOnly.startedUptime, duration: probeOnly.duration, uncertain: probeOnly.uncertain, failed: probeOnly.failed, historical: probeOnly.historical, finished: probeOnly.finished)
+    precondition(recentSuccessfulToolExecution(ActivitySummary(steps: [probeOnly]), now: now.addingTimeInterval(2)) == nil)
     precondition(activityStepRows([pending], uptime: 13)[0].contains("●  读取文件  · 进行中 3 秒"))
     precondition(activityStepRows([completed], uptime: 99)[0].contains("✓  读取文件  · 2 秒"))
     var failedStep = completed; failedStep.failed = true
@@ -1209,7 +1861,7 @@ func selfTest() {
     precondition(recentlyReturnedCall(invalidDuration, uptime: 12) == nil)
     var unmatchedCompletion = justReturned; unmatchedCompletion.observedUptime = 13; unmatchedCompletion.returnedStepID = nil
     precondition(recentlyReturnedCall(unmatchedCompletion, uptime: 13) == nil)
-    precondition(callState(ActivitySummary(state: "本机已返回（云端结果未知）")) == "当前无工具调用")
+    precondition(callState(ActivitySummary(state: "本机已返回（云端结果未知）", idleProven: true)) == "未观察到新调用")
     precondition(callState(ActivitySummary()) == "状态未确认")
     precondition(callState(ActivitySummary(state: "调用状态未确认（日志有间隔）")) == "状态未确认")
     precondition(callState(ActivitySummary(state: "未观察到新调用", error: true)) == "状态未确认")
@@ -1296,7 +1948,7 @@ func selfTest() {
     precondition(CommanderActivity.parse(Data("🔧 Received tool call \(safeID): write_file {\"file_path\":\"/tmp/sk-secret-token-0123456789abcdef0123456789abcdef\",\"content\":\"private\"}".utf8))?.3 == "更新文件")
     precondition(CommanderActivity.parse(Data("🔧 Received tool call \(safeID): read_file {\"content\":\"fake path /tmp/DO_NOT_SHOW.md\"}".utf8))?.3 == "读取文件")
     precondition(CommanderActivity.parse(Data("prefix 🔧 Received tool call \(safeID): read_file {".utf8)) == nil)
-    precondition(CommanderActivity.parse(Data("🔧 Received tool call \(safeID): read_file_extra {".utf8)) == nil)
+    precondition(CommanderActivity.parse(Data("🔧 Received tool call \(safeID): read_file_extra {".utf8))?.3 == "本机工具调用")
     let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
     try! FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: dir) }
@@ -1306,9 +1958,9 @@ func selfTest() {
     try! Data("invalid".utf8).write(to: ledgerFile)
     precondition(!ChannelRecoveryLedger.load(from: ledgerFile).autoRecoveryEnabled)
     let log = dir.appendingPathComponent("stdout.log")
-    FileManager.default.createFile(atPath: log.path, contents: Data())
+    FileManager.default.createFile(atPath: log.path, contents: Data("🚀 Starting MCP Device...\n".utf8))
     let reader = ActivityLogReader(url: log)
-    reader.poll(); precondition(reader.summary.state == "未观察到新调用" && !reader.summary.coverageGap)
+    reader.poll(); reader.poll(); precondition(reader.summary.state == "未观察到新调用" && !reader.summary.coverageGap && reader.summary.idleProven)
     func append(_ s: String) { let f = try! FileHandle(forWritingTo: log); try! f.seekToEnd(); try! f.write(contentsOf: Data(s.utf8)); try! f.close() }
     append("🔧 Received tool call \(safeID): read_file {\n")
     reader.poll(now: now, uptime: 10); precondition(reader.summary.active["read_file"] == 1 && reader.summary.steps.first?.startedAt == now)
@@ -1328,10 +1980,10 @@ func selfTest() {
     reader.poll(now: now.addingTimeInterval(10), uptime: 20); let uniqueStart = reader.summary.steps.first!.startedAt
     append("✅ Tool call list_directory completed: private result\n")
     reader.poll(now: now.addingTimeInterval(13), uptime: 23)
-    precondition(reader.summary.steps.first?.startedAt == uniqueStart && reader.summary.steps.first?.duration == 3 && callState(reader.summary) == "当前无工具调用")
+    precondition(reader.summary.steps.first?.startedAt == uniqueStart && reader.summary.steps.first?.duration == 3 && callState(reader.summary) == "未观察到新调用")
     let capLog = dir.appendingPathComponent("cap.log")
-    FileManager.default.createFile(atPath: capLog.path, contents: Data())
-    let capReader = ActivityLogReader(url: capLog); capReader.poll()
+    FileManager.default.createFile(atPath: capLog.path, contents: Data("🚀 Starting MCP Device...\n".utf8))
+    let capReader = ActivityLogReader(url: capLog); capReader.poll(); capReader.poll()
     func appendCap(_ s: String) { let f = try! FileHandle(forWritingTo: capLog); try! f.seekToEnd(); try! f.write(contentsOf: Data(s.utf8)); try! f.close() }
     for index in 0...100 {
         appendCap("🔧 Received tool call 00000000-0000-4000-8000-\(String(format: "%012d", index)): read_file {}\n")
@@ -1341,8 +1993,8 @@ func selfTest() {
     capReader.poll(now: now.addingTimeInterval(1), uptime: 31)
     precondition(capReader.summary.steps.count == 100 && capReader.summary.active["read_file"] == 100 && capReader.summary.steps.first?.id == "00000000-0000-4000-8000-000000000100" && capReader.summary.steps.first?.uncertain == true && capReader.summary.steps.first?.duration == nil)
     let returnLog = dir.appendingPathComponent("return.log")
-    FileManager.default.createFile(atPath: returnLog.path, contents: Data())
-    let returnReader = ActivityLogReader(url: returnLog); returnReader.poll()
+    FileManager.default.createFile(atPath: returnLog.path, contents: Data("🚀 Starting MCP Device...\n".utf8))
+    let returnReader = ActivityLogReader(url: returnLog); returnReader.poll(); returnReader.poll()
     func appendReturn(_ s: String) { let f = try! FileHandle(forWritingTo: returnLog); try! f.seekToEnd(); try! f.write(contentsOf: Data(s.utf8)); try! f.close() }
     appendReturn("🔧 Received tool call a23e4567-e89b-12d3-a456-426614174000: list_directory {}\n✅ Tool call list_directory completed: result\n")
     returnReader.poll(now: now, uptime: 40)
@@ -1351,10 +2003,53 @@ func selfTest() {
     appendReturn("🔧 Received tool call b23e4567-e89b-12d3-a456-426614174000: list_directory {}\n✅ Tool call list_directory completed: result\n✅ Tool call list_sessions completed: unmatched\n")
     returnReader.poll(now: now.addingTimeInterval(1), uptime: 41)
     precondition(returnReader.summary.active.isEmpty && returnReader.summary.state == "本机已返回（云端结果未知）" && returnReader.summary.returnedStepID == nil && recentlyReturnedCall(returnReader.summary, uptime: 41) == nil)
+    let backlogLog = dir.appendingPathComponent("backlog.log")
+    FileManager.default.createFile(atPath: backlogLog.path, contents: Data("🚀 Starting MCP Device...\n".utf8))
+    let backlogReader = ActivityLogReader(url: backlogLog); backlogReader.poll(); backlogReader.poll()
+    let backlogHandle = try! FileHandle(forWritingTo: backlogLog)
+    try! backlogHandle.seekToEnd()
+    try! backlogHandle.write(contentsOf: Data("🔧 Received tool call c23e4567-e89b-12d3-a456-426614174000: list_directory {}\n".utf8))
+    try! backlogHandle.write(contentsOf: Data(String(repeating: "ordinary log line\n", count: 5_000).utf8))
+    try! backlogHandle.write(contentsOf: Data("✅ Tool call list_directory completed: done\n".utf8)); try! backlogHandle.close()
+    backlogReader.poll(); precondition(backlogReader.summary.activeCount == 1 && backlogReader.summary.catchingUp && !backlogReader.summary.coverageGap && !activitySafeForRecovery(backlogReader.summary))
+    backlogReader.poll(); precondition(backlogReader.summary.activeCount == 0 && !backlogReader.summary.catchingUp && !backlogReader.summary.coverageGap && activitySafeForRecovery(backlogReader.summary))
+    let utf8Log = dir.appendingPathComponent("utf8-prefix.log")
+    FileManager.default.createFile(atPath: utf8Log.path, contents: Data("🚀 Starting MCP Device...\n".utf8))
+    let utf8Reader = ActivityLogReader(url: utf8Log); utf8Reader.poll(); utf8Reader.poll()
+    let receiptHead = "🔧 Received tool call e23e4567-e89b-12d3-a456-426614174000: read_file {\"padding\":\""
+    let crossingLine = receiptHead + String(repeating: "x", count: 4095 - receiptHead.utf8.count) + "中\"}\n"
+    precondition(String(data: Data(crossingLine.utf8.prefix(4096)), encoding: .utf8) == nil)
+    let utf8Handle = try! FileHandle(forWritingTo: utf8Log); try! utf8Handle.seekToEnd()
+    try! utf8Handle.write(contentsOf: Data(crossingLine.utf8)); utf8Reader.poll()
+    precondition(utf8Reader.summary.active["read_file"] == 1 && !utf8Reader.summary.coverageGap)
+    try! utf8Handle.write(contentsOf: Data("✅ Tool call read_file completed: done\n".utf8)); try! utf8Handle.close()
+    utf8Reader.poll(); precondition(utf8Reader.summary.activeCount == 0 && !utf8Reader.summary.coverageGap && activitySafeForRecovery(utf8Reader.summary))
+    let emptyLog = dir.appendingPathComponent("empty-start.log")
+    FileManager.default.createFile(atPath: emptyLog.path, contents: Data())
+    let emptyReader = ActivityLogReader(url: emptyLog); emptyReader.poll()
+    let emptyHandle = try! FileHandle(forWritingTo: emptyLog)
+    try! emptyHandle.write(contentsOf: Data("🚀 Sta".utf8)); emptyReader.poll()
+    precondition(!emptyReader.summary.idleProven && !emptyReader.summary.coverageGap)
+    try! emptyHandle.write(contentsOf: Data("rting MCP Device...\n".utf8)); try! emptyHandle.close()
+    emptyReader.poll(); precondition(emptyReader.summary.idleProven && activitySafeForRecovery(emptyReader.summary))
+    let pairedOut = dir.appendingPathComponent("paired-stdout.log")
+    let pairedErr = dir.appendingPathComponent("paired-stderr.log")
+    FileManager.default.createFile(atPath: pairedOut.path, contents: Data("🚀 Starting MCP Device...\n".utf8))
+    FileManager.default.createFile(atPath: pairedErr.path, contents: Data())
+    let pairedReader = ActivityLogReader(url: pairedOut, errorURL: pairedErr)
+    pairedReader.poll(); pairedReader.poll()
+    let outHandle = try! FileHandle(forWritingTo: pairedOut); try! outHandle.seekToEnd()
+    try! outHandle.write(contentsOf: Data("🔧 Received tool call d23e4567-e89b-12d3-a456-426614174000: other_tool {}\n".utf8)); try! outHandle.close()
+    pairedReader.poll(); precondition(pairedReader.summary.activeCount == 1 && !activitySafeForRecovery(pairedReader.summary))
+    let errHandle = try! FileHandle(forWritingTo: pairedErr)
+    try! errHandle.write(contentsOf: Data("❌ Tool call other_tool failed: private error\n".utf8)); try! errHandle.close()
+    pairedReader.poll(); precondition(pairedReader.summary.activeCount == 0 && pairedReader.summary.state == "本机异常（云端结果未知）" && !pairedReader.summary.coverageGap && activitySafeForRecovery(pairedReader.summary))
     append("🔧 Received tool call 323e4567-e89b-12d3-a456-426614174000: read_file {" + String(repeating: "x", count: 30_000))
     reader.poll(); precondition(reader.summary.active["read_file"] == 1)
-    append(String(repeating: "z", count: 300_000))
-    reader.poll(); precondition(reader.summary.active.isEmpty && reader.summary.state.contains("未确认") && reader.summary.coverageGap)
+    append(String(repeating: "z", count: 300_000) + "\n")
+    reader.poll(); precondition(reader.summary.active["read_file"] == 1 && reader.summary.catchingUp && !activitySafeForRecovery(reader.summary))
+    for _ in 0..<6 where reader.summary.catchingUp { reader.poll() }
+    precondition(reader.summary.active["read_file"] == 1 && !reader.summary.catchingUp && !reader.summary.coverageGap)
     append("🚀 Starting MCP Device...\n🔧 Received tool call 523e4567-e89b-12d3-a456-426614174000: read_file {live}\n")
     reader.poll(); precondition(reader.summary.active["read_file"] == 1)
     append("🛑 Shutting down device...\n")
@@ -1369,7 +2064,11 @@ func selfTest() {
     FileManager.default.createFile(atPath: log.path, contents: Data("🔧 Received tool call 423e4567-e89b-12d3-a456-426614174000: read_file {old start}\n".utf8))
     reader.poll(); precondition(reader.summary.active.isEmpty && reader.summary.state == "调用状态未确认")
     let bootstrap = ActivityLogReader(url: log); bootstrap.poll()
-    precondition(bootstrap.summary.active.isEmpty && bootstrap.summary.state == "调用状态未确认" && bootstrap.summary.steps.isEmpty)
+    bootstrap.poll(); precondition(bootstrap.summary.active.isEmpty && !bootstrap.summary.idleProven)
+    precondition(!reader.confirmedProcessRestart(oldPID: 1, newPID: 1, oldProcessExited: true))
+    try! Data("🚀 Starting MCP Device...\n".utf8).write(to: log)
+    precondition(reader.confirmedProcessRestart(oldPID: 1, newPID: 2, oldProcessExited: true))
+    reader.poll(); reader.poll(); precondition(activitySafeForRecovery(reader.summary))
     let appRoot = dir.appendingPathComponent("app-logs", isDirectory: true)
     let day = appRoot.appendingPathComponent("2026/10/01", isDirectory: true)
     try! FileManager.default.createDirectory(at: day, withIntermediateDirectories: true)
@@ -1402,22 +2101,25 @@ func selfTest() {
     try! Data((validApp + "\n").utf8).write(to: appLog)
     let timeline = TimelineReader(appRoot: appRoot, commanderLog: dir.appendingPathComponent("stdout.log"), commanderErrorLog: nil, journal: journal, conversationLabelsURL: labelCatalogURL)
     timeline.poll(now: now)
-    precondition(timeline.summary.events.isEmpty && timeline.summary.coverage.contains("Commander 调用归属未确认")) // Startup tail is never relabeled as live.
+    precondition(timeline.summary.events.count == 1 && timeline.summary.events[0].sourceAt == sourceStamp && timeline.summary.coverage.contains("Commander 调用归属未确认")) // Retained App history keeps its original event time.
     let appHandle = try! FileHandle(forWritingTo: appLog); try! appHandle.seekToEnd()
     try! appHandle.write(contentsOf: Data("\(sourceStamp) warning [electron-message-handler] chatgpt_pubsub_transport_closed private body=DO_NOT_STORE\n".utf8))
     try! appHandle.write(contentsOf: Data("transcript chatgpt_pubsub_transport_opened\n".utf8))
     try! appHandle.write(contentsOf: Data("\(sourceStamp) warning [electron-message-handler] chatgpt_conversation_refetch_completed statusAfter=private_token\n".utf8))
     try! appHandle.write(contentsOf: Data("\(sourceStamp) error [electron-message-handler] chatgpt_completion_transport_recovery_started partial".utf8)); try! appHandle.close()
-    timeline.poll(now: now.addingTimeInterval(1)); precondition(timeline.summary.events.count == 1 && timeline.summary.events[0].event == "chatgpt_pubsub_transport_closed")
+    timeline.poll(now: now.addingTimeInterval(1)); precondition(timeline.summary.events.count == 2 && timeline.summary.events[1].event == "chatgpt_pubsub_transport_closed")
     let appHandle2 = try! FileHandle(forWritingTo: appLog); try! appHandle2.seekToEnd()
     try! appHandle2.write(contentsOf: Data("\n\(sourceStamp) info [electron-message-handler] chatgpt_pubsub_transport_opened\n\(sourceStamp) info [electron-message-handler] chatgpt_pubsub_reconnect_scheduled\n".utf8)); try! appHandle2.close()
     timeline.poll(now: now.addingTimeInterval(2)); timeline.poll(now: now.addingTimeInterval(3))
     precondition(timeline.summary.events.suffix(3).map(\.event) == ["chatgpt_completion_transport_recovery_started", "chatgpt_pubsub_transport_opened", "chatgpt_pubsub_reconnect_scheduled"])
     precondition(timeline.summary.events.last?.sourceAt == sourceStamp)
-    let labeledLog = day.appendingPathComponent("labeled.log")
+    let namedRoot = dir.appendingPathComponent("named-app-logs")
+    let namedDay = namedRoot.appendingPathComponent("2026/10/01")
+    try! FileManager.default.createDirectory(at: namedDay, withIntermediateDirectories: true)
+    let labeledLog = namedDay.appendingPathComponent("labeled.log")
     FileManager.default.createFile(atPath: labeledLog.path, contents: Data())
     let labeledJournal = dir.appendingPathComponent("labeled.jsonl")
-    let labeledTimeline = TimelineReader(appRoot: appRoot, commanderLog: dir.appendingPathComponent("no-commander.log"), commanderErrorLog: nil, journal: labeledJournal, conversationLabelsURL: labelCatalogURL)
+    let labeledTimeline = TimelineReader(appRoot: namedRoot, commanderLog: dir.appendingPathComponent("no-commander.log"), commanderErrorLog: nil, journal: labeledJournal, conversationLabelsURL: labelCatalogURL)
     labeledTimeline.poll(now: now)
     let namedLines = [
         "chatgpt_conversation_refetch_started conversationId=\(syntheticConversationID)",
@@ -1443,7 +2145,7 @@ func selfTest() {
     try! (JSONEncoder().encode(invalidGlobal) + Data([10]) + JSONEncoder().encode(invalidCommanderTitle) + Data([10])).write(to: globalTitleJournal)
     let rejectsGlobalTitle = TimelineReader(appRoot: dir.appendingPathComponent("missing-app"), commanderLog: dir.appendingPathComponent("missing-commander"), commanderErrorLog: nil, journal: globalTitleJournal, conversationLabelsURL: labelCatalogURL)
     precondition(rejectsGlobalTitle.summary.events.isEmpty)
-    let longPrefix = "\(sourceStamp) info [electron-message-handler] chatgpt_pubsub_transport_closed "
+    let longPrefix = "2026-10-01T03:33:02.055Z info [electron-message-handler] chatgpt_pubsub_transport_closed "
     let longHandle = try! FileHandle(forWritingTo: appLog); try! longHandle.seekToEnd(); try! longHandle.write(contentsOf: Data((longPrefix + String(repeating: "x", count: 9000) + " DO_NOT_KEEP\n").utf8)); try! longHandle.close()
     timeline.poll(now: now.addingTimeInterval(3.5)); precondition(timeline.summary.latestAppEvent?.event == "chatgpt_pubsub_transport_closed")
     let savedTimeline = String(data: try! Data(contentsOf: journal), encoding: .utf8)!
@@ -1452,7 +2154,7 @@ func selfTest() {
     precondition(restored.summary.events.count >= 3)
     let movedAppLog = dir.appendingPathComponent("rotated-app.log"); try! FileManager.default.moveItem(at: appLog, to: movedAppLog)
     try! Data("historical event\n".utf8).write(to: appLog); timeline.poll(now: now.addingTimeInterval(4))
-    precondition(timeline.summary.coverage.contains("轮换") && timeline.summary.events.count == 5)
+    precondition(timeline.summary.coverage.contains("轮换") && timeline.summary.events.count == 6)
     try! Data("small\n".utf8).write(to: appLog); timeline.poll(now: now.addingTimeInterval(4)); precondition(timeline.summary.coverage.contains("截断"))
     let missingTimeline = TimelineReader(appRoot: dir.appendingPathComponent("missing"), commanderLog: dir.appendingPathComponent("missing.log"), commanderErrorLog: nil, journal: dir.appendingPathComponent("missing.jsonl"))
     missingTimeline.poll(); precondition(missingTimeline.summary.coverage.contains("缺失"))
@@ -1475,7 +2177,7 @@ func selfTest() {
     let boundedJournal = dir.appendingPathComponent("bounded-timeline.jsonl")
     let boundedTimeline = TimelineReader(appRoot: boundedRoot, commanderLog: dir.appendingPathComponent("no-commander.log"), commanderErrorLog: nil, journal: boundedJournal)
     boundedTimeline.poll(now: now)
-    let manyEvents = String(repeating: "2026-10-01T03:33:01.055Z warning [electron-message-handler] chatgpt_pubsub_transport_closed\n", count: 18000)
+    let manyEvents = (0..<18000).map { index in "\(ISO8601DateFormatter.flex.string(from: now.addingTimeInterval(Double(index)))) warning [electron-message-handler] chatgpt_pubsub_transport_closed\n" }.joined()
     let boundedHandle = try! FileHandle(forWritingTo: boundedAppLog); try! boundedHandle.seekToEnd(); try! boundedHandle.write(contentsOf: Data(manyEvents.utf8)); try! boundedHandle.close()
     for index in 0..<30 { boundedTimeline.poll(now: now.addingTimeInterval(Double(index + 1))) }
     precondition(boundedTimeline.summary.events.count == 12 && boundedTimeline.summary.history.count == 500)
@@ -1490,10 +2192,133 @@ func selfTest() {
     try! (JSONEncoder().encode(invalidRow) + Data([10])).write(to: invalidJournal)
     let rejectsUnlisted = TimelineReader(appRoot: dir.appendingPathComponent("missing"), commanderLog: dir.appendingPathComponent("none"), commanderErrorLog: nil, journal: invalidJournal)
     precondition(rejectsUnlisted.summary.events.isEmpty)
-        print("CommanderGuard self-test passed")
+    // A public connection opening or idle UI never proves the interrupted answer recovered.
+    let issueTime = "2026-10-04T11:40:53.677Z"
+    let issue = TimelineEvent(source: "chatgpt_app", event: "chatgpt_completion_transport_recovery_started", sourceAt: issueTime, observedAt: issueTime, failureKind: "resume_unavailable")
+    let laterOpen = TimelineEvent(source: "chatgpt_app", event: "chatgpt_pubsub_transport_opened", sourceAt: "2026-10-04T11:41:00.000Z", observedAt: "2026-10-04T11:41:00.000Z")
+    let laterIdle = TimelineEvent(source: "chatgpt_app", event: "chatgpt_conversation_refetch_completed · idle", sourceAt: "2026-10-04T11:42:00.000Z", observedAt: "2026-10-04T11:42:00.000Z")
+    let chatResult = chatMonitorSummary(TimelineSummary(coverage: "已覆盖当前日志", history: [issue, laterOpen, laterIdle]))
+    precondition(chatResult.answer.contains("恢复流不可用") && chatResult.connection.contains("更新连接已建立") && !chatResult.answer.contains("回答已恢复"))
+    precondition(chatResult.answer.contains("恢复情况未确认"))
+    precondition(appEventLabel(TimelineEvent(source: "chatgpt_app", event: "chatgpt_conversation_refetch_completed · error", sourceAt: issueTime, observedAt: issueTime)).contains("对话状态刷新失败"))
+    let repeated = TimelineEvent(source: "chatgpt_app", event: "chatgpt_pubsub_transport_opened", sourceAt: "2026-10-04T11:41:00.100Z", observedAt: "2026-10-04T11:41:00.100Z")
+    let repeated2 = TimelineEvent(source: "chatgpt_app", event: "chatgpt_pubsub_transport_opened", sourceAt: "2026-10-04T11:41:00.800Z", observedAt: "2026-10-04T11:41:00.800Z")
+    let separate = TimelineEvent(source: "chatgpt_app", event: "chatgpt_pubsub_transport_opened", sourceAt: "2026-10-04T11:41:03.000Z", observedAt: "2026-10-04T11:41:03.000Z")
+    let grouped = groupedTimelineEvents([repeated, repeated2, separate])
+    precondition(grouped.count == 2 && grouped[0].1 == 2 && grouped[1].1 == 1)
+    precondition(groupedTimelineEvents([issue, TimelineEvent(source: issue.source, event: issue.event, sourceAt: issue.sourceAt, observedAt: issue.observedAt)]).count == 2, "Different failure classifications must remain separate")
+    precondition(chatResult.menuLine.count < 100 && chatResult.deliveryLimit.contains("没有可读"))
+    precondition(chatMonitorSummary(TimelineSummary(coverage: "App 日志缺失")).answer.contains("未知"))
+    precondition(chatMonitorSummary(TimelineSummary(coverage: "已覆盖当前日志")).answer.contains("尚未观察到"))
+    let retainedIssue = chatMonitorSummary(TimelineSummary(coverage: "已覆盖当前日志", history: [laterOpen, laterIdle], latestAppIssue: issue))
+    precondition(retainedIssue.answer.contains("恢复流不可用"))
+    let chatRoot = dir.appendingPathComponent("chat-monitor/2026/10/04"); try! FileManager.default.createDirectory(at: chatRoot, withIntermediateDirectories: true)
+    let chatLog = chatRoot.appendingPathComponent("app.log")
+    let chatJournal = dir.appendingPathComponent("chat-monitor.jsonl")
+    let chatRecord = "\(issueTime) warning [electron-message-handler] chatgpt_completion_transport_recovery_started conversationId=00000000-0000-4000-8000-000000000001 error={\"type\":\"fetch-stream-error\",\"responseStatus\":404,\"error\":\"{\\\"detail\\\":\\\"Resume stream unavailable\\\"}\"}\n"
+    precondition(appRecoveryFailure("note=Resume stream unavailable error={\"type\":\"other\"}") == nil)
+    precondition(appRecoveryFailure("error={\"type\":\"fetch-stream-error\",\"responseStatus\":500,\"error\":\"Resume stream unavailable\"}") == nil)
+    try! Data(chatRecord.utf8).write(to: chatLog)
+    let chatReader = TimelineReader(appRoot: dir.appendingPathComponent("chat-monitor"), commanderLog: dir.appendingPathComponent("none"), commanderErrorLog: nil, journal: chatJournal)
+    chatReader.poll(now: now)
+    precondition(chatReader.summary.latestAppIssue?.failureKind == "resume_unavailable")
+    let restoredChatReader = TimelineReader(appRoot: dir.appendingPathComponent("missing"), commanderLog: dir.appendingPathComponent("none"), commanderErrorLog: nil, journal: chatJournal)
+    precondition(restoredChatReader.summary.latestAppIssue?.failureKind == "resume_unavailable")
+    let serializedChat = String(decoding: try! Data(contentsOf: chatJournal), as: UTF8.self)
+    precondition(!serializedChat.contains("conversationId") && !serializedChat.contains("errorType") && !serializedChat.contains("Resume stream unavailable"))
+    let extraEvents = ["chatgpt_completion_transport_recovery_completed", "chatgpt_completion_transport_recovery_poll_failed", "chatgpt_pubsub_reconnect_exhausted"]
+    let extraLines = extraEvents.enumerated().map { offset, event in
+        "2026-10-04T11:43:0\(offset).000Z warning [electron-message-handler] \(event) conversationId=00000000-0000-4000-8000-000000000001 error=PRIVATE_TEST_PAYLOAD"
+    }.joined(separator: "\n") + "\n"
+    let extraHandle = try! FileHandle(forWritingTo: chatLog); try! extraHandle.seekToEnd(); try! extraHandle.write(contentsOf: Data(extraLines.utf8)); try! extraHandle.close()
+    chatReader.poll(now: now)
+    precondition(chatReader.summary.history.suffix(3).map(\.event) == extraEvents)
+    precondition(chatMonitorSummary(chatReader.summary).answer.contains("恢复检查失败"))
+    precondition(chatMonitorSummary(chatReader.summary).connection.contains("重连已耗尽"))
+    let recoveredEvent = chatReader.summary.history.first { $0.event == extraEvents[0] }!
+    precondition(appEventLabel(recoveredEvent).contains("恢复完成"))
+    precondition(chatMonitorSummary(TimelineSummary(coverage: "已覆盖当前日志", history: [issue, recoveredEvent])).answer.contains("恢复情况未确认"))
+    let restoredExtra = TimelineReader(appRoot: dir.appendingPathComponent("missing"), commanderLog: dir.appendingPathComponent("none"), commanderErrorLog: nil, journal: chatJournal)
+    precondition(restoredExtra.summary.history.suffix(3).map(\.event) == extraEvents)
+    precondition(!String(decoding: try! Data(contentsOf: chatJournal), as: UTF8.self).contains("PRIVATE_TEST_PAYLOAD"))
+    let freshRoot = dir.appendingPathComponent("fresh-log/2026/10/04")
+    try! FileManager.default.createDirectory(at: freshRoot, withIntermediateDirectories: true)
+    let freshCommander = dir.appendingPathComponent("fresh-commander.log"); try! Data().write(to: freshCommander)
+    let freshReader = TimelineReader(appRoot: dir.appendingPathComponent("fresh-log"), commanderLog: freshCommander, commanderErrorLog: nil, journal: dir.appendingPathComponent("fresh-journal.jsonl"))
+    freshReader.poll(now: now)
+    try! Data("\(issueTime) info [electron-message-handler] chatgpt_pubsub_transport_opened\n".utf8).write(to: freshRoot.appendingPathComponent("new.log"))
+    freshReader.poll(now: now)
+    precondition(freshReader.summary.coverage.contains("已覆盖当前日志") && freshReader.summary.history.count == 1, "A new App log read from byte zero has no coverage gap")
+    try! Data(repeating: 32, count: 2 * 1024 * 1024 + 1).write(to: freshRoot.appendingPathComponent("too-large.log"))
+    freshReader.poll(now: now)
+    precondition(freshReader.summary.coverage.contains("覆盖有缺口"), "Skipping old bytes in a new path must still report a gap")
+    precondition(NSImage(systemSymbolName: "shield", accessibilityDescription: nil) != nil && NSImage(systemSymbolName: "link", accessibilityDescription: nil) != nil)
+    let incidentURL = dir.appendingPathComponent("guardian-status.json")
+    let offsetFormatter = DateFormatter(); offsetFormatter.locale = Locale(identifier: "en_US_POSIX"); offsetFormatter.timeZone = TimeZone(secondsFromGMT: 8 * 3600); offsetFormatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ssZ"
+    let offsetStamp = offsetFormatter.string(from: now.addingTimeInterval(-50))
+    func writeGuardian(_ values: [String: Any]) { try! JSONSerialization.data(withJSONObject: values).write(to: incidentURL) }
+    let goodGuardian: [String: Any] = ["updated_at": offsetStamp, "healthy": true, "proxy_available": true, "tunnel_state": "running", "manual_pause": false, "new_log_failures": 0, "recent_failure_score": 0]
+    writeGuardian(goodGuardian)
+    let guardianGood = NetworkGuardianStatus.read(incidentURL, now: now)
+    precondition(guardianGood.updatedAt != nil && guardianGood.healthy == true)
+    precondition(NetworkGuardianStatus.read(dir.appendingPathComponent("missing-status.json"), now: now).updatedAt == nil)
+    writeGuardian(["updated_at": ISO8601DateFormatter.flex.string(from: now.addingTimeInterval(-121)), "healthy": true, "proxy_available": true, "tunnel_state": "running"])
+    precondition(NetworkGuardianStatus.read(incidentURL, now: now).updatedAt == nil, "Stale network status must be unknown")
+    writeGuardian(["updated_at": "2026-10-05T11:05:14", "healthy": true, "proxy_available": true, "tunnel_state": "running"])
+    precondition(NetworkGuardianStatus.read(incidentURL, now: now).updatedAt == nil, "A timezone-less timestamp must be rejected")
+    writeGuardian(goodGuardian.merging(["healthy": 1]) { _, new in new })
+    precondition(NetworkGuardianStatus.read(incidentURL, now: now).updatedAt == nil, "Malformed selected status must be unknown")
+    writeGuardian(goodGuardian.merging(["updated_at": ISO8601DateFormatter.flex.string(from: now.addingTimeInterval(1))]) { _, new in new })
+    precondition(NetworkGuardianStatus.read(incidentURL, now: now).updatedAt == nil, "Future status must not be treated as current")
+    let safeIdle = ActivitySummary(state: "未观察到新调用", idleProven: true)
+    let eventTime = ISO8601DateFormatter.flex.string(from: now.addingTimeInterval(-50))
+    let appClose = TimelineEvent(source: "chatgpt_app", event: "chatgpt_pubsub_transport_closed", sourceAt: eventTime, observedAt: eventTime)
+    let commanderChannel = TimelineEvent(source: "commander", event: "Commander错误: 通道错误", sourceAt: nil, observedAt: ISO8601DateFormatter.flex.string(from: now.addingTimeInterval(-45)))
+    var badGuardianJSON = goodGuardian
+    badGuardianJSON["healthy"] = false; badGuardianJSON["proxy_available"] = false; badGuardianJSON["tunnel_state"] = "down"
+    badGuardianJSON["updated_at"] = ISO8601DateFormatter.flex.string(from: now.addingTimeInterval(-48))
+    writeGuardian(badGuardianJSON)
+    let guardianBad = NetworkGuardianStatus.read(incidentURL, now: now)
+    let joint = IncidentDiagnosis.make(timeline: TimelineSummary(coverage: "已覆盖当前日志", history: [appClose, commanderChannel]), activity: safeIdle, network: guardianBad, service: "运行中", channelState: "通道畅通", now: now)
+    precondition(joint.title.contains("同时异常") && joint.evidence.contains("不证明"), "Near-time cross-service evidence must remain tentative")
+    precondition(joint.startedAt == ISO8601DateFormatter.parse(eventTime) && joint.lastSeenAt == ISO8601DateFormatter.parse(commanderChannel.observedAt), "A failed webpage check must not replace actual incident times")
+    let pairWithHealthyWeb = IncidentDiagnosis.make(timeline: TimelineSummary(coverage: "已覆盖当前日志", history: [appClose, commanderChannel]), activity: safeIdle, network: guardianGood, service: "运行中", channelState: "通道畅通", now: now)
+    precondition(pairWithHealthyWeb.title.contains("同时异常") && pairWithHealthyWeb.evidence.contains("不证明"), "A healthy public webpage probe must not hide a near-time App and Commander interruption")
+    let appOnly = IncidentDiagnosis.make(timeline: TimelineSummary(coverage: "已覆盖当前日志", history: [appClose]), activity: safeIdle, network: guardianGood, now: now)
+    precondition(appOnly.title.contains("连接近期中断") && appOnly.evidence.contains("不等同于 Commander ping"))
+    let opened = TimelineEvent(source: "chatgpt_app", event: "chatgpt_pubsub_transport_opened", sourceAt: ISO8601DateFormatter.flex.string(from: now.addingTimeInterval(-10)), observedAt: eventTime)
+    let duplicateClose = TimelineEvent(source: "chatgpt_app", event: appClose.event, sourceAt: eventTime, observedAt: ISO8601DateFormatter.flex.string(from: now.addingTimeInterval(-49)))
+    let interrupted = IncidentDiagnosis.make(timeline: TimelineSummary(coverage: "已覆盖当前日志", history: [appClose, duplicateClose, opened]), activity: safeIdle, network: guardianGood, now: now)
+    precondition(interrupted.title.contains("之后观察到重新连接") && !interrupted.title.contains("次"), "Co-temporal close records should collapse into one incident")
+    let repeatClose = TimelineEvent(source: "chatgpt_app", event: appClose.event, sourceAt: ISO8601DateFormatter.flex.string(from: now.addingTimeInterval(-20)), observedAt: ISO8601DateFormatter.flex.string(from: now.addingTimeInterval(-19)))
+    let repeatedDiagnosis = IncidentDiagnosis.make(timeline: TimelineSummary(coverage: "已覆盖当前日志", history: [appClose, duplicateClose, repeatClose]), activity: safeIdle, network: guardianGood, now: now)
+    precondition(repeatedDiagnosis.title.contains("近15分钟 2 个关闭时段"), "Distinct close groups should report the repeat count")
+    let oldIssue = TimelineEvent(source: "chatgpt_app", event: "chatgpt_completion_transport_recovery_started", sourceAt: ISO8601DateFormatter.flex.string(from: now.addingTimeInterval(-1800)), observedAt: eventTime, failureKind: "resume_unavailable")
+    let oldTimeline = TimelineSummary(coverage: "已覆盖当前日志", history: [oldIssue], latestAppIssue: oldIssue)
+    let oldDiagnosis = IncidentDiagnosis.make(timeline: oldTimeline, activity: safeIdle, network: guardianGood, now: now)
+    precondition(oldDiagnosis.title.contains("较早") && chatMonitorSummary(oldTimeline).answer.contains("恢复流不可用"), "Old unresolved answer incidents must persist separately")
+    let oldPlusClose = IncidentDiagnosis.make(timeline: TimelineSummary(coverage: "已覆盖当前日志", history: [oldIssue, appClose], latestAppIssue: oldIssue), activity: safeIdle, network: guardianGood, now: now)
+    precondition(oldPlusClose.title.contains("更新连接近期中断"), "An old answer issue must not hide a new connection interruption")
+    let stopped = IncidentDiagnosis.make(timeline: oldTimeline, activity: safeIdle, network: guardianGood, service: "未运行", channelState: "未知", now: now)
+    precondition(stopped.title.contains("服务当前未运行"), "Current service state must outrank old answer history")
+    let expired = IncidentDiagnosis.make(timeline: TimelineSummary(coverage: "已覆盖当前日志", history: [TimelineEvent(source: "chatgpt_app", event: appClose.event, sourceAt: ISO8601DateFormatter.flex.string(from: now.addingTimeInterval(-901)), observedAt: eventTime)]), activity: safeIdle, network: guardianGood, now: now)
+    precondition(expired.title.contains("没有可操作") && expired.startedAt == nil, "Expired incidents must not remain current")
+    let earlierCommander = TimelineEvent(source: "commander", event: "Commander错误: 通道关闭", sourceAt: nil, observedAt: ISO8601DateFormatter.flex.string(from: now.addingTimeInterval(-600)))
+    let exactJoint = IncidentDiagnosis.make(timeline: TimelineSummary(coverage: "已覆盖当前日志", history: [earlierCommander, appClose, commanderChannel]), activity: safeIdle, network: guardianGood, now: now)
+    precondition(exactJoint.startedAt == ISO8601DateFormatter.parse(eventTime) && exactJoint.lastSeenAt == ISO8601DateFormatter.parse(commanderChannel.observedAt), "Unrelated older Commander events must not change incident times")
+    let unknownActivity = IncidentDiagnosis.make(timeline: TimelineSummary(coverage: "已覆盖当前日志"), activity: ActivitySummary(state: "状态未确认"), network: guardianGood, now: now)
+    precondition(unknownActivity.title.contains("未确认") && unknownActivity.nextAction.contains("当前不建议重启或重试"))
+    let busyDiagnosis = IncidentDiagnosis.make(timeline: TimelineSummary(coverage: "已覆盖当前日志"), activity: ActivitySummary(state: "收到调用（处理中）", active: ["read_file": 1]), network: guardianGood, now: now)
+    precondition(busyDiagnosis.title.contains("进行中") && busyDiagnosis.nextAction.contains("等待当前调用返回"))
+    let missingCoverage = IncidentDiagnosis.make(timeline: TimelineSummary(coverage: "读取失败"), activity: ActivitySummary(state: "未观察到新调用", observed: now.addingTimeInterval(-600)), network: guardianGood, now: now)
+    precondition(missingCoverage.title.contains("覆盖") && missingCoverage.startedAt == nil, "An unrelated call timestamp cannot become a diagnostic gap start")
+    let networkOnly = IncidentDiagnosis.make(timeline: TimelineSummary(coverage: "已覆盖当前日志"), activity: safeIdle, network: guardianBad, now: now)
+    precondition(networkOnly.title.contains("网络守护近期") && networkOnly.startedAt == nil && networkOnly.lastSeenAt == guardianBad.updatedAt)
+    precondition(IncidentDiagnosis.make(timeline: oldTimeline, activity: safeIdle, network: guardianGood, now: now).title.contains("较早"), "A successful probe must not clear an answer issue")
+    print("CommanderGuard self-test passed")
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTableViewDelegate {
     private var item: NSStatusItem!
     private var timer: Timer?
     private var channelTimer: Timer?
@@ -1501,44 +2326,100 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var paused = false
     private var snapshot = Snapshot()
     private var summaryLines: [NSMenuItem] = []
+    private var statusMenu: NSMenu?
     private var guardItem: NSMenuItem!
     private var recoveryItem: NSMenuItem!
     private let recoveryURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/CommanderGuard/channel-recovery.json")
     private var recoveryLedger = ChannelRecoveryLedger.load(from: FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/CommanderGuard/channel-recovery.json"))
     private var watchdog = ChannelWatchdogState(startedAt: Date())
     private var channelBusy = false
+    private var lastPingAt: Date?
+    private var lastPingResult = "尚无实际检查结果"
+    private var deferredReason = "等待首次检查"
+    private var lastRecoveryOutcome: String?
+    private var manualNotice: String?
+    private var manualPingBusy = false
+    private var toolProbeBusy = false
+    private var lastToolProbeAttempt = Date.distantPast
+    private var toolProbeDeferredReason = "等待首次工具检查"
     private var lastActivityPoll = Date.distantPast
     private var recoveryLaunched = false
-    private var logWindow: NSWindow?
+    private let previewMode: Bool
+    private var panelWindow: NSWindow?
+    private var panelPage = 0
+    private var panelScroll: NSScrollView?
+    private var panelNav: NSSegmentedControl?
+    private var panelHeading: NSStackView?
+    private var panelHeroMinimum: NSLayoutConstraint?
+    private var panelConnection: NSTextField?
+    private var panelConnectionTime: NSTextField?
+    private var panelConnectionDetail: NSTextField?
+    private var panelToolExecution: NSTextField?
+    private var panelToolExecutionTime: NSTextField?
+    private var panelToolExecutionDetail: NSTextField?
+    private var panelChat: NSTextField?
+    private var panelChatTime: NSTextField?
+    private var panelChatDetail: NSTextField?
+    private var panelNetwork: NSTextField?
+    private var panelNetworkTime: NSTextField?
+    private var panelNetworkDetail: NSTextField?
+    private var panelRecoveryToggle: NSButton?
+    private var panelRecoveryStatus: NSTextField?
+    private var panelWakeToggle: NSButton?
     private var logTextView: NSTextView?
-    private var logDetailsButton: NSButton?
-    private var showingLogDetails = false
-    private let activityReader = ActivityLogReader()
+    private var recordSearch: NSSearchField?
+    private var recordFilter: NSPopUpButton?
+    private var recordTable: NSTableView?
+    private var recordTableScroll: NSScrollView?
+    private var recordDocument: NSStackView?
+    private var recordDetail: NSTextField?
+    private var recordSteps: [ActivityStep] = []
+    private var selectedRecordID: String?
+    private let activityReader = ActivityLogReader(errorURL: FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/RemoteDesktopCommander/stderr.log"))
+    private var verifiedRestart: (old: Int32, new: Int32)?
     private let timelineReader = TimelineReader()
     private var activityBusy = false
     private var activityTimer: Timer?
 
+    init(previewMode: Bool = false) { self.previewMode = previewMode; super.init() }
+
     func applicationDidFinishLaunching(_ n: Notification) {
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        item.button?.title = "Commander 守护"
+        let image = NSImage(size: NSSize(width: 18, height: 18), flipped: false) { _ in
+            NSImage(systemSymbolName: "shield", accessibilityDescription: nil)?.draw(in: NSRect(x: 1, y: 0, width: 16, height: 18))
+            NSImage(systemSymbolName: "link", accessibilityDescription: nil)?.draw(in: NSRect(x: 5, y: 6, width: 8, height: 7))
+            return true
+        }
+        image.isTemplate = true
+        item.button?.image = image; item.button?.imagePosition = .imageLeading
         rebuild()
+        if previewMode {
+            loadPreviewSnapshot(); openPanel()
+            if CommandLine.arguments.contains("--verify-ui") { verifyPanelLayout(); exit(0) }
+            return
+        }
+        DistributedNotificationCenter.default().addObserver(self, selector: #selector(openPanel), name: NSNotification.Name("com.wuwendi.commander-guard.open-panel"), object: nil)
         poll()
         timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { _ in self.poll() }
-        channelTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { _ in self.pollChannel() }
+        channelTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { _ in self.pollChannel(); self.pollToolExecution() }
         activityTimer = Timer(timeInterval: 1, repeats: true) { _ in self.pollActivity() }
         RunLoop.main.add(activityTimer!, forMode: .common)
         pollActivity()
     }
     func applicationWillTerminate(_ n: Notification) { timer?.invalidate(); channelTimer?.invalidate(); activityTimer?.invalidate(); releaseAssertion() }
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool { openPanel(); return true }
     private func rebuild() {
         let m = NSMenu()
-        ["连接：未知", "通道：启动宽限", "动作：未观察到新调用"].forEach { let x = NSMenuItem(title: $0, action: nil, keyEquivalent: ""); x.isEnabled = false; m.addItem(x); summaryLines.append(x) }
-        let recent = NSMenuItem(title: "执行日志…", action: #selector(openLogWindow), keyEquivalent: ""); recent.target = self; m.addItem(recent)
-        recoveryItem = NSMenuItem(title: "自动恢复 MCP 通道", action: #selector(toggleAutoRecovery), keyEquivalent: ""); recoveryItem.target = self; recoveryItem.state = recoveryLedger.autoRecoveryEnabled ? .on : .off; m.addItem(recoveryItem)
-        guardItem = NSMenuItem(title: "暂停防休眠（仅影响本机睡眠）", action: #selector(togglePause), keyEquivalent: ""); guardItem.target = self; m.addItem(guardItem)
+        summaryLines = (0..<5).map { _ in NSMenuItem(title: "", action: nil, keyEquivalent: "") }
+        recoveryItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        guardItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        let open = NSMenuItem(title: "打开 CommanderGuard", action: #selector(openPanel), keyEquivalent: ""); open.target = self; m.addItem(open)
         m.addItem(.separator())
-        let quit = NSMenuItem(title: "退出", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"); quit.target = NSApplication.shared; m.addItem(quit)
-        item.menu = m
+        let quit = NSMenuItem(title: "退出 CommanderGuard", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"); quit.target = NSApplication.shared; m.addItem(quit)
+        statusMenu = m
+        item.button?.target = self
+        item.button?.action = #selector(statusBarClicked)
+        item.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
     }
     private func poll() {
         DispatchQueue.global(qos: .utility).async {
@@ -1558,13 +2439,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     private func pollChannel() {
         let now = Date()
-        guard !channelBusy, watchdog.isDue(now: now) else { return }
+        guard !channelBusy, !manualPingBusy, watchdog.isDue(now: now) else { return }
         watchdog.lastProbe = now
-        guard snapshot.service == "运行中" else { recordProbe(.unknown("Commander 服务未运行"), now: now); return }
-        guard activitySafeForRecovery(snapshot.activity) else {
-            recordProbe(.unknown("本机调用活跃或日志状态不完整"), now: now); return
-        }
-        channelBusy = true
+        guard snapshot.service == "运行中" else { recordDeferred("Commander 服务未运行"); return }
+        channelBusy = true; deferredReason = "正在检查"; render()
         MCPChannelProbe().run { result in
             DispatchQueue.main.async {
                 self.channelBusy = false
@@ -1573,12 +2451,110 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
     }
-    private func recordProbe(_ result: ChannelProbeResult, now: Date) {
-        watchdog.observed(result, now: now)
+    private func recordProbe(_ result: ChannelProbeResult, now: Date, manual: Bool = false) {
+        lastPingAt = now; lastPingResult = probeDescription(result); deferredReason = "未延后"
+        manualNotice = nil
+        if manual { watchdog.observedManual(result, now: now) }
+        else { watchdog.observed(result, now: now) }
         snapshot.channelState = watchdog.status; snapshot.channelDetail = watchdog.detail
         snapshot.channelFailures = watchdog.failures; snapshot.channelChecked = now
         render()
     }
+    private func recordDeferred(_ reason: String) {
+        deferredReason = reason; manualNotice = nil
+        watchdog.observed(.unknown(reason), now: Date())
+        snapshot.channelState = watchdog.status
+        snapshot.channelFailures = watchdog.failures
+        snapshot.channelDetail = "检查暂缓：\(reason)"
+        render()
+    }
+    private func refreshToolExecutionFromActivity(_ activity: ActivitySummary, now: Date = Date()) {
+        guard let evidence = recentSuccessfulToolExecution(activity, now: now) else { return }
+        guard snapshot.toolExecutionChecked.map({ evidence > $0 }) ?? true else { return }
+        snapshot.toolExecutionState = "已验证"
+        snapshot.toolExecutionDetail = "复用最近真实工具调用成功记录"
+        snapshot.toolExecutionChecked = evidence
+        toolProbeDeferredReason = "无需额外探测"
+    }
+    private func pollToolExecution() {
+        let now = Date()
+        guard !previewMode, !toolProbeBusy, !watchdog.recovering else { return }
+        refreshToolExecutionFromActivity(snapshot.activity, now: now)
+        if toolExecutionFresh(snapshot, now: now) { return }
+        guard now.timeIntervalSince(lastToolProbeAttempt) >= 30 else { return }
+        guard snapshot.service == "运行中" else { toolProbeDeferredReason = "Commander 服务未运行"; return }
+        guard channelIndicator(service: snapshot.service, state: snapshot.channelState, checked: snapshot.channelChecked, now: now) == "●" else {
+            toolProbeDeferredReason = "消息通道尚未确认"; return
+        }
+        guard activitySafeForRecovery(snapshot.activity), !activityBusy else {
+            toolProbeDeferredReason = activityDeferralReason(snapshot.activity); return
+        }
+        startToolExecutionProbe(manual: false)
+    }
+    private func startToolExecutionProbe(manual: Bool) {
+        let now = Date()
+        guard !toolProbeBusy else { if manual { manualNotice = "工具执行检查已在进行"; render() }; return }
+        refreshToolExecutionFromActivity(snapshot.activity, now: now)
+        if toolExecutionFresh(snapshot, now: now) {
+            if manual { manualNotice = "通道已检查；工具执行由最近真实调用验证"; render() }
+            return
+        }
+        guard snapshot.service == "运行中" else { toolProbeDeferredReason = "Commander 服务未运行"; if manual { manualNotice = "工具检查暂缓：Commander 服务未运行"; render() }; return }
+        guard activitySafeForRecovery(snapshot.activity), !activityBusy else {
+            let reason = activityDeferralReason(snapshot.activity); toolProbeDeferredReason = reason
+            if manual { manualNotice = "通道已检查；工具检查暂缓：\(reason)"; render() }
+            return
+        }
+        lastToolProbeAttempt = now; toolProbeBusy = true; toolProbeDeferredReason = "正在执行只读工具检查"; render()
+        MCPToolExecutionProbe().run { result in
+            DispatchQueue.main.async {
+                self.toolProbeBusy = false
+                self.recordToolExecution(result, now: Date())
+                if manual { self.manualNotice = "通道已检查；\(self.toolExecutionSummary(now: Date()))"; self.render() }
+            }
+        }
+    }
+    private func recordToolExecution(_ result: ToolExecutionProbeResult, now: Date) {
+        snapshot.toolExecutionChecked = now
+        switch result {
+        case .verified:
+            snapshot.toolExecutionState = "已验证"; snapshot.toolExecutionDetail = "只读 list_sessions 已经本机工具层执行"
+        case .failed(let reason):
+            snapshot.toolExecutionState = "失败"; snapshot.toolExecutionDetail = reason
+        case .unknown(let reason):
+            snapshot.toolExecutionState = "未知"; snapshot.toolExecutionDetail = reason
+        }
+        toolProbeDeferredReason = "未延后"
+        render()
+    }
+    private func toolExecutionSummary(now: Date) -> String {
+        if snapshot.toolExecutionState == "已验证" && !toolExecutionFresh(snapshot, now: now) { return "工具执行待复查" }
+        return snapshot.toolExecutionState == "已验证" ? "工具执行已验证" : "工具执行\(snapshot.toolExecutionState)"
+    }
+    private func activityDeferralReason(_ activity: ActivitySummary) -> String {
+        if activity.activeCount > 0 { return "检测到本机调用进行中" }
+        if activity.error { return "调用日志暂时不可读，无法确认空闲" }
+        if activity.catchingUp { return "调用日志追赶中（剩余 \(activity.backlogBytes) 字节）" }
+        if activity.pendingLine { return "等待调用日志当前行写完" }
+        if activity.coverageGap { return "日志覆盖缺口：\(activity.gapReason)；无法确认空闲" }
+        return "调用状态尚未确认"
+    }
+    @objc private func manualCheck() {
+        guard !watchdog.recovering else { manualCheckBlocked("自动恢复处理中，暂不能手动检查"); return }
+        guard !channelBusy, !manualPingBusy else { manualCheckBlocked("已有连接检查进行中"); return }
+        guard Date().timeIntervalSince(watchdog.startedAt) >= 90 else { manualCheckBlocked("启动等待中，暂不能手动检查"); return }
+        guard snapshot.service == "运行中" else { manualCheckBlocked("Commander 服务未运行"); return }
+        manualNotice = nil; manualPingBusy = true; deferredReason = "手动检查进行中"; render()
+        MCPChannelProbe().run { result in
+            DispatchQueue.main.async {
+                self.manualPingBusy = false
+                self.recordProbe(result, now: Date(), manual: true)
+                if case .healthy = result { self.startToolExecutionProbe(manual: true) }
+                else { self.manualNotice = "消息通道未确认；未进行工具执行检查"; self.render() }
+            }
+        }
+    }
+    private func manualCheckBlocked(_ reason: String) { manualNotice = reason; render() }
     private func considerRecovery() {
         guard recoveryLedger.autoRecoveryEnabled else { snapshot.channelDetail = "自动恢复已关闭"; render(); return }
         guard recoveryLedger.canAttempt(at: Date()) else { snapshot.channelDetail = "处于持久化冷却期"; render(); return }
@@ -1616,8 +2592,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     private func startRecovery(oldPID: Int32) {
         guard recoveryGateOpen(oldPID: oldPID) else { abortRecovery("恢复前状态已变化；未重启"); return }
+        guard servicePID() == oldPID else { abortRecovery("Commander 进程已变化；未重启"); return }
         recoveryLedger.recordAttempt(at: Date())
         guard recoveryLedger.save(to: recoveryURL) else { abortRecovery("无法安全保存冷却记录；未重启"); return }
+        lastRecoveryOutcome = "恢复进行中"
         snapshot.channelState = "正在恢复通道"; snapshot.channelDetail = "冷却已保存，正在重启固定的 Commander 服务"; render()
         let p = Process(); p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
         p.arguments = ["kickstart", "-k", "gui/\(getuid())/com.wuwendi.remote-desktop-commander"]
@@ -1639,15 +2617,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     private func recoveryFinished(oldPID: Int32, newPID: Int32?, result: ChannelProbeResult) {
         watchdog.recovering = false; recoveryLaunched = false
+        if newPID != nil { lastPingAt = Date(); lastPingResult = probeDescription(result); snapshot.channelChecked = lastPingAt }
+        lastRecoveryOutcome = newPID == nil ? resultMessageForMissingRecoveryProbe(result) : probeDescription(result)
         if recoveryConfirmed(oldPID: oldPID, newPID: newPID, probe: result) {
             watchdog.failures = 0; snapshot.channelState = "通道已恢复"; snapshot.channelDetail = "服务 PID 已变化，后续 MCP ping 成功"
+            if let newPID, kill(oldPID, 0) == -1 && errno == ESRCH {
+                verifiedRestart = (oldPID, newPID)
+                pollActivity()
+            }
         } else {
             snapshot.channelState = "恢复尚未确认"; snapshot.channelDetail = newPID == nil ? (watchdog.detail + "；" + probeDescription(result)) : "服务已重启，但后续 MCP ping 未成功（\(probeDescription(result))）"
         }
-        snapshot.channelFailures = watchdog.failures; snapshot.channelChecked = Date(); render()
+        snapshot.channelFailures = watchdog.failures; render()
     }
     private func probeDescription(_ result: ChannelProbeResult) -> String {
         switch result { case .healthy: return "ping 成功"; case .noLiveConnection: return "设备连接仍不可用"; case .unknown(let message): return message }
+    }
+    private func resultMessageForMissingRecoveryProbe(_ result: ChannelProbeResult) -> String {
+        switch result { case .healthy, .noLiveConnection: return "本次运行未观察到恢复后 ping 结果"; case .unknown(let message): return message }
     }
     private func servicePID() -> Int32? {
         let p = Process(); p.executableURL = URL(fileURLWithPath: "/bin/launchctl"); p.arguments = ["print", "gui/\(getuid())/com.wuwendi.remote-desktop-commander"]
@@ -1662,13 +2649,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     private func pollActivity() {
         guard !activityBusy else { return }
+        let restart = verifiedRestart; verifiedRestart = nil
         activityBusy = true
         DispatchQueue.global(qos: .utility).async {
+            if let restart { self.activityReader.confirmedProcessRestart(oldPID: restart.old, newPID: restart.new, oldProcessExited: true) }
             self.activityReader.poll()
             self.timelineReader.poll()
             let value = self.activityReader.summary
             let timeline = self.timelineReader.summary
-            DispatchQueue.main.async { self.snapshot.activity = value; self.snapshot.timeline = timeline; self.lastActivityPoll = Date(); self.activityBusy = false; self.render() }
+            DispatchQueue.main.async {
+                self.snapshot.activity = value; self.snapshot.timeline = timeline; self.lastActivityPoll = Date(); self.activityBusy = false
+                self.refreshToolExecutionFromActivity(value)
+                self.render()
+            }
         }
     }
     private func serviceRunning() -> Bool {
@@ -1685,44 +2678,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let result = IOPMAssertionCreateWithName(kIOPMAssertionTypePreventUserIdleSystemSleep as CFString, IOPMAssertionLevel(kIOPMAssertionLevelOn), "Commander service guardian" as CFString, &assertion)
             if result != kIOReturnSuccess { assertion = 0 }
         } else if (paused || snapshot.service != "运行中") && assertion != 0 { releaseAssertion() }
-        guardItem.title = paused ? "恢复防休眠（重新阻止本机睡眠）" : "暂停防休眠（仅影响本机睡眠）"
+        guardItem.state = paused ? .off : .on
     }
     private func releaseAssertion() { if assertion != 0 { IOPMAssertionRelease(assertion); assertion = 0 } }
     private func render() {
-        guard summaryLines.count == 3 else { return }
-        let latestAppEvent = snapshot.timeline.latestAppEvent.map { event in
-            let time = ISO8601DateFormatter.parse(event.observedAt).map { DateFormatter.localizedString(from: $0, dateStyle: .none, timeStyle: .medium) } ?? "时间未知"
-            return "\(appEventLabel(event)) · \(time)"
-        } ?? "未观察到新事件"
+        guard summaryLines.count == 5 else { return }
         let activity = snapshot.activity
         let clockText: (Date) -> String = { DateFormatter.localizedString(from: $0, dateStyle: .none, timeStyle: .medium) }
         let connection = channelIndicator(service: snapshot.service, state: snapshot.channelState, checked: snapshot.channelChecked, now: Date())
         let connectionText = "Commander 服务\(snapshot.service == "运行中" ? "运行中" : (snapshot.service == "未运行" ? "未运行" : "状态未知"))"
-        summaryLines[0].title = "状态：\(connectionText)"
-        summaryLines[1].title = "通道：\(snapshot.channelState) · \(snapshot.channelDetail)"
+        summaryLines[0].title = "消息通道：\(channelSummary(snapshot, now: Date()))"
+        summaryLines[1].title = "工具执行：\(toolExecutionSummary(now: Date()))"
         let uptime = ProcessInfo.processInfo.systemUptime
         if let step = currentCallStep(activity) {
             let elapsed = durationText(step.elapsed(at: ProcessInfo.processInfo.systemUptime))
             let timing = step.uncertain ? "耗时未确认" : "等待返回 \(elapsed)"
-            summaryLines[2].title = "动作：\(middleTruncate(CommanderActivity.menuDetail(step.detail), limit: 80)) · \(clockText(step.startedAt)) · \(timing)"
+            summaryLines[2].title = "活动：\(middleTruncate(CommanderActivity.menuDetail(step.detail), limit: 80)) · \(step.historical ? "开始时间未知" : clockText(step.startedAt)) · \(timing)"
         } else if let step = recentlyReturnedCall(activity, uptime: uptime) {
-            summaryLines[2].title = "动作：\(middleTruncate(CommanderActivity.menuDetail(step.detail), limit: 80)) · 调用耗时 \(durationText(step.duration))"
+            summaryLines[2].title = "活动：\(middleTruncate(CommanderActivity.menuDetail(step.detail), limit: 80)) · 调用耗时 \(durationText(step.duration))"
         } else {
-            summaryLines[2].title = "动作：\(callState(activity))"
+            summaryLines[2].title = "活动：\(activity.catchingUp ? "日志追赶中；暂不能确认空闲" : (activity.error || activity.coverageGap ? "日志不完整；暂不能确认空闲" : callState(activity)))"
         }
+        summaryLines[3].title = "自动恢复：\(recoveryAvailability())"
+        summaryLines[4].title = chatMonitorSummary(snapshot.timeline).menuLine
         let activeStep = currentCallStep(activity)
         let callStatus = callState(activity)
         let barTimer = activeStep.map { barCallClock($0, uptime: uptime) } ?? ""
         let returnedStep = activeStep == nil ? recentlyReturnedCall(activity, uptime: uptime) : nil
         let barAction = activeStep.map(\.detail) ?? returnedStep.map(\.detail) ?? callStatus
         let barDuration = returnedStep.map { durationText($0.duration) }
-        let shortAction = middleTruncate(CommanderActivity.menuDetail(barAction), limit: 40)
-        item.button?.title = "DC \(connection)\(barTimer.isEmpty ? (barDuration.map { " \($0)" } ?? "") : " \(barTimer)") · \(shortAction)"
-        let origin = "最近一次本机观察；\(conversationLabelNote(snapshot.timeline.conversationLabelsVerifiedAt)) 无新事件不表示空闲或完成。"
+        let shortAction = middleTruncate(CommanderActivity.menuDetail(barAction), limit: 16)
+        item.button?.title = "\(connection) \(middleTruncate(channelSummary(snapshot, now: Date()), limit: 8))\(barTimer.isEmpty ? (barDuration.map { " \($0)" } ?? "") : " \(barTimer)") · \(shortAction)"
+        item.button?.setAccessibilityLabel("CommanderGuard，命令连接\(channelSummary(snapshot, now: Date()))")
+        item.button?.setAccessibilityValue("本机操作：\(barAction)；\(callStatus)")
+        item.button?.setAccessibilityHelp("点击打开运行概览；右键可查看菜单")
+        let origin = "消息通道与本机工具执行分别验证；任一层成功都不代表 ChatGPT 原回答完成。\(conversationLabelNote(snapshot.timeline.conversationLabelsVerifiedAt)) 无新事件不表示空闲或完成。"
         let age = activity.observed.map { DateFormatter.localizedString(from: $0, dateStyle: .none, timeStyle: .medium) } ?? "未知"
-        item.button?.toolTip = "\(connectionText)\n通道：\(snapshot.channelState) · \(snapshot.channelDetail)\n\(returnedStep == nil ? "" : "本机调用已返回 · ")\(barAction)\(barDuration.map { " · 调用耗时 \($0)" } ?? "") · \(callStatus) · \(age)\n\(origin)"
-        writeStatus()
-        if logWindow?.isVisible == true { renderLogWindow(latestAppEvent: latestAppEvent) }
+        item.button?.toolTip = "\(connectionText)\n消息通道：\(snapshot.channelState) · \(displayPingResult(snapshot.channelDetail))\n工具执行：\(toolExecutionSummary(now: Date())) · \(snapshot.toolExecutionDetail)\n\(returnedStep == nil ? "" : "本机调用已返回 · ")\(barAction)\(barDuration.map { " · 调用耗时 \($0)" } ?? "") · \(callStatus) · \(age)\n\(manualNotice.map { "手动检查：\(displayPingResult($0))\n" } ?? "")\(origin)"
+        if !previewMode { writeStatus() }
+        if panelWindow?.isVisible == true { renderPanel() }
+    }
+    private func recoveryAvailability() -> String {
+        guard recoveryLedger.autoRecoveryEnabled else { return "已关闭" }
+        if watchdog.recovering { return "恢复中" }
+        guard recoveryLedger.canAttempt(at: Date()) else { return "已开启 · 冷却中" }
+        guard snapshot.service == "运行中" else { return "已开启 · 等待 Commander 服务" }
+        if !activitySafeForRecovery(snapshot.activity) { return "已开启 · 暂缓：\(activityDeferralReason(snapshot.activity))" }
+        return "已开启 · 等待检查"
     }
     private func durationText(_ value: TimeInterval?) -> String {
         guard let value else { return "未确认" }
@@ -1738,13 +2740,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         do { try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true) }
         catch { fputs("CommanderGuard: unable to create status directory\n", stderr); return }
         let rows = activityStepRows(snapshot.activity.steps, uptime: ProcessInfo.processInfo.systemUptime)
-        let safeSteps: [[String: Any]] = snapshot.activity.steps.map { step in ["tool": step.tool, "detail": step.detail, "started_at": ISO8601DateFormatter.flex.string(from: step.startedAt), "elapsed_seconds": step.elapsed(at: ProcessInfo.processInfo.systemUptime) as Any? ?? NSNull(), "duration_seconds": step.duration as Any? ?? NSNull(), "uncertain": step.uncertain, "failed": step.failed] }
+        let safeSteps: [[String: Any]] = snapshot.activity.steps.map { step in ["tool": step.tool, "detail": step.detail, "started_at": step.historical ? NSNull() : ISO8601DateFormatter.flex.string(from: step.startedAt) as Any, "elapsed_seconds": step.elapsed(at: ProcessInfo.processInfo.systemUptime) as Any? ?? NSNull(), "duration_seconds": step.duration as Any? ?? NSNull(), "uncertain": step.uncertain, "failed": step.failed, "historical": step.historical, "finished": step.finished] }
         let latestStep = currentCallStep(snapshot.activity)
         let callElapsed = latestStep?.elapsed(at: ProcessInfo.processInfo.systemUptime)
         let currentState = callState(snapshot.activity)
-        let timelineRows: [[String: Any]] = snapshot.timeline.events.map { ["source": $0.source, "event": $0.event, "conversation_title": $0.conversationTitle as Any? ?? NSNull(), "source_timestamp": $0.sourceAt as Any? ?? NSNull(), "observed_at": $0.observedAt] }
-        let lastAppEvent: [String: Any] = snapshot.timeline.latestAppEvent.map { ["event": $0.event, "conversation_title": $0.conversationTitle as Any? ?? NSNull(), "source_timestamp": $0.sourceAt as Any? ?? NSNull(), "observed_at": $0.observedAt] } ?? [:]
-        let object: [String: Any] = ["service": snapshot.service, "cloud": snapshot.cloud, "last_seen": snapshot.lastSeen.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "checked_at": ISO8601DateFormatter.flex.string(from: snapshot.checked), "error_count": snapshot.errorCount, "paused": paused, "idle_prevention": assertion != 0, "message": snapshot.message, "channel": ["state": snapshot.channelState, "detail": snapshot.channelDetail, "consecutive_no_live": snapshot.channelFailures, "checked_at": snapshot.channelChecked.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "auto_recovery_enabled": recoveryLedger.autoRecoveryEnabled, "last_recovery_attempt": recoveryLedger.lastAttempt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull()], "menu": ["menubar_title": item.button?.title ?? "", "connection": summaryLines.first?.title ?? "", "channel": summaryLines[1].title, "action": summaryLines[2].title, "execution_step_rows": rows, "execution_steps": safeSteps, "tool_call_elapsed_seconds": callElapsed as Any? ?? NSNull(), "tool_call_state": currentState, "recent_actions": snapshot.activity.recent], "activity": ["state": snapshot.activity.state, "tool": snapshot.activity.tool, "active_count": snapshot.activity.activeCount, "observed_at": snapshot.activity.observed.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "recent": snapshot.activity.recent, "error": snapshot.activity.error, "coverage_gap": snapshot.activity.coverageGap], "timeline": ["coverage": snapshot.timeline.coverage, "commander_errors_this_run": snapshot.timeline.commanderErrors, "conversation_labels_verified_at": snapshot.timeline.conversationLabelsVerifiedAt as Any? ?? NSNull(), "last_chatgpt_app_event": lastAppEvent, "events": timelineRows]]
+        let timelineRows: [[String: Any]] = snapshot.timeline.events.map { ["source": $0.source, "event": $0.event, "conversation_title": $0.conversationTitle as Any? ?? NSNull(), "failure_kind": $0.failureKind as Any? ?? NSNull(), "source_timestamp": $0.sourceAt as Any? ?? NSNull(), "observed_at": $0.observedAt] }
+        let lastAppEvent: [String: Any] = snapshot.timeline.latestAppEvent.map { ["event": $0.event, "conversation_title": $0.conversationTitle as Any? ?? NSNull(), "failure_kind": $0.failureKind as Any? ?? NSNull(), "source_timestamp": $0.sourceAt as Any? ?? NSNull(), "observed_at": $0.observedAt] } ?? [:]
+        let chat = chatMonitorSummary(snapshot.timeline)
+        let diagnosis = currentDiagnosis()
+        var object: [String: Any] = ["chatgpt": ["answer": chat.answer, "update_connection": chat.connection, "coverage": snapshot.timeline.coverage, "delivery_timeout_directly_observable": false, "limitation": chat.deliveryLimit], "service": snapshot.service, "cloud": snapshot.cloud, "last_seen": snapshot.lastSeen.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "checked_at": ISO8601DateFormatter.flex.string(from: snapshot.checked), "error_count": snapshot.errorCount, "paused": paused, "idle_prevention": assertion != 0, "message": snapshot.message, "channel": ["state": snapshot.channelState, "detail": snapshot.channelDetail, "consecutive_no_live": snapshot.channelFailures, "checked_at": snapshot.channelChecked.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "auto_recovery_enabled": recoveryLedger.autoRecoveryEnabled, "last_recovery_attempt": recoveryLedger.lastAttempt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "last_ping_at": lastPingAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "last_ping_result": lastPingResult, "check_deferred_reason": deferredReason, "recovery_status": recoveryAvailability(), "last_recovery_result": lastRecoveryOutcome as Any? ?? NSNull()], "menu": ["menubar_title": item.button?.title ?? "", "menubar_has_icon": item.button?.image != nil, "connection": summaryLines[0].title, "channel": summaryLines[0].title, "tool_execution": summaryLines[1].title, "action": summaryLines[2].title, "recovery": summaryLines[3].title, "chatgpt": summaryLines[4].title, "execution_step_rows": rows, "execution_steps": safeSteps, "tool_call_elapsed_seconds": callElapsed as Any? ?? NSNull(), "tool_call_state": currentState, "recent_actions": snapshot.activity.recent], "activity": ["state": snapshot.activity.state, "tool": snapshot.activity.tool, "active_count": snapshot.activity.activeCount, "observed_at": snapshot.activity.observed.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "recent": snapshot.activity.recent, "error": snapshot.activity.error, "coverage_gap": snapshot.activity.coverageGap, "gap_reason": snapshot.activity.gapReason, "gap_first_at": snapshot.activity.gapFirstAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "gap_last_at": snapshot.activity.gapLastAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "backlog_bytes": snapshot.activity.backlogBytes, "catching_up": snapshot.activity.catchingUp, "pending_line": snapshot.activity.pendingLine, "idle_proven": snapshot.activity.idleProven], "timeline": ["coverage": snapshot.timeline.coverage, "commander_errors_this_run": snapshot.timeline.commanderErrors, "conversation_labels_verified_at": snapshot.timeline.conversationLabelsVerifiedAt as Any? ?? NSNull(), "last_chatgpt_app_event": lastAppEvent, "events": timelineRows]]
+        object["tool_execution"] = ["state": snapshot.toolExecutionState, "detail": snapshot.toolExecutionDetail, "checked_at": snapshot.toolExecutionChecked.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "fresh": toolExecutionFresh(snapshot, now: Date()), "evidence_ttl_seconds": Int(toolExecutionEvidenceTTL), "probe_deferred_reason": toolProbeDeferredReason]
+        object["diagnosis"] = ["title": diagnosis.title, "started_at": diagnosis.startedAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "last_seen_at": diagnosis.lastSeenAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "next_action": diagnosis.nextAction, "evidence": diagnosis.evidence, "network_guardian": diagnosis.network.safeSummary]
         guard let d = try? JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys]) else { return }
         do { try d.write(to: dir.appendingPathComponent("status.json"), options: .atomic) }
         catch { fputs("CommanderGuard: unable to write sanitized status file\n", stderr) }
@@ -1757,82 +2763,467 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if !next.autoRecoveryEnabled && watchdog.recovering && !recoveryLaunched { abortRecovery("自动恢复已关闭；未开始重启") }
         else { render() }
     }
-    @objc private func openLogWindow() {
-        if logWindow == nil {
-            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 760, height: 560), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
-            window.title = "CommanderGuard · 操作记录"
-            window.isReleasedWhenClosed = false
-            window.minSize = NSSize(width: 600, height: 400)
-            window.center()
-            let bounds = window.contentView!.bounds
-            let scroll = NSScrollView(frame: NSRect(x: 0, y: 40, width: bounds.width, height: bounds.height - 40)); scroll.hasVerticalScroller = true; scroll.autoresizingMask = [.width, .height]
-            let text = NSTextView(frame: scroll.contentView.bounds); text.isEditable = false; text.isSelectable = true; text.isRichText = false; text.font = .monospacedSystemFont(ofSize: 13, weight: .regular); text.textContainerInset = NSSize(width: 12, height: 12); text.isVerticallyResizable = true; text.isHorizontallyResizable = false; text.autoresizingMask = [.width]; text.textContainer?.widthTracksTextView = true; text.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
-            let details = NSButton(title: "故障详情…", target: self, action: #selector(toggleLogDetails)); details.frame = NSRect(x: 12, y: 8, width: 120, height: 24); details.autoresizingMask = [.maxYMargin]; details.bezelStyle = .rounded
-            scroll.documentView = text; window.contentView?.addSubview(scroll); window.contentView?.addSubview(details); logWindow = window; logTextView = text; logDetailsButton = details
+    @objc private func statusBarClicked() {
+        if NSApp.currentEvent?.type == .rightMouseUp, let menu = statusMenu, let button = item.button {
+            menu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.height), in: button)
+        } else { openPanel() }
+    }
+
+    @objc private func openPanel() {
+        if panelWindow == nil { buildPanel() }
+        renderPanel()
+        panelWindow?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+    @objc private func openLogWindow() { panelPage = 1; openPanel(); panelNav?.selectedSegment = 1; renderPanelPage() }
+    @objc private func openDiagnosticWindow() { panelPage = 2; openPanel(); panelNav?.selectedSegment = 2; renderPanelPage() }
+    @objc private func panelPageChanged(_ sender: NSSegmentedControl) { panelPage = sender.selectedSegment; renderPanelPage() }
+
+    private func label(_ value: String, size: CGFloat = 13, weight: NSFont.Weight = .regular, color: NSColor = .labelColor) -> NSTextField {
+        let field = NSTextField(labelWithString: value)
+        field.font = .systemFont(ofSize: size, weight: weight)
+        field.textColor = color
+        field.lineBreakMode = .byWordWrapping
+        field.maximumNumberOfLines = 0
+        field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        return field
+    }
+    private func vertical(_ spacing: CGFloat = 8) -> NSStackView {
+        let stack = NSStackView(); stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = spacing
+        return stack
+    }
+    private func card(_ content: NSView, padding: CGFloat = 18) -> NSVisualEffectView {
+        let card = NSVisualEffectView(); card.material = .contentBackground; card.state = .active
+        card.wantsLayer = true; card.layer?.cornerRadius = 16; card.layer?.masksToBounds = true
+        card.layer?.borderColor = NSColor.separatorColor.cgColor; card.layer?.borderWidth = 1
+        card.addSubview(content); content.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            content.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: padding),
+            content.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -padding),
+            content.topAnchor.constraint(equalTo: card.topAnchor, constant: padding),
+            content.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -padding)
+        ])
+        return card
+    }
+    private func heroCard(_ eyebrow: String, value: NSTextField, time: NSTextField, detail: NSTextField) -> NSView {
+        let stack = vertical(5)
+        stack.addArrangedSubview(label(eyebrow.uppercased(), size: 10, weight: .semibold, color: .secondaryLabelColor))
+        stack.addArrangedSubview(value); stack.addArrangedSubview(time)
+        value.font = .systemFont(ofSize: 16, weight: .semibold)
+        value.maximumNumberOfLines = 2
+        time.font = .monospacedDigitSystemFont(ofSize: 10.5, weight: .medium)
+        time.textColor = .secondaryLabelColor
+        detail.isHidden = true
+        return card(stack, padding: 12)
+    }
+    private func buildPanel() {
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 940, height: 720), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+        window.title = previewMode ? "CommanderGuard · 界面预览" : "CommanderGuard"
+        if previewMode && CommandLine.arguments.contains("--preview-dark") { window.appearance = NSAppearance(named: .darkAqua) }
+        window.isReleasedWhenClosed = false; window.minSize = NSSize(width: 760, height: 560); window.center()
+        let root = NSView(); root.wantsLayer = true; window.contentView = root
+        let layout = vertical(14); layout.edgeInsets = NSEdgeInsets(top: 22, left: 28, bottom: 20, right: 28)
+        root.addSubview(layout); layout.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([layout.leadingAnchor.constraint(equalTo: root.leadingAnchor), layout.trailingAnchor.constraint(equalTo: root.trailingAnchor), layout.topAnchor.constraint(equalTo: root.topAnchor), layout.bottomAnchor.constraint(equalTo: root.bottomAnchor)])
+
+        let title = vertical(4)
+        title.addArrangedSubview(label("COMMANDERGUARD", size: 11, weight: .bold, color: .secondaryLabelColor))
+        title.addArrangedSubview(label("运行概览", size: 27, weight: .bold))
+        title.addArrangedSubview(label(previewMode ? "设计预览 · 以下为固定示例数据" : "消息通道、工具执行、ChatGPT 回答与网络路径分层观察", size: 13, color: .secondaryLabelColor))
+        layout.addArrangedSubview(title)
+        panelHeading = title
+
+        let commandValue = label("等待观察"); let commandTime = label("检查：暂无"); let commandDetail = label("")
+        let toolValue = label("未验证"); let toolTime = label("检查：暂无"); let toolDetail = label("")
+        let chatValue = label("等待读取"); let chatTime = label("问题：暂无"); let chatDetail = label("")
+        let networkValue = label("未确认"); let networkTime = label("检查：暂无"); let networkDetail = label("")
+        panelConnection = commandValue; panelConnectionTime = commandTime; panelConnectionDetail = commandDetail
+        panelToolExecution = toolValue; panelToolExecutionTime = toolTime; panelToolExecutionDetail = toolDetail
+        panelChat = chatValue; panelChatTime = chatTime; panelChatDetail = chatDetail
+        panelNetwork = networkValue; panelNetworkTime = networkTime; panelNetworkDetail = networkDetail
+        let heroes = NSStackView(); heroes.orientation = .horizontal; heroes.spacing = 10; heroes.distribution = .fillEqually
+        let commandCard = heroCard("消息通道", value: commandValue, time: commandTime, detail: commandDetail)
+        let toolCard = heroCard("工具执行", value: toolValue, time: toolTime, detail: toolDetail)
+        let chatCard = heroCard("ChatGPT 回答", value: chatValue, time: chatTime, detail: chatDetail)
+        let networkCard = heroCard("网络路径", value: networkValue, time: networkTime, detail: networkDetail)
+        [commandCard, toolCard, chatCard, networkCard].forEach { heroes.addArrangedSubview($0) }
+        toolCard.heightAnchor.constraint(equalTo: commandCard.heightAnchor).isActive = true
+        chatCard.heightAnchor.constraint(equalTo: commandCard.heightAnchor).isActive = true
+        networkCard.heightAnchor.constraint(equalTo: commandCard.heightAnchor).isActive = true
+        panelHeroMinimum = heroes.heightAnchor.constraint(greaterThanOrEqualToConstant: 76)
+        panelHeroMinimum?.isActive = true
+        layout.addArrangedSubview(heroes)
+        heroes.widthAnchor.constraint(equalTo: layout.widthAnchor, constant: -56).isActive = true
+
+        let controls = NSStackView(); controls.orientation = .horizontal; controls.alignment = .centerY; controls.spacing = 22
+        let recovery = NSButton(checkboxWithTitle: "自动恢复命令连接", target: self, action: #selector(toggleAutoRecovery))
+        let wake = NSButton(checkboxWithTitle: "保持电脑唤醒", target: self, action: #selector(togglePause))
+        let check = NSButton(title: "检查链路", target: self, action: #selector(manualCheck)); check.bezelStyle = .rounded
+        [recovery, wake, check].forEach { $0.isEnabled = !previewMode }
+        panelRecoveryToggle = recovery; panelWakeToggle = wake
+        controls.addArrangedSubview(recovery); controls.addArrangedSubview(wake)
+        let spacer = NSView(); spacer.setContentHuggingPriority(.defaultLow, for: .horizontal); controls.addArrangedSubview(spacer)
+        controls.addArrangedSubview(check)
+        let controlContent = vertical(5)
+        controlContent.addArrangedSubview(controls)
+        controls.widthAnchor.constraint(equalTo: controlContent.widthAnchor).isActive = true
+        let recoveryStatus = label("自动恢复：等待检查", size: 11, color: .secondaryLabelColor)
+        panelRecoveryStatus = recoveryStatus
+        controlContent.addArrangedSubview(recoveryStatus)
+        let controlCard = card(controlContent, padding: 16)
+        layout.addArrangedSubview(controlCard)
+        controlCard.widthAnchor.constraint(equalTo: layout.widthAnchor, constant: -56).isActive = true
+
+        let nav = NSSegmentedControl(labels: ["概览", "操作记录", "连接诊断"], trackingMode: .selectOne, target: self, action: #selector(panelPageChanged(_:)))
+        nav.selectedSegment = panelPage; nav.segmentStyle = .rounded; nav.heightAnchor.constraint(equalToConstant: 32).isActive = true
+        panelNav = nav; layout.addArrangedSubview(nav)
+        let scroll = NSScrollView(); scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true; scroll.drawsBackground = false
+        scroll.setContentHuggingPriority(.defaultLow, for: .vertical); scroll.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
+        panelScroll = scroll; layout.addArrangedSubview(scroll)
+        scroll.widthAnchor.constraint(equalTo: layout.widthAnchor, constant: -56).isActive = true
+        panelWindow = window
+        renderPanelPage()
+    }
+    private func stamp(_ date: Date?) -> String { date.map { DateFormatter.localizedString(from: $0, dateStyle: .medium, timeStyle: .medium) } ?? "暂无" }
+    private func prominentStamp(_ date: Date?) -> String { date.map { let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd HH:mm:ss"; return f.string(from: $0) } ?? "暂无" }
+    private func eventStamp(_ event: TimelineEvent) -> String { stamp(ISO8601DateFormatter.parse(event.sourceAt ?? event.observedAt)) }
+    private func displayPingResult(_ value: String) -> String { value.replacingOccurrences(of: "ping 成功", with: "命令连接检查成功") }
+    private func currentDiagnosis(now: Date = Date()) -> IncidentDiagnosis {
+        let network: NetworkGuardianStatus
+        if previewMode {
+            network = NetworkGuardianStatus(updatedAt: nil, healthy: nil, proxyAvailable: nil, tunnelState: "unknown", manualPause: nil, newLogFailures: nil, recentFailureScore: nil)
+        } else {
+            let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/OpenAILinkGuardian/status.json")
+            network = NetworkGuardianStatus.read(url, now: now)
         }
-        renderLogWindow(latestAppEvent: snapshot.timeline.latestAppEvent.map { event in
-            let time = ISO8601DateFormatter.parse(event.observedAt).map { DateFormatter.localizedString(from: $0, dateStyle: .none, timeStyle: .medium) } ?? "时间未知"
-            return "\(appEventLabel(event)) · \(time)"
-        } ?? "未观察到新事件")
-        logWindow?.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
+        return IncidentDiagnosis.make(timeline: snapshot.timeline, activity: snapshot.activity, network: network,
+                                      service: snapshot.service, channelState: snapshot.channelState, now: now)
     }
-    @objc private func toggleLogDetails() {
-        showingLogDetails.toggle()
-        logDetailsButton?.title = showingLogDetails ? "收起故障详情" : "故障详情…"
-        if let text = logTextView { text.setSelectedRange(NSRange(location: text.selectedRange().location, length: 0)) }
-        let latest = snapshot.timeline.latestAppEvent.map { event in
-            let time = ISO8601DateFormatter.parse(event.observedAt).map { DateFormatter.localizedString(from: $0, dateStyle: .none, timeStyle: .medium) } ?? "时间未知"
-            return "\(appEventLabel(event)) · \(time)"
-        } ?? "未观察到新事件"
-        renderLogWindow(latestAppEvent: latest)
+    private func networkLayerStatus(_ network: NetworkGuardianStatus) -> String {
+        guard network.updatedAt != nil else { return "未确认" }
+        if network.healthy == false || network.proxyAvailable == false || network.tunnelState == "down" { return "异常" }
+        if network.healthy == true && network.proxyAvailable == true && network.tunnelState == "running" { return "网页探测正常" }
+        return "部分确认"
     }
-    private func renderLogWindow(latestAppEvent: String) {
-        guard let window = logWindow, let text = logTextView else { return }
-        let clip = text.enclosingScrollView?.contentView
-        let oldOrigin = clip?.bounds.origin ?? .zero
+    private func renderPanel() {
+        guard panelWindow != nil else { return }
+        let now = Date()
+        let diagnosis = currentDiagnosis(now: now)
+        panelConnection?.stringValue = channelSummary(snapshot, now: now)
+        let marker = channelIndicator(service: snapshot.service, state: snapshot.channelState, checked: snapshot.channelChecked, now: now)
+        panelConnection?.textColor = marker == "●" ? .systemGreen : (marker == "!" ? .systemRed : .labelColor)
+        panelConnectionTime?.stringValue = "检查：\(prominentStamp(lastPingAt))"
+        let channelDetail = displayPingResult(manualNotice ?? (manualPingBusy || channelBusy ? deferredReason : snapshot.channelDetail))
+        panelConnectionDetail?.stringValue = middleTruncate(channelDetail, limit: 56)
+
+        let toolState = toolExecutionSummary(now: now)
+        panelToolExecution?.stringValue = toolState
+        panelToolExecution?.textColor = snapshot.toolExecutionState == "失败" ? .systemRed : (toolExecutionFresh(snapshot, now: now) ? .systemGreen : .labelColor)
+        panelToolExecutionTime?.stringValue = "检查：\(prominentStamp(snapshot.toolExecutionChecked))"
+        panelToolExecutionDetail?.stringValue = middleTruncate(toolProbeBusy ? "正在执行只读工具检查" : snapshot.toolExecutionDetail, limit: 56)
+
+        let chat = chatMonitorSummary(snapshot.timeline)
+        if let issue = snapshot.timeline.latestAppIssue,
+           let issueAt = ISO8601DateFormatter.parse(issue.sourceAt ?? issue.observedAt) {
+            let recent = now.timeIntervalSince(issueAt) >= 0 && now.timeIntervalSince(issueAt) <= 900
+            panelChat?.stringValue = recent ? "回答异常（恢复未确认）" : "历史异常 · 原回答未确认"
+            panelChat?.textColor = recent ? .systemOrange : .secondaryLabelColor
+            panelChatTime?.stringValue = "回答问题：\(prominentStamp(issueAt))"
+        } else {
+            panelChat?.stringValue = chat.answer; panelChat?.textColor = .labelColor
+            panelChatTime?.stringValue = "回答问题：暂无"
+        }
+        panelChatDetail?.stringValue = middleTruncate("更新连接：\(chat.connection)", limit: 56)
+
+        let networkState = networkLayerStatus(diagnosis.network)
+        panelNetwork?.stringValue = networkState
+        panelNetwork?.textColor = networkState == "异常" ? .systemRed : (networkState == "网页探测正常" ? .systemGreen : .labelColor)
+        panelNetworkTime?.stringValue = "检查：\(prominentStamp(diagnosis.network.updatedAt))"
+        panelNetworkDetail?.stringValue = diagnosis.network.updatedAt == nil ? "守护状态缺失、无效或已过期" : middleTruncate(diagnosis.network.safeSummary, limit: 56)
+
+        panelRecoveryToggle?.state = recoveryLedger.autoRecoveryEnabled ? .on : .off
+        panelWakeToggle?.state = paused ? .off : .on
+        panelRecoveryStatus?.stringValue = "自动恢复：\(middleTruncate(recoveryAvailability(), limit: 85))"
+        renderPanelPage()
+    }
+    private func row(_ title: String, _ value: String, color: NSColor = .labelColor) -> NSView {
+        let h = NSStackView(); h.orientation = .horizontal; h.alignment = .top; h.spacing = 14
+        let key = label(title, size: 12, weight: .medium, color: .secondaryLabelColor)
+        key.widthAnchor.constraint(equalToConstant: 128).isActive = true
+        let content = label(value, size: 13, color: color)
+        if ["首次观察", "最近观察"].contains(title) { content.font = .monospacedDigitSystemFont(ofSize: 17, weight: .semibold) }
+        h.addArrangedSubview(key); h.addArrangedSubview(content)
+        return h
+    }
+    private func section(_ title: String, subtitle: String? = nil, rows: [(String, String)]) -> NSView {
+        let stack = vertical(11)
+        stack.addArrangedSubview(label(title, size: 16, weight: .semibold))
+        if let subtitle { stack.addArrangedSubview(label(subtitle, size: 12, color: .secondaryLabelColor)) }
+        for (key, value) in rows { let item = row(key, value); stack.addArrangedSubview(item); item.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true }
+        return card(stack)
+    }
+    private func setSections(_ sections: [NSView]) {
+        guard let scroll = panelScroll else { return }
+        let origin = scroll.contentView.bounds.origin
+        let doc = NSStackView(); doc.orientation = .vertical; doc.alignment = .leading; doc.spacing = 14
+        for section in sections { doc.addArrangedSubview(section); section.widthAnchor.constraint(equalTo: doc.widthAnchor).isActive = true }
+        scroll.documentView = doc
+        doc.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([doc.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor), doc.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor), doc.topAnchor.constraint(equalTo: scroll.contentView.topAnchor)])
+        doc.layoutSubtreeIfNeeded()
+        scroll.contentView.scroll(to: origin); scroll.reflectScrolledClipView(scroll.contentView)
+    }
+    private func renderPanelPage() {
+        guard panelWindow != nil else { return }
+        panelHeading?.isHidden = panelPage == 1
+        panelConnectionDetail?.isHidden = panelPage == 1
+        panelToolExecutionDetail?.isHidden = panelPage == 1
+        panelChatDetail?.isHidden = panelPage == 1
+        panelNetworkDetail?.isHidden = panelPage == 1
+        panelHeroMinimum?.constant = panelPage == 1 ? 64 : 76
+        if panelPage == 1 { renderLogPage(); return }
+        let chat = chatMonitorSummary(snapshot.timeline)
         let activity = snapshot.activity
-        let uptime = ProcessInfo.processInfo.systemUptime
-        let steps = activityStepRows(activity.steps, uptime: uptime)
-        let history = visibleTimelineEvents(snapshot.timeline.history).reversed().map { event -> String in
-            let time = ISO8601DateFormatter.parse(event.observedAt).map { DateFormatter.localizedString(from: $0, dateStyle: .none, timeStyle: .medium) } ?? "时间未知"
-            let source = event.source == "chatgpt_app" ? "App" : "Commander"
-            let label = event.source == "chatgpt_app" ? appEventLabel(event) : commanderEventLabel(event.event).replacingOccurrences(of: "Commander错误：", with: "")
-            return "\(time)  \(source)  \(label)"
+        let events = visibleTimelineEvents(snapshot.timeline.history).sorted { ($0.sourceAt ?? $0.observedAt) > ($1.sourceAt ?? $1.observedAt) }
+        if panelPage == 0 {
+            let diagnosis = currentDiagnosis()
+            let active = currentCallStep(activity)
+            let action = active.map { "\($0.detail) · \($0.historical ? "开始时间未知" : stamp($0.startedAt))" } ?? callState(activity)
+            let recent = groupedTimelineEvents(events).prefix(5).map { event, count in
+                (eventStamp(event), (event.source == "chatgpt_app" ? appEventLabel(event) : commanderEventLabel(event.event)) + (count > 1 ? " ×\(count)" : ""))
+            }
+            setSections([
+                section("当前需要处理", rows: [("判断", diagnosis.title), ("下一步", diagnosis.nextAction), ("首次观察", stamp(diagnosis.startedAt)), ("最近观察", stamp(diagnosis.lastSeenAt)), ("说明", diagnosis.evidence)]),
+                section("当前活动", subtitle: "仅表示本机已观察到的调用", rows: [("状态", action), ("日志", activity.error ? "暂时不可读" : activity.coverageGap ? "覆盖缺口 · \(activity.gapReason)" : activity.catchingUp ? "追赶中" : "读取正常")]),
+                section("链路分层", subtitle: "四层分别判断，任一层成功不替代其他层", rows: [
+                    ("消息通道", "\(channelSummary(snapshot, now: Date())) · \(stamp(lastPingAt))"),
+                    ("工具执行", "\(toolExecutionSummary(now: Date())) · \(stamp(snapshot.toolExecutionChecked))"),
+                    ("ChatGPT 回答", snapshot.timeline.latestAppIssue == nil ? chat.answer : "原回答恢复未确认"),
+                    ("网络路径", "\(networkLayerStatus(diagnosis.network)) · \(stamp(diagnosis.network.updatedAt))")
+                ]),
+                section("最近事件", subtitle: "新事件在前 · 更多细节见连接诊断", rows: recent.isEmpty ? [("记录", "暂无连接或异常事件")] : recent)
+            ])
+        } else {
+            let diagnosis = currentDiagnosis()
+            let remaining = recoveryLedger.lastAttempt.map { max(0, 300 - Int(Date().timeIntervalSince($0))) }
+            let recent = groupedTimelineEvents(events).prefix(20).map { event, count in
+                (eventStamp(event), "\(event.source == "chatgpt_app" ? "ChatGPT" : "Commander") · \(event.source == "chatgpt_app" ? appEventLabel(event) : commanderEventLabel(event.event))" + (count > 1 ? " ×\(count)" : ""))
+            }
+            setSections([
+                section("诊断与下一步", rows: [("判断", diagnosis.title), ("建议", diagnosis.nextAction), ("首次观察", stamp(diagnosis.startedAt)), ("最近观察", stamp(diagnosis.lastSeenAt)), ("证据范围", diagnosis.evidence)]),
+                section("网络守护", rows: [("选定状态", diagnosis.network.safeSummary)]),
+                section("Commander 链路", rows: [("服务", snapshot.service), ("云端登记", snapshot.cloud), ("消息通道", channelSummary(snapshot, now: Date())), ("通道说明", displayPingResult(snapshot.channelDetail)), ("通道检查", stamp(lastPingAt)), ("工具执行", toolExecutionSummary(now: Date())), ("工具检查", stamp(snapshot.toolExecutionChecked)), ("工具依据", snapshot.toolExecutionDetail), ("工具检查暂缓", toolProbeBusy ? "正在检查" : toolProbeDeferredReason), ("手动检查", displayPingResult(manualNotice ?? deferredReason))]),
+                section("自动恢复", rows: [("状态", recoveryAvailability()), ("冷却剩余", remaining.map { "\($0) 秒" } ?? "无"), ("最近尝试", stamp(recoveryLedger.lastAttempt)), ("最近结果", lastRecoveryOutcome ?? (recoveryLedger.lastAttempt == nil ? "暂无恢复尝试" : "本次运行未观察到结果"))]),
+                section("ChatGPT 回答与连接", rows: [("回答事件", chat.answer), ("更新连接", chat.connection), ("监控范围", "仅当前本机 App 的固定事件；其他设备或网页提示可能不可见"), ("覆盖限制", chat.deliveryLimit), ("处理建议", "回原对话确认回答状态，核对操作记录后再决定是否继续")]),
+                section("日志覆盖", rows: [("本机活动", callState(activity)), ("调用日志", activity.error ? "暂时不可读" : activity.coverageGap ? "覆盖缺口 · \(activity.gapReason)" : activity.catchingUp ? "追赶中 · 剩余 \(activity.backlogBytes) 字节" : "当前未发现覆盖缺口"), ("缺口首次", stamp(activity.gapFirstAt)), ("缺口最近", stamp(activity.gapLastAt)), ("时间线", snapshot.timeline.coverage)]),
+                section("连接与异常", subtitle: "最多 20 条 · 新事件在前", rows: recent.isEmpty ? [("记录", "暂无连接事件")] : recent)
+            ])
         }
-        var content = "最近本机工具调用（最多 100 条；时间为本机观察时间）\n● 进行中  ✓ 调用结束  ! 本机异常  ? 未确认\n\(steps.isEmpty ? "暂无操作记录" : steps.joined(separator: "\n"))"
-        if showingLogDetails {
-            content += "\n\n连接与异常（最近 \(history.count) 条，新事件在前）\n\(history.isEmpty ? "暂无连接或异常记录" : history.joined(separator: "\n"))\n\nCommander：\(snapshot.service) · 云端登记：\(snapshot.cloud) · 错误 \(snapshot.errorCount)\nApp 最近事件：\(latestAppEvent) · 覆盖：\(snapshot.timeline.coverage)\n\(conversationLabelNote(snapshot.timeline.conversationLabelsVerifiedAt)) · Commander 新观测错误：\(snapshot.timeline.commanderErrors) 条"
+    }
+    private func sourceColor(_ title: String) -> NSColor {
+        let colors: [NSColor] = [.systemBlue, .systemTeal, .systemPurple, .systemOrange, .systemPink]
+        return colors[Int(Array(SHA256.hash(data: Data(title.utf8)))[0]) % colors.count]
+    }
+    private func renderLogPage() {
+        guard let scroll = panelScroll else { return }
+        let doc: NSStackView
+        if let document = recordDocument {
+            doc = document
+        } else {
+            doc = vertical(12)
+            doc.translatesAutoresizingMaskIntoConstraints = false
+            let search = NSSearchField(); search.placeholderString = "搜索命令、工具或路径"; (search.cell as? NSSearchFieldCell)?.sendsSearchStringImmediately = true
+            search.target = self; search.action = #selector(recordSearchChanged(_:)); recordSearch = search
+            let filter = NSPopUpButton(); filter.addItems(withTitles: ["全部", "进行中", "异常与未确认"])
+            filter.target = self; filter.action = #selector(recordFilterChanged(_:)); recordFilter = filter
+            let controls = NSStackView(views: [search, filter]); controls.orientation = .horizontal; controls.spacing = 10
+            search.widthAnchor.constraint(greaterThanOrEqualToConstant: 260).isActive = true
+            filter.widthAnchor.constraint(equalToConstant: 180).isActive = true
+            doc.addArrangedSubview(label("本机操作记录 · 最多 100 条 · 归属未确认", size: 14, weight: .semibold))
+            doc.addArrangedSubview(label("搜索仅匹配已脱敏的命令、工具和路径；选择记录查看完整内容与时间。", size: 12, color: .secondaryLabelColor))
+            doc.addArrangedSubview(controls)
+            let detail = label("选择一条记录查看详情", size: 13)
+            detail.isSelectable = true
+            recordDetail = detail
+            let detailCard = card(detail, padding: 14); doc.addArrangedSubview(detailCard)
+            detailCard.widthAnchor.constraint(equalTo: doc.widthAnchor).isActive = true
+            let table = NSTableView(); table.headerView = nil; table.rowHeight = 44; table.delegate = self; table.dataSource = self
+            let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("record")); column.title = "本机操作"; column.width = 660
+            table.addTableColumn(column); table.usesAlternatingRowBackgroundColors = true
+            let tableScroll = NSScrollView(); tableScroll.hasVerticalScroller = true; tableScroll.documentView = table
+            tableScroll.heightAnchor.constraint(equalToConstant: 230).isActive = true
+            recordTable = table; recordTableScroll = tableScroll; doc.addArrangedSubview(tableScroll)
+            let eventTitle = label("ChatGPT App 事件 · 最近 25 条 · 原始事件时间", size: 15, weight: .semibold)
+            doc.addArrangedSubview(eventTitle)
+            let eventsText = NSTextView(); eventsText.isEditable = false; eventsText.isSelectable = true; eventsText.isRichText = true
+            eventsText.font = .monospacedSystemFont(ofSize: 12, weight: .regular); eventsText.textContainerInset = NSSize(width: 10, height: 8)
+            eventsText.isVerticallyResizable = true; eventsText.isHorizontallyResizable = false; eventsText.textContainer?.widthTracksTextView = true
+            eventsText.heightAnchor.constraint(greaterThanOrEqualToConstant: 90).isActive = true
+            doc.addArrangedSubview(eventsText); logTextView = eventsText
+            scroll.documentView = doc
+            recordDocument = doc
+            NSLayoutConstraint.activate([doc.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor), doc.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor), doc.topAnchor.constraint(equalTo: scroll.contentView.topAnchor)])
         }
-        window.title = "CommanderGuard · 操作记录"
-        guard text.string != content else { return }
-        let selection = text.selectedRange()
-        if selection.length > 0 { return }
-        let wasEmpty = text.string.isEmpty
-        text.string = content
-        let paragraph = NSMutableParagraphStyle(); paragraph.lineSpacing = 3
-        text.textStorage?.addAttribute(.paragraphStyle, value: paragraph, range: NSRange(location: 0, length: (content as NSString).length))
-        text.layoutManager?.ensureLayout(for: text.textContainer!)
-        let length = (content as NSString).length
-        let location = min(selection.location, length)
-        text.setSelectedRange(NSRange(location: location, length: 0))
-        if wasEmpty, let clip { clip.scroll(to: .zero); text.enclosingScrollView?.reflectScrolledClipView(clip) }
-        else if let clip { clip.scroll(to: oldOrigin); text.enclosingScrollView?.reflectScrolledClipView(clip) }
+        if scroll.documentView !== doc { scroll.documentView = doc }
+        let oldOrigin = scroll.contentView.bounds.origin
+        let oldTableOrigin = recordTableScroll?.contentView.bounds.origin ?? .zero
+        let query = recordSearch?.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        let mode = recordFilter?.indexOfSelectedItem ?? 0
+        recordSteps = snapshot.activity.steps.filter { step in
+            let text = "\(step.tool) \(step.detail)".lowercased()
+            let matchesQuery = query.isEmpty || text.contains(query)
+            let matchesMode = mode == 0 || (mode == 1 ? (!step.finished && !step.failed && !step.uncertain) : (step.failed || step.uncertain))
+            return matchesQuery && matchesMode
+        }
+        if !recordSteps.contains(where: { $0.id == selectedRecordID }) { selectedRecordID = recordSteps.first?.id }
+        recordTable?.reloadData()
+        if let selectedRecordID, let index = recordSteps.firstIndex(where: { $0.id == selectedRecordID }) {
+            recordTable?.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
+        }
+        updateRecordDetail()
+        let output = NSMutableAttributedString()
+        func append(_ value: String, color: NSColor = .labelColor, weight: NSFont.Weight = .regular) {
+            output.append(NSAttributedString(string: value, attributes: [.font: NSFont.monospacedSystemFont(ofSize: 12, weight: weight), .foregroundColor: color]))
+        }
+        for event in snapshot.timeline.history.filter({ $0.source == "chatgpt_app" }).sorted(by: { ($0.sourceAt ?? $0.observedAt) < ($1.sourceAt ?? $1.observedAt) }).suffix(25) {
+            append("\(eventStamp(event))  ", color: .secondaryLabelColor)
+            if let title = event.conversationTitle { append("[\(title)]  ", color: sourceColor(title), weight: .semibold) }
+            else { append("[来源未识别]  ", color: .tertiaryLabelColor) }
+            let value = appEventLabel(event), prefix = event.conversationTitle.map { "\($0) · " } ?? ""
+            append("\(!prefix.isEmpty && value.hasPrefix(prefix) ? String(value.dropFirst(prefix.count)) : value)\n")
+        }
+        if output.length == 0 { append("暂无 ChatGPT App 事件\n", color: .secondaryLabelColor) }
+        if let text = logTextView {
+            let selection = text.selectedRange(), selected = selection.length > 0 && NSMaxRange(selection) <= (text.string as NSString).length ? (text.string as NSString).substring(with: selection) : ""
+            text.textStorage?.setAttributedString(output)
+            if !selected.isEmpty { let range = (output.string as NSString).range(of: selected); if range.location != NSNotFound { text.setSelectedRange(range) } }
+        }
+        doc.layoutSubtreeIfNeeded()
+        if let table = recordTable, let tableScroll = recordTableScroll {
+            table.setFrameSize(NSSize(width: max(660, tableScroll.contentView.bounds.width), height: max(tableScroll.contentView.bounds.height, CGFloat(recordSteps.count) * table.rowHeight)))
+            table.sizeLastColumnToFit()
+        }
+        scroll.contentView.scroll(to: oldOrigin); scroll.reflectScrolledClipView(scroll.contentView)
+        if let tableScroll = recordTableScroll { tableScroll.contentView.scroll(to: oldTableOrigin); tableScroll.reflectScrolledClipView(tableScroll.contentView) }
+    }
+    @objc private func recordSearchChanged(_ sender: NSSearchField) { renderLogPage() }
+    @objc private func recordFilterChanged(_ sender: NSPopUpButton) { renderLogPage() }
+    func numberOfRows(in tableView: NSTableView) -> Int { recordSteps.count }
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        let step = recordSteps[row]
+        let time = step.historical ? "时间未知" : prominentStamp(step.startedAt)
+        let status = step.uncertain ? "未确认" : step.failed ? "异常" : step.finished ? "已返回" : "进行中"
+        let field = NSTextField(wrappingLabelWithString: "\(time) · \(status) · \(step.detail)")
+        field.lineBreakMode = .byTruncatingTail; field.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        field.textColor = step.uncertain ? .systemOrange : step.failed ? .systemRed : .labelColor
+        return field
+    }
+    func tableViewSelectionDidChange(_ notification: Notification) {
+        guard let table = recordTable, table.selectedRow >= 0, recordSteps.indices.contains(table.selectedRow) else { return }
+        selectedRecordID = recordSteps[table.selectedRow].id; updateRecordDetail()
+    }
+    private func updateRecordDetail() {
+        guard let step = recordSteps.first(where: { $0.id == selectedRecordID }) else { recordDetail?.stringValue = "当前筛选下没有匹配记录"; return }
+        let time = step.historical ? "时间未知" : prominentStamp(step.startedAt)
+        let state = step.uncertain ? "未确认" : step.failed ? "异常" : step.finished ? "已返回" : "进行中"
+        let duration = step.historical ? "耗时未知" : step.uncertain ? "耗时未确认" : step.duration.map(durationText) ?? barCallClock(step, uptime: ProcessInfo.processInfo.systemUptime)
+        let value = "\(time)  ·  \(state)  ·  \(duration)\n\(step.detail)"
+        if recordDetail?.currentEditor() == nil, recordDetail?.stringValue != value { recordDetail?.stringValue = value }
+    }
+    private func loadPreviewSnapshot() {
+        let now = Date(), uptime = ProcessInfo.processInfo.systemUptime
+        snapshot.service = "运行中"; snapshot.cloud = "已连接"
+        snapshot.channelState = "通道畅通"; snapshot.channelDetail = "最近一次检查通过 · 示例"
+        snapshot.channelChecked = now.addingTimeInterval(-38)
+        snapshot.toolExecutionState = "已验证"; snapshot.toolExecutionDetail = "复用最近真实工具调用成功记录 · 示例"; snapshot.toolExecutionChecked = now.addingTimeInterval(-26)
+        lastPingAt = snapshot.channelChecked; lastPingResult = "ping 成功 · 示例"
+        deferredReason = "未延后"
+        snapshot.activity.state = "有本机调用进行中"
+        snapshot.activity.active = ["执行命令": 1]
+        snapshot.activity.steps = [
+            ActivityStep(id: "preview-1", tool: "读取文件", detail: "读取文件 · /Projects/example/README.md", startedAt: now.addingTimeInterval(-95), startedUptime: uptime - 95, duration: 2, finished: true),
+            ActivityStep(id: "preview-2", tool: "执行命令", detail: "执行命令 · swift test --filter ConnectionTests", startedAt: now.addingTimeInterval(-34), startedUptime: uptime - 34, duration: nil),
+            ActivityStep(id: "preview-3", tool: "搜索", detail: "搜索 · rg -n 'connection' Sources", startedAt: now.addingTimeInterval(-240), startedUptime: uptime - 240, duration: 1, finished: true),
+            ActivityStep(id: "preview-4", tool: "读取文件", detail: "读取文件 · /Projects/example/error.log", startedAt: now.addingTimeInterval(-18), startedUptime: uptime - 18, duration: 0.4, failed: true, finished: true)
+        ]
+        let makeTime: (TimeInterval) -> String = { ISO8601DateFormatter.flex.string(from: now.addingTimeInterval($0)) }
+        let issue = TimelineEvent(source: "chatgpt_app", event: "chatgpt_completion_transport_recovery_started", sourceAt: makeTime(-65), observedAt: makeTime(-64), conversationTitle: "设计讨论", failureKind: "resume_unavailable")
+        let app = TimelineEvent(source: "chatgpt_app", event: "chatgpt_conversation_refetch_completed · error", sourceAt: makeTime(-58), observedAt: makeTime(-57), conversationTitle: "功能排查")
+        let closed = TimelineEvent(source: "chatgpt_app", event: "chatgpt_pubsub_transport_closed", sourceAt: makeTime(-70), observedAt: makeTime(-69))
+        snapshot.timeline = TimelineSummary(coverage: "读取正常 · 示例", events: [closed, issue, app], history: [closed, issue, app], commanderErrors: 0, latestAppEvent: app, latestAppIssue: app, conversationLabelsVerifiedAt: makeTime(-3600))
+        render()
+    }
+    private func verifyPanelLayout() {
+        func verify(_ condition: @autoclosure () -> Bool, _ message: String) {
+            guard condition() else { fputs("CommanderGuard UI check failed: \(message)\n", stderr); exit(2) }
+        }
+        guard let window = panelWindow, let root = window.contentView, let scroll = panelScroll else { fputs("CommanderGuard UI check failed: panel was not created\n", stderr); exit(2) }
+        for size in [NSSize(width: 940, height: 720), NSSize(width: 760, height: 560)] {
+            window.setContentSize(size)
+            for page in 0...2 {
+                panelPage = page; renderPanel()
+                root.layoutSubtreeIfNeeded()
+                verify(window.isVisible && scroll.frame.width > 650 && scroll.frame.height > 80, "panel content is clipped at \(Int(size.width))x\(Int(size.height)), page \(page)")
+                verify(scroll.documentView != nil, "panel page \(page) is empty")
+            }
+        }
+        panelPage = 1; renderPanel()
+        guard let text = logTextView else { fputs("CommanderGuard UI check failed: records are missing\n", stderr); exit(2) }
+        verify((10...12).contains(panelConnectionTime?.font?.pointSize ?? 0) && (10...12).contains(panelToolExecutionTime?.font?.pointSize ?? 0) && (10...12).contains(panelChatTime?.font?.pointSize ?? 0) && (10...12).contains(panelNetworkTime?.font?.pointSize ?? 0), "layer timestamps are not secondary to state")
+        precondition(recordSteps.count == 4, "Record page must expose all source rows")
+        recordFilter?.selectItem(at: 1); renderLogPage()
+        precondition(recordSteps.count == 1 && recordSteps[0].id == "preview-2", "Ongoing filter must match only ongoing work")
+        recordFilter?.selectItem(at: 2); renderLogPage()
+        precondition(recordSteps.count == 1 && recordSteps[0].id == "preview-4", "Issue filter must include failed and unconfirmed work")
+        recordSearch?.stringValue = "error.log"; renderLogPage()
+        precondition(recordSteps.count == 1 && recordSteps[0].detail.contains("error.log"), "Search must match sanitized paths")
+        recordSearch?.stringValue = ""; recordFilter?.selectItem(at: 0); renderLogPage()
+        guard let table = recordTable, let selected = recordSteps.firstIndex(where: { $0.id == "preview-2" }) else { preconditionFailure("Filtered record rows are missing") }
+        table.selectRowIndexes(IndexSet(integer: selected), byExtendingSelection: false)
+        precondition(recordDetail?.stringValue.contains("swift test --filter ConnectionTests") == true, "Selecting a row must reveal the complete safe command")
+        let selectedID = selectedRecordID
+        renderPanel()
+        precondition(selectedRecordID == selectedID && recordDetail?.stringValue.contains("swift test --filter ConnectionTests") == true, "Selected record detail must survive refresh")
+        text.setSelectedRange(NSRange(location: 0, length: 4))
+        renderPanel()
+        precondition(logTextView === text && text.selectedRange().length == 4, "Record selection must survive refresh")
+        text.setSelectedRange(NSRange(location: 0, length: 0)); renderPanel()
+        precondition(logTextView === text, "Record view must be reused")
+        precondition(item.button?.image?.isTemplate == true && item.button?.title.contains("通道可回应") == true && item.button?.title.contains("DC ") == false, "Menu bar must show an icon and scoped live status")
+        precondition(panelHeading?.isHidden == true && panelConnectionTime?.isHidden == false && panelRecoveryToggle?.isHidden == false, "Records must retain compact status and controls")
+        print("CommanderGuard UI check passed")
     }
     private func commanderEventLabel(_ event: String) -> String {
         guard let separator = event.range(of: ": ") else { return event }
         let kind = String(event[..<separator.lowerBound]), tool = String(event[separator.upperBound...])
-        let label = ["调用receipt": "收到调用", "调用completion": "本机返回", "调用error": "本机调用异常"][kind] ?? kind
+        let label = ["调用receipt": "收到调用", "调用completion": "本机调用已返回", "调用error": "本机调用异常"][kind] ?? kind
         return "\(label)：\(tool)"
     }
 }
 
 if CommandLine.arguments.contains("--self-test") { selfTest() }
+else if CommandLine.arguments.contains("--preview-ui") {
+    let app = NSApplication.shared
+    app.setActivationPolicy(.regular)
+    let delegate = AppDelegate(previewMode: true); app.delegate = delegate
+    withExtendedLifetime(delegate) { app.run() }
+}
 else if CommandLine.arguments.contains("--probe-channel") {
     MCPChannelProbe().run { result in
         let state: String
         let code: Int32
         switch result { case .healthy: state = "通道畅通"; code = 0; case .noLiveConnection: state = "设备无实时连接"; code = 2; case .unknown: state = "通道状态未知"; code = 1 }
         if let data = try? JSONSerialization.data(withJSONObject: ["channel": state, "checked_at": ISO8601DateFormatter.flex.string(from: Date())], options: [.sortedKeys]), let text = String(data: data, encoding: .utf8) { print(text) }
+        exit(code)
+    }
+    dispatchMain()
+}
+else if CommandLine.arguments.contains("--probe-tool") {
+    MCPToolExecutionProbe().run { result in
+        let state: String
+        let code: Int32
+        switch result { case .verified: state = "工具执行已验证"; code = 0; case .failed: state = "工具执行失败"; code = 2; case .unknown: state = "工具执行状态未知"; code = 1 }
+        if let data = try? JSONSerialization.data(withJSONObject: ["tool_execution": state, "checked_at": ISO8601DateFormatter.flex.string(from: Date())], options: [.sortedKeys]), let text = String(data: data, encoding: .utf8) { print(text) }
         exit(code)
     }
     dispatchMain()
@@ -1846,9 +3237,13 @@ else if CommandLine.arguments.contains("--check") {
     dispatchMain()
 } else {
     let lockFD = open("/tmp/com.wuwendi.commander-guard-\(getuid()).lock", O_CREAT | O_RDWR | O_NOFOLLOW, S_IRUSR | S_IWUSR)
-    if lockFD < 0 || flock(lockFD, LOCK_EX | LOCK_NB) != 0 { fputs("CommanderGuard is already running\n", stderr); exit(0) }
+    if lockFD < 0 { fputs("CommanderGuard could not acquire its instance lock\n", stderr); exit(1) }
+    if flock(lockFD, LOCK_EX | LOCK_NB) != 0 {
+        DistributedNotificationCenter.default().postNotificationName(NSNotification.Name("com.wuwendi.commander-guard.open-panel"), object: nil, userInfo: nil, deliverImmediately: true)
+        exit(0)
+    }
     let app = NSApplication.shared
     app.setActivationPolicy(.accessory)
     let delegate = AppDelegate(); app.delegate = delegate
-    app.run()
+    withExtendedLifetime(delegate) { app.run() }
 }

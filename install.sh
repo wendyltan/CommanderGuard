@@ -18,7 +18,8 @@ if [[ -e "$PLIST" ]] && ! /usr/libexec/PlistBuddy -c 'Print Label' "$PLIST" 2>/d
 "$SOURCE/build.sh" >/dev/null
 mkdir -p "$ROOT" "$HOME/Applications" "$HOME/Desktop" "$HOME/Library/LaunchAgents" "$HOME/Library/Logs/CommanderGuard"
 if [[ ! "$SOURCE" -ef "$ROOT" ]]; then
-  for file in CommanderGuard.swift build.sh install.sh uninstall.sh README.md .gitignore; do ditto "$SOURCE/$file" "$ROOT/$file"; done
+  for file in CommanderGuard.swift build.sh install.sh uninstall.sh README.md TODO.md CHAT-LIVENESS-REVIEW.md .gitignore; do ditto "$SOURCE/$file" "$ROOT/$file"; done
+  ditto "$SOURCE/Assets" "$ROOT/Assets"
 fi
 if [[ -f "$PLIST" ]]; then launchctl bootout "gui/$(id -u)" "$PLIST" >/dev/null 2>&1 || true; fi
 ditto "$SOURCE/build/CommanderGuard.app" "$APP"

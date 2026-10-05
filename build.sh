@@ -3,6 +3,8 @@ set -euo pipefail
 cd "$(dirname "$0")"
 OUT="$PWD/build"
 mkdir -p "$OUT/CommanderGuard.app/Contents/MacOS"
+mkdir -p "$OUT/CommanderGuard.app/Contents/Resources"
+ditto Assets/AppIcon.icns "$OUT/CommanderGuard.app/Contents/Resources/AppIcon.icns"
 xcrun swiftc -O -module-cache-path "/private/tmp/CommanderGuard-SwiftModuleCache" CommanderGuard.swift -framework Cocoa -framework IOKit -o "$OUT/CommanderGuard.app/Contents/MacOS/CommanderGuard"
 cat > "$OUT/CommanderGuard.app/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -11,6 +13,7 @@ cat > "$OUT/CommanderGuard.app/Contents/Info.plist" <<'PLIST'
 <key>CFBundleIdentifier</key><string>com.wuwendi.commander-guard</string>
 <key>CFBundleName</key><string>Commander 守护</string>
 <key>CFBundleExecutable</key><string>CommanderGuard</string>
+<key>CFBundleIconFile</key><string>AppIcon</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>LSUIElement</key><true/>
 <key>NSHighResolutionCapable</key><true/>
