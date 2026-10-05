@@ -56,7 +56,19 @@
 
 验收：缺文件、截断、轮换、损坏行和重复记录不崩溃；没有可靠编号时不赋予 ChatGPT 会话颜色或名称；结构化历史不能单独证明空闲并放开恢复保护。
 
-### 6. P2 — 故障记录与少量有用通知
+### 6. P1 — ChatGPT 会话 ↔ Commander 调用归属
+
+- [x] 核对 OpenAI 当前工具调用会话字段，并验证 Remote Desktop Commander 0.2.51 实际透传的 metadata 字段全集。
+- [x] 分别排除 `call_id`、`origin_instance`、调用时间窗、当前前台 ChatGPT 会话作为可靠归属键。
+- [x] CommanderGuard 兼容 `openai/session` 与 `origin_context_id`；只保存 SHA-256 匿名指纹，不保存原始会话值。
+- [x] 大参数调用使用有界日志尾部读取 metadata；不扩大命令正文保留范围。
+- [ ] 用真实 ChatGPT → Remote Desktop Commander 调用确认稳定会话字段已由托管入口透传，并验证同会话连续调用同键、不同会话不同键。
+
+当前阻碍：Remote Desktop Commander 公共 issue #12 正在请求稳定 conversation-scoped metadata；当前托管入口尚未把 ChatGPT 已提供的 `openai/session` 传到配对设备。上游未修复前真实调用必须继续显示“归属未确认”，不得退回时间或前台窗口猜测。详见 `CHAT-COMMANDER-ATTRIBUTION-REVIEW.md`。
+
+验收：合成短调用和超长参数调用均可稳定归组；冲突字段降级为“归属冲突”；原始 session 不进入 UI、status 或时间线；上游字段缺失时不误标会话。最终真实验收依赖上游透传。
+
+### 7. P2 — 故障记录与少量有用通知
 
 - [ ] 同一次连接故障展示一条记录，包含开始、最近变化、连接恢复时间及回答恢复是否已确认。
 - [ ] 通知开关默认关闭；开启后只在有意义的异常升级或有证据的连接恢复时通知，避免每条连接日志弹一次。
@@ -64,7 +76,7 @@
 
 依赖：第 1、3 项。验收：并发连接关闭、短暂重连和 Guard 重启不造成重复通知；“连接恢复”不会被写成“回答恢复”。
 
-### 7. P2 — 持续连接稳定性评估
+### 8. P2 — 持续连接稳定性评估
 
 - [ ] 统计明确的断连时段、重连耗时、恢复流不可用次数及网络守护状态，标出数据覆盖范围。
 - [ ] 将实际 App 事件与网页探测区分，不用普通 HTTP 成功率代表回答流稳定性。
@@ -72,7 +84,7 @@
 
 验收：同刻多条日志不放大故障次数；缺口、启动补读和不同连接的记录不伪造趋势。暂不新增无意义的持续 ping 或匿名 WebSocket 探测。
 
-### 8. P3 — 验证官方 Chat 端事件联动
+### 9. P3 — 验证官方 Chat 端事件联动
 
 - [ ] 核对当前 ChatGPT 场景、MCP 版本、服务器和权限是否支持官方 MCP Events。
 - [ ] 先做可行性记录，再决定是否值得搭建认证事件服务与 webhook。
@@ -97,3 +109,6 @@
 - 额外复核代理因使用额度限制未完成，由主代理直接复核本批差异；登录、ping、进程保护和自动恢复代码与本批前工作区版本一致。未提交 commit 或 push。
 - 2026-10-05：第 5 项“结构化工具历史”完成。核对当前 Desktop Commander 0.2.51 的 `tool-history.jsonl` 契约及实现：JSONL 记录含时间、工具名、参数、返回结果和毫秒耗时；约每秒批量刷盘，内存上限 1000 条，单条保存输出上限 4 KiB，文件超过 5 MiB 裁剪到约 4 MiB，启动时超过 2000 条改写为最近 1000 条。Guard 只保留工具名、时间、耗时和结果类别，参数与结果正文不进入状态；无可靠 call id 时保持独立证据源，不按时间与 stdout 或 ChatGPT 会话合并，也不单独证明空闲。
 - 第 5 项验收：离线自检覆盖缺文件、部分写入、损坏行、重复记录、文件轮换、截断和工具错误结果；`start_process` 明确提示“调用已返回；后台进程仍可能运行”，所有结构化历史仍保留“云端是否收到结果未知”的边界。
+- 2026-10-05：第 6 项本机兼容层完成。CommanderGuard 只接受上游明确提供的 `openai/session` 或 `origin_context_id`，立即 SHA-256 后保存匿名指纹；`origin_instance`、时间窗和当前前台会话均不参与归属。短调用、同会话稳定归组、双字段一致、双字段冲突、同 call 后续冲突、无效／超长 session 及 20 KiB 参数后置 metadata 均有离线覆盖；冲突降级为“归属冲突”，字段缺失保持“归属未确认”。
+- 第 6 项验收：Release 构建、`git diff --check`、连续三次离线自检、真实 `--probe-channel`／`--probe-tool`、浅色／深色及 940×720／760×560 UI 检查通过。UI 预览使用独立 Bundle ID 与 `ApplePersistenceIgnoreState`，避免 macOS 因此前测试崩溃记录弹出的恢复状态确认框干扰自动检查。最终真实 ChatGPT→Commander 会话分组仍等待上游透传稳定会话字段，不以启发式结果代替。
+- 第 6 项安装验收：仅重新安装并启动 CommanderGuard；Remote Desktop Commander 安装前后进程号保持不变，未重启 Commander、TunnelSentinel、代理或登录链路。

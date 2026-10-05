@@ -59,6 +59,9 @@ struct ActivityStep {
     var failed = false
     var historical = false
     var finished = false
+    var sessionKey: String?
+    var sessionSource: String?
+    var sessionAttributionConflict = false
     func elapsed(at uptime: TimeInterval) -> TimeInterval? { uncertain || historical ? nil : duration ?? max(0, uptime - startedUptime) }
 }
 
@@ -92,7 +95,8 @@ func activityStepRows(_ steps: [ActivityStep], uptime: TimeInterval) -> [String]
     return steps.map { step in
         let symbol = step.historical && step.finished ? (step.failed ? "!" : "✓") : (step.uncertain ? "?" : (step.failed ? "!" : (step.finished || step.duration != nil ? "✓" : "●")))
         let duration = step.historical ? (step.finished ? "已返回 · 耗时未知" : "开始时间未知 · 状态未确认") : (step.uncertain ? "未确认" : (step.duration == nil ? "进行中 \(barCallClock(step, uptime: uptime))" : barCallClock(step, uptime: uptime)))
-        return "\(step.historical ? "时间未知" : clock.string(from: step.startedAt))  \(symbol)  \(step.detail)  · \(duration)"
+        let owner = step.sessionAttributionConflict ? "归属冲突" : (CommanderActivity.sessionDisplay(step.sessionKey) ?? "归属未确认")
+        return "\(step.historical ? "时间未知" : clock.string(from: step.startedAt))  \(symbol)  [\(owner)]  \(step.detail)  · \(duration)"
     }
 }
 
@@ -777,6 +781,13 @@ func channelSummary(_ snapshot: Snapshot, now: Date) -> String {
 }
 
 enum CommanderActivity {
+    struct SessionAttribution {
+        let key: String
+        let source: String
+        let conflict: Bool
+        init(key: String, source: String, conflict: Bool = false) { self.key = key; self.source = source; self.conflict = conflict }
+    }
+
     static let tools = ["read_file": "读取文件", "read_multiple_files": "读取文件", "read_process_output": "读取进程输出", "list_sessions": "查看终端会话", "list_processes": "查看进程", "list_directory": "查看目录", "search_files": "搜索文件", "start_search": "开始搜索", "get_more_search_results": "读取搜索结果", "stop_search": "停止搜索", "list_searches": "查看搜索任务", "get_file_info": "查看文件信息", "start_process": "启动进程", "interact_with_process": "操作进程", "kill_process": "结束进程", "force_terminate": "结束进程", "write_file": "写入文件", "edit_block": "编辑文件", "create_directory": "创建目录", "move_file": "移动文件", "get_config": "读取配置"]
     static let uuidPattern = try! NSRegularExpression(pattern: #"^🔧 Received tool call ([0-9a-fA-F-]{36}): ([A-Za-z0-9_-]+) "#)
     static let completionPattern = try! NSRegularExpression(pattern: #"^[✅❌] Tool call ([A-Za-z0-9_-]+) (completed|failed):"#)
@@ -800,6 +811,35 @@ enum CommanderActivity {
             return ("", tool, String(line[resultRange]), tools[tool] ?? "本机工具调用")
         }
         return nil
+    }
+
+    static func sessionAttribution(_ bytes: Data) -> SessionAttribution? {
+        guard bytes.count <= 8 * 1024,
+              let text = String(data: bytes, encoding: .utf8),
+              let marker = text.range(of: " metadata: ", options: .backwards) else { return nil }
+        let jsonText = String(text[marker.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard jsonText.utf8.count <= 4 * 1024,
+              let data = jsonText.data(using: .utf8),
+              let metadata = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
+        var candidates: [SessionAttribution] = []
+        for source in ["openai/session", "origin_context_id"] {
+            guard let raw = metadata[source] as? String else { continue }
+            let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !value.isEmpty, value.utf8.count <= 512,
+                  !value.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) else { continue }
+            let digest = SHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined()
+            candidates.append(SessionAttribution(key: digest, source: source))
+        }
+        guard let first = candidates.first else { return nil }
+        if candidates.dropFirst().contains(where: { $0.key != first.key }) {
+            return SessionAttribution(key: "", source: "conflict", conflict: true)
+        }
+        return first
+    }
+
+    static func sessionDisplay(_ key: String?) -> String? {
+        guard let key, key.count == 64, key.allSatisfy({ $0.isHexDigit }) else { return nil }
+        return "会话 " + key.prefix(10).uppercased()
     }
 
     private static func detail(tool: String, args: String) -> String {
@@ -1167,6 +1207,8 @@ final class ActivityLogReader {
     private var freshEmptyLog = false
     private var partial = Data()
     private var discarding = false
+    private var discardedTail = Data()
+    private var discardedCallID: String?
     private var prefixEvent = ""
     private var errorOffset: UInt64 = 0
     private var errorFileID: UInt64?
@@ -1189,6 +1231,7 @@ final class ActivityLogReader {
     private var lastOutcome = "调用状态未确认"
     private(set) var summary = ActivitySummary()
     private let lineLimit = 4 * 1024
+    private let metadataTailLimit = 8 * 1024
     private let ioLimit = 64 * 1024
 
     init(url: URL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/RemoteDesktopCommander/stdout.log"), errorURL: URL? = nil) { self.url = url; self.errorURL = errorURL }
@@ -1217,7 +1260,7 @@ final class ActivityLogReader {
         } else if id != fileID || size < offset {
             markGap(id != fileID ? "调用日志已轮换" : "调用日志已截断", now: now)
             offset = size; fileID = id; replaying = false; provenEpoch = false
-            partial.removeAll(); discarding = false; prefixEvent = ""
+            partial.removeAll(); discarding = false; discardedTail.removeAll(); discardedCallID = nil; prefixEvent = ""
             invalidateSteps(); active.removeAll(); seen.removeAll(); recent.removeAll(); recentIDs.removeAll()
             lastObserved = nil; lastTool = ""; observedLive = false; uncertain = true; lastOutcome = "调用状态未确认"
             summary.active = [:]; summary.steps = steps; summary.state = "调用状态未确认"
@@ -1305,7 +1348,7 @@ final class ActivityLogReader {
         guard oldPID > 0, newPID > 0, oldPID != newPID, oldProcessExited else { return false }
         offset = 0; fileID = nil; initialized = false; searchEnd = nil; searchSize = 0
         replaying = false; provenEpoch = false; freshEmptyLog = false
-        partial.removeAll(); discarding = false; prefixEvent = ""
+        partial.removeAll(); discarding = false; discardedTail.removeAll(); discardedCallID = nil; prefixEvent = ""
         active.removeAll(); seen.removeAll(); steps.removeAll(); recent.removeAll(); recentIDs.removeAll()
         observedLive = false; uncertain = true; lastOutcome = "调用状态未确认"; lastObserved = nil; lastTool = ""
         errorOffset = 0; errorFileID = nil; errorPartial.removeAll(); errorDiscarding = false
@@ -1374,17 +1417,27 @@ final class ActivityLogReader {
     private func consume(_ data: Data, live: Bool, now: Date, uptime: TimeInterval) {
         for byte in data {
             if byte == 10 {
-                if !discarding { emit(partial, live: live, complete: true, now: now, uptime: uptime) }
-                partial.removeAll(keepingCapacity: true); discarding = false; prefixEvent = ""
+                if !discarding {
+                    emit(partial, live: live, complete: true, now: now, uptime: uptime)
+                } else if let callID = discardedCallID, let attribution = CommanderActivity.sessionAttribution(discardedTail) {
+                    attachSession(callID: callID, attribution: attribution)
+                }
+                partial.removeAll(keepingCapacity: true); discarding = false; discardedTail.removeAll(keepingCapacity: true); discardedCallID = nil; prefixEvent = ""
             } else if !discarding {
                 if partial.count < lineLimit { partial.append(byte) }
                 else {
+                    let parsed = CommanderActivity.parse(partial, partial: true)
                     if live,
                        (partial.starts(with: Data("🔧 Received tool call ".utf8)) || partial.starts(with: Data("✅ Tool call ".utf8)) || partial.starts(with: Data("❌ Tool call ".utf8))),
-                       CommanderActivity.parse(partial, partial: true) == nil { markGap("调用事件前缀超过读取上限", now: now) }
+                       parsed == nil { markGap("调用事件前缀超过读取上限", now: now) }
+                    discardedCallID = parsed?.2 == "received" ? parsed?.0 : nil
+                    discardedTail = Data(partial.suffix(metadataTailLimit))
                     discarding = true
                     emit(partial, live: live, complete: false, now: now, uptime: uptime)
                 }
+            } else if discardedCallID != nil {
+                discardedTail.append(byte)
+                if discardedTail.count > metadataTailLimit { discardedTail.removeFirst(discardedTail.count - metadataTailLimit) }
             }
         }
         if live && !discarding && !partial.isEmpty { emit(partial, live: true, complete: false, now: now, uptime: uptime) }
@@ -1423,9 +1476,28 @@ final class ActivityLogReader {
         }
         if live && !provenEpoch { freshEmptyLog = false }
         let key = "\(event.0)|\(event.1)|\(event.2)|\(event.3)"
-        guard key != prefixEvent else { return }
+        let attribution = event.2 == "received" ? CommanderActivity.sessionAttribution(bytes) : nil
+        if key == prefixEvent {
+            if let attribution { attachSession(callID: event.0, attribution: attribution) }
+            return
+        }
         prefixEvent = key
         handle(event, live: live, now: now, uptime: uptime)
+        if let attribution { attachSession(callID: event.0, attribution: attribution) }
+    }
+
+    private func attachSession(callID: String, attribution: CommanderActivity.SessionAttribution) {
+        guard let index = steps.firstIndex(where: { $0.id == callID }) else { return }
+        if steps[index].sessionAttributionConflict { return }
+        if attribution.conflict {
+            steps[index].sessionKey = nil; steps[index].sessionSource = nil; steps[index].sessionAttributionConflict = true; summary.steps = steps; return
+        }
+        if let existing = steps[index].sessionKey, existing != attribution.key {
+            steps[index].sessionKey = nil; steps[index].sessionSource = nil; steps[index].sessionAttributionConflict = true
+        } else {
+            steps[index].sessionKey = attribution.key; steps[index].sessionSource = attribution.source
+        }
+        summary.steps = steps
     }
 
     private func handle(_ event: (String, String, String, String), live: Bool, now: Date, uptime: TimeInterval) {
@@ -1877,6 +1949,60 @@ extension ISO8601DateFormatter {
     static let plain = ISO8601DateFormatter()
 }
 
+private func selfTestSessionAttributionParser() {
+    let safeID = "123e4567-e89b-12d3-a456-426614174000"
+    let rawSession = "private-openai-session-A"
+    let sessionLine = Data("🔧 Received tool call \(safeID): read_file {} metadata: {\"openai/session\":\"\(rawSession)\",\"origin_instance\":\"unstable\"}".utf8)
+    let sessionAttribution = CommanderActivity.sessionAttribution(sessionLine)
+    precondition(sessionAttribution?.source == "openai/session" && sessionAttribution?.key.count == 64 && sessionAttribution?.key.contains(rawSession) == false)
+    precondition(CommanderActivity.sessionDisplay(sessionAttribution?.key)?.hasPrefix("会话 ") == true)
+    let sameSession = CommanderActivity.sessionAttribution(Data(" metadata: {\"openai/session\":\"\(rawSession)\"}".utf8))
+    precondition(sameSession?.key == sessionAttribution?.key)
+    let contextAttribution = CommanderActivity.sessionAttribution(Data(" metadata: {\"origin_context_id\":\"opaque-context-B\"}".utf8))
+    precondition(contextAttribution?.source == "origin_context_id" && contextAttribution?.key != sessionAttribution?.key)
+    let sameDualAttribution = CommanderActivity.sessionAttribution(Data(" metadata: {\"openai/session\":\"\(rawSession)\",\"origin_context_id\":\"\(rawSession)\"}".utf8))
+    precondition(sameDualAttribution?.key == sessionAttribution?.key && sameDualAttribution?.source == "openai/session" && sameDualAttribution?.conflict == false)
+    let conflictingDualAttribution = CommanderActivity.sessionAttribution(Data(" metadata: {\"openai/session\":\"\(rawSession)\",\"origin_context_id\":\"different-context\"}".utf8))
+    precondition(conflictingDualAttribution?.conflict == true && conflictingDualAttribution?.key.isEmpty == true)
+    precondition(CommanderActivity.sessionAttribution(Data(" metadata: {\"origin_instance\":\"not-a-session\"}".utf8)) == nil)
+    precondition(CommanderActivity.sessionAttribution(Data(" metadata: {\"openai/session\":\"bad\\nvalue\"}".utf8)) == nil)
+    let tooLongSession = String(repeating: "s", count: 513)
+    precondition(CommanderActivity.sessionAttribution(Data(" metadata: {\"openai/session\":\"\(tooLongSession)\"}".utf8)) == nil)
+}
+
+private func selfTestSessionAttributionReader(dir: URL, now: Date) {
+    let rawSession = "private-openai-session-A"
+    let expected = CommanderActivity.sessionAttribution(Data(" metadata: {\"openai/session\":\"\(rawSession)\"}".utf8))!
+    let attributionLog = dir.appendingPathComponent("session-attribution.log")
+    FileManager.default.createFile(atPath: attributionLog.path, contents: Data("🚀 Starting MCP Device...\n".utf8))
+    let attributionReader = ActivityLogReader(url: attributionLog); attributionReader.poll(); attributionReader.poll()
+    func appendAttribution(_ value: String) { let handle = try! FileHandle(forWritingTo: attributionLog); try! handle.seekToEnd(); try! handle.write(contentsOf: Data(value.utf8)); try! handle.close() }
+    let attributedID = "f23e4567-e89b-12d3-a456-426614174000"
+    appendAttribution("🔧 Received tool call \(attributedID): read_file {} metadata: {\"openai/session\":\"\(rawSession)\",\"origin_instance\":\"unstable-1\"}\n")
+    attributionReader.poll(now: now, uptime: 50)
+    precondition(attributionReader.summary.steps.first?.sessionKey == expected.key && attributionReader.summary.steps.first?.sessionSource == "openai/session" && !attributionReader.summary.steps.first!.sessionAttributionConflict)
+    appendAttribution("🔧 Received tool call \(attributedID): read_file {} metadata: {\"origin_context_id\":\"conflicting-context\"}\n")
+    attributionReader.poll(now: now.addingTimeInterval(1), uptime: 51)
+    precondition(attributionReader.summary.steps.first?.sessionKey == nil && attributionReader.summary.steps.first?.sessionAttributionConflict == true)
+    appendAttribution("✅ Tool call read_file completed: done\n")
+    attributionReader.poll(now: now.addingTimeInterval(2), uptime: 52)
+    precondition(attributionReader.summary.activeCount == 0 && !attributionReader.summary.coverageGap)
+
+    let oversizedLog = dir.appendingPathComponent("session-attribution-oversized.log")
+    FileManager.default.createFile(atPath: oversizedLog.path, contents: Data("🚀 Starting MCP Device...\n".utf8))
+    let oversizedReader = ActivityLogReader(url: oversizedLog); oversizedReader.poll(); oversizedReader.poll()
+    let oversizedID = "f33e4567-e89b-12d3-a456-426614174000"
+    let oversizedRawSession = "oversized-openai-session"
+    let oversizedExpected = CommanderActivity.sessionAttribution(Data(" metadata: {\"openai/session\":\"\(oversizedRawSession)\"}".utf8))!
+    let oversizedLine = "🔧 Received tool call \(oversizedID): read_file {\"padding\":\"" + String(repeating: "x", count: 20_000) + "\"} metadata: {\"openai/session\":\"\(oversizedRawSession)\"}\n"
+    let oversizedHandle = try! FileHandle(forWritingTo: oversizedLog); try! oversizedHandle.seekToEnd(); try! oversizedHandle.write(contentsOf: Data(oversizedLine.utf8)); try! oversizedHandle.close()
+    oversizedReader.poll(now: now, uptime: 60)
+    precondition(oversizedReader.summary.steps.first?.id == oversizedID && oversizedReader.summary.steps.first?.sessionKey == oversizedExpected.key && oversizedReader.summary.steps.first?.sessionSource == "openai/session" && !oversizedReader.summary.coverageGap)
+    let oversizedCompletion = try! FileHandle(forWritingTo: oversizedLog); try! oversizedCompletion.seekToEnd(); try! oversizedCompletion.write(contentsOf: Data("✅ Tool call read_file completed: done\n".utf8)); try! oversizedCompletion.close()
+    oversizedReader.poll(now: now.addingTimeInterval(1), uptime: 61)
+    precondition(oversizedReader.summary.activeCount == 0 && !oversizedReader.summary.coverageGap && activitySafeForRecovery(oversizedReader.summary))
+}
+
 func selfTest() {
     let now = Date(timeIntervalSince1970: 2_000_000_000)
     let fresh = now.addingTimeInterval(-300)
@@ -1975,12 +2101,12 @@ func selfTest() {
     precondition(evidenceActivity.steps[0].tool == "read_file", "Tool evidence fixture changed")
     var probeOnly = completed; probeOnly = ActivityStep(id: probeOnly.id, tool: "list_sessions", detail: probeOnly.detail, startedAt: probeOnly.startedAt, startedUptime: probeOnly.startedUptime, duration: probeOnly.duration, uncertain: probeOnly.uncertain, failed: probeOnly.failed, historical: probeOnly.historical, finished: probeOnly.finished)
     precondition(recentSuccessfulToolExecution(ActivitySummary(steps: [probeOnly]), now: now.addingTimeInterval(2)) == nil)
-    precondition(activityStepRows([pending], uptime: 13)[0].contains("●  读取文件  · 进行中 3 秒"))
-    precondition(activityStepRows([completed], uptime: 99)[0].contains("✓  读取文件  · 2 秒"))
+    precondition(activityStepRows([pending], uptime: 13)[0].contains("●  [归属未确认]  读取文件  · 进行中 3 秒"))
+    precondition(activityStepRows([completed], uptime: 99)[0].contains("✓  [归属未确认]  读取文件  · 2 秒"))
     var failedStep = completed; failedStep.failed = true
-    precondition(activityStepRows([failedStep], uptime: 99)[0].contains("!  读取文件  · 2 秒"))
+    precondition(activityStepRows([failedStep], uptime: 99)[0].contains("!  [归属未确认]  读取文件  · 2 秒"))
     var uncertainStep = failedStep; uncertainStep.uncertain = true
-    precondition(activityStepRows([uncertainStep], uptime: 99)[0].contains("?  读取文件  · 未确认"))
+    precondition(activityStepRows([uncertainStep], uptime: 99)[0].contains("?  [归属未确认]  读取文件  · 未确认"))
     let uiTimeline = [TimelineEvent(source: "commander", event: "调用receipt: 读取文件", sourceAt: nil, observedAt: ""), TimelineEvent(source: "commander", event: "调用completion: 读取文件", sourceAt: nil, observedAt: ""), TimelineEvent(source: "commander", event: "调用error: 未匹配步骤", sourceAt: nil, observedAt: ""), TimelineEvent(source: "commander", event: "Commander错误: 通道错误", sourceAt: nil, observedAt: ""), TimelineEvent(source: "chatgpt_app", event: "chatgpt_pubsub_transport_opened", sourceAt: nil, observedAt: "")]
     precondition(visibleTimelineEvents(uiTimeline).map(\.event) == ["调用error: 未匹配步骤", "Commander错误: 通道错误", "chatgpt_pubsub_transport_opened"])
     let nextCall = ActivityStep(id: "call-2", tool: "read_file", detail: "读取文件", startedAt: now, startedUptime: 20, duration: nil)
@@ -2098,6 +2224,7 @@ func selfTest() {
     precondition(CommanderActivity.parse(Data("🔧 Received tool call \(safeID): read_file {\"content\":\"fake path /tmp/DO_NOT_SHOW.md\"}".utf8))?.3 == "读取文件")
     precondition(CommanderActivity.parse(Data("prefix 🔧 Received tool call \(safeID): read_file {".utf8)) == nil)
     precondition(CommanderActivity.parse(Data("🔧 Received tool call \(safeID): read_file_extra {".utf8))?.3 == "本机工具调用")
+    selfTestSessionAttributionParser()
     let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
     try! FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: dir) }
@@ -2210,6 +2337,9 @@ func selfTest() {
     precondition(utf8Reader.summary.active["read_file"] == 1 && !utf8Reader.summary.coverageGap)
     try! utf8Handle.write(contentsOf: Data("✅ Tool call read_file completed: done\n".utf8)); try! utf8Handle.close()
     utf8Reader.poll(); precondition(utf8Reader.summary.activeCount == 0 && !utf8Reader.summary.coverageGap && activitySafeForRecovery(utf8Reader.summary))
+
+    selfTestSessionAttributionReader(dir: dir, now: now)
+
     let emptyLog = dir.appendingPathComponent("empty-start.log")
     FileManager.default.createFile(atPath: emptyLog.path, contents: Data())
     let emptyReader = ActivityLogReader(url: emptyLog); emptyReader.poll()
@@ -2938,7 +3068,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         do { try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true) }
         catch { fputs("CommanderGuard: unable to create status directory\n", stderr); return }
         let rows = activityStepRows(snapshot.activity.steps, uptime: ProcessInfo.processInfo.systemUptime)
-        let safeSteps: [[String: Any]] = snapshot.activity.steps.map { step in ["tool": step.tool, "detail": step.detail, "started_at": step.historical ? NSNull() : ISO8601DateFormatter.flex.string(from: step.startedAt) as Any, "elapsed_seconds": step.elapsed(at: ProcessInfo.processInfo.systemUptime) as Any? ?? NSNull(), "duration_seconds": step.duration as Any? ?? NSNull(), "uncertain": step.uncertain, "failed": step.failed, "historical": step.historical, "finished": step.finished] }
+        let safeSteps: [[String: Any]] = snapshot.activity.steps.map { step in ["tool": step.tool, "detail": step.detail, "started_at": step.historical ? NSNull() : ISO8601DateFormatter.flex.string(from: step.startedAt) as Any, "elapsed_seconds": step.elapsed(at: ProcessInfo.processInfo.systemUptime) as Any? ?? NSNull(), "duration_seconds": step.duration as Any? ?? NSNull(), "uncertain": step.uncertain, "failed": step.failed, "historical": step.historical, "finished": step.finished, "session": CommanderActivity.sessionDisplay(step.sessionKey) as Any? ?? NSNull(), "session_source": step.sessionSource as Any? ?? NSNull(), "session_attribution_conflict": step.sessionAttributionConflict] }
         let latestStep = currentCallStep(snapshot.activity)
         let callElapsed = latestStep?.elapsed(at: ProcessInfo.processInfo.systemUptime)
         let currentState = callState(snapshot.activity)
@@ -3226,15 +3356,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         } else {
             doc = vertical(12)
             doc.translatesAutoresizingMaskIntoConstraints = false
-            let search = NSSearchField(); search.placeholderString = "搜索命令、工具或路径"; (search.cell as? NSSearchFieldCell)?.sendsSearchStringImmediately = true
+            let search = NSSearchField(); search.placeholderString = "搜索命令、工具、路径或会话"; (search.cell as? NSSearchFieldCell)?.sendsSearchStringImmediately = true
             search.target = self; search.action = #selector(recordSearchChanged(_:)); recordSearch = search
             let filter = NSPopUpButton(); filter.addItems(withTitles: ["全部", "进行中", "异常与未确认"])
             filter.target = self; filter.action = #selector(recordFilterChanged(_:)); recordFilter = filter
             let controls = NSStackView(views: [search, filter]); controls.orientation = .horizontal; controls.spacing = 10
             search.widthAnchor.constraint(greaterThanOrEqualToConstant: 260).isActive = true
             filter.widthAnchor.constraint(equalToConstant: 180).isActive = true
-            doc.addArrangedSubview(label("本机操作记录 · 最多 100 条 · 归属未确认", size: 14, weight: .semibold))
-            doc.addArrangedSubview(label("搜索仅匹配已脱敏的命令、工具和路径；选择记录查看完整内容与时间。", size: 12, color: .secondaryLabelColor))
+            doc.addArrangedSubview(label("本机操作记录 · 最多 100 条", size: 14, weight: .semibold))
+            doc.addArrangedSubview(label("会话关联只使用上游明确提供的匿名会话字段；字段缺失时保持“归属未确认”，不按时间或前台窗口猜测。", size: 12, color: .secondaryLabelColor))
             doc.addArrangedSubview(controls)
             let detail = label("选择一条记录查看详情", size: 13)
             detail.isSelectable = true
@@ -3264,7 +3394,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let query = recordSearch?.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
         let mode = recordFilter?.indexOfSelectedItem ?? 0
         recordSteps = snapshot.activity.steps.filter { step in
-            let text = "\(step.tool) \(step.detail)".lowercased()
+            let owner = step.sessionAttributionConflict ? "归属冲突" : (CommanderActivity.sessionDisplay(step.sessionKey) ?? "归属未确认")
+            let text = "\(step.tool) \(step.detail) \(owner) \(step.sessionSource ?? "")".lowercased()
             let matchesQuery = query.isEmpty || text.contains(query)
             let matchesMode = mode == 0 || (mode == 1 ? (!step.finished && !step.failed && !step.uncertain) : (step.failed || step.uncertain))
             return matchesQuery && matchesMode
@@ -3307,7 +3438,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let step = recordSteps[row]
         let time = step.historical ? "时间未知" : prominentStamp(step.startedAt)
         let status = step.uncertain ? "未确认" : step.failed ? "异常" : step.finished ? "已返回" : "进行中"
-        let field = NSTextField(wrappingLabelWithString: "\(time) · \(status) · \(step.detail)")
+        let owner = step.sessionAttributionConflict ? "归属冲突" : (CommanderActivity.sessionDisplay(step.sessionKey) ?? "归属未确认")
+        let field = NSTextField(wrappingLabelWithString: "\(time) · [\(owner)] · \(status) · \(step.detail)")
         field.lineBreakMode = .byTruncatingTail; field.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
         field.textColor = step.uncertain ? .systemOrange : step.failed ? .systemRed : .labelColor
         return field
@@ -3321,7 +3453,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let time = step.historical ? "时间未知" : prominentStamp(step.startedAt)
         let state = step.uncertain ? "未确认" : step.failed ? "异常" : step.finished ? "已返回" : "进行中"
         let duration = step.historical ? "耗时未知" : step.uncertain ? "耗时未确认" : step.duration.map(durationText) ?? barCallClock(step, uptime: ProcessInfo.processInfo.systemUptime)
-        let value = "\(time)  ·  \(state)  ·  \(duration)\n\(step.detail)"
+        let owner: String
+        if step.sessionAttributionConflict { owner = "归属冲突 · 未采用" }
+        else if let display = CommanderActivity.sessionDisplay(step.sessionKey) { owner = "\(display)（\(step.sessionSource ?? "上游会话字段")）" }
+        else { owner = "归属未确认 · 上游未提供稳定会话字段" }
+        let value = "\(time)  ·  \(state)  ·  \(duration)\n归属：\(owner)\n\(step.detail)"
         if recordDetail?.currentEditor() == nil, recordDetail?.stringValue != value { recordDetail?.stringValue = value }
     }
     private func loadPreviewSnapshot() {
@@ -3334,9 +3470,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         deferredReason = "未延后"
         snapshot.activity.state = "有本机调用进行中"
         snapshot.activity.active = ["执行命令": 1]
+        let previewSession = CommanderActivity.sessionAttribution(Data(" metadata: {\"openai/session\":\"preview-session-alpha\"}".utf8))!.key
         snapshot.activity.steps = [
-            ActivityStep(id: "preview-1", tool: "读取文件", detail: "读取文件 · /Projects/example/README.md", startedAt: now.addingTimeInterval(-95), startedUptime: uptime - 95, duration: 2, finished: true),
-            ActivityStep(id: "preview-2", tool: "执行命令", detail: "执行命令 · swift test --filter ConnectionTests", startedAt: now.addingTimeInterval(-34), startedUptime: uptime - 34, duration: nil),
+            ActivityStep(id: "preview-1", tool: "读取文件", detail: "读取文件 · /Projects/example/README.md", startedAt: now.addingTimeInterval(-95), startedUptime: uptime - 95, duration: 2, finished: true, sessionKey: previewSession, sessionSource: "openai/session"),
+            ActivityStep(id: "preview-2", tool: "执行命令", detail: "执行命令 · swift test --filter ConnectionTests", startedAt: now.addingTimeInterval(-34), startedUptime: uptime - 34, duration: nil, sessionKey: previewSession, sessionSource: "openai/session"),
             ActivityStep(id: "preview-3", tool: "搜索", detail: "搜索 · rg -n 'connection' Sources", startedAt: now.addingTimeInterval(-240), startedUptime: uptime - 240, duration: 1, finished: true),
             ActivityStep(id: "preview-4", tool: "读取文件", detail: "读取文件 · /Projects/example/error.log", startedAt: now.addingTimeInterval(-18), startedUptime: uptime - 18, duration: 0.4, failed: true, finished: true)
         ]
@@ -3371,10 +3508,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         precondition(recordSteps.count == 1 && recordSteps[0].id == "preview-4", "Issue filter must include failed and unconfirmed work")
         recordSearch?.stringValue = "error.log"; renderLogPage()
         precondition(recordSteps.count == 1 && recordSteps[0].detail.contains("error.log"), "Search must match sanitized paths")
-        recordSearch?.stringValue = ""; recordFilter?.selectItem(at: 0); renderLogPage()
+        recordSearch?.stringValue = "会话"; recordFilter?.selectItem(at: 0); renderLogPage()
+        precondition(recordSteps.count == 2 && recordSteps.allSatisfy { $0.sessionKey != nil }, "Session search must match attributed rows only")
+        recordSearch?.stringValue = ""; renderLogPage()
         guard let table = recordTable, let selected = recordSteps.firstIndex(where: { $0.id == "preview-2" }) else { preconditionFailure("Filtered record rows are missing") }
         table.selectRowIndexes(IndexSet(integer: selected), byExtendingSelection: false)
-        precondition(recordDetail?.stringValue.contains("swift test --filter ConnectionTests") == true, "Selecting a row must reveal the complete safe command")
+        precondition(recordDetail?.stringValue.contains("swift test --filter ConnectionTests") == true && recordDetail?.stringValue.contains("归属：会话 ") == true, "Selecting a row must reveal safe command and anonymized session attribution")
         let selectedID = selectedRecordID
         renderPanel()
         precondition(selectedRecordID == selectedID && recordDetail?.stringValue.contains("swift test --filter ConnectionTests") == true, "Selected record detail must survive refresh")
