@@ -145,68 +145,14 @@ struct TimelineSummary {
     var conversationLabelsVerifiedAt: String?
 }
 
-struct NetworkGuardianStatus {
-    let updatedAt: Date?
-    let healthy: Bool?
-    let proxyAvailable: Bool?
-    let tunnelState: String
-    let manualPause: Bool?
-    let newLogFailures: Double?
-    let recentFailureScore: Double?
-
-    static func read(_ url: URL, now: Date) -> NetworkGuardianStatus {
-        func unknown() -> NetworkGuardianStatus { NetworkGuardianStatus(updatedAt: nil, healthy: nil, proxyAvailable: nil, tunnelState: "unknown", manualPause: nil, newLogFailures: nil, recentFailureScore: nil) }
-        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
-              attributes[.type] as? FileAttributeType == .typeRegular,
-              let size = attributes[.size] as? NSNumber, size.intValue <= 64 * 1024,
-              let data = try? Data(contentsOf: url), data.count <= 64 * 1024,
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let rawDate = object["updated_at"] as? String,
-              rawDate.range(of: #"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})$"#, options: .regularExpression) != nil,
-              let updatedAt = ISO8601DateFormatter.parse(rawDate), now.timeIntervalSince(updatedAt) >= 0,
-              now.timeIntervalSince(updatedAt) <= 120,
-              let healthyNumber = object["healthy"] as? NSNumber, CFGetTypeID(healthyNumber) == CFBooleanGetTypeID(),
-              let proxyNumber = object["proxy_available"] as? NSNumber, CFGetTypeID(proxyNumber) == CFBooleanGetTypeID(),
-              let healthy = object["healthy"] as? Bool, let proxyAvailable = object["proxy_available"] as? Bool,
-              let tunnel = object["tunnel_state"] as? String,
-              ["running", "down", "unknown"].contains(tunnel) else { return unknown() }
-        let manualNumber = object["manual_pause"] as? NSNumber
-        let manualPause = manualNumber.flatMap { CFGetTypeID($0) == CFBooleanGetTypeID() ? object["manual_pause"] as? Bool : nil }
-        func bounded(_ key: String) -> Double? {
-            guard let value = object[key] as? NSNumber else { return nil }
-            guard CFGetTypeID(value) != CFBooleanGetTypeID() else { return nil }
-            let number = value.doubleValue
-            return number.isFinite && (0...1_000_000).contains(number) ? number : nil
-        }
-        guard object["manual_pause"] == nil || manualPause != nil,
-              ["new_log_failures", "recent_failure_score"].allSatisfy({ object[$0] == nil || bounded($0) != nil }) else { return unknown() }
-        return NetworkGuardianStatus(updatedAt: updatedAt, healthy: healthy, proxyAvailable: proxyAvailable,
-                                     tunnelState: tunnel, manualPause: manualPause,
-                                     newLogFailures: bounded("new_log_failures"), recentFailureScore: bounded("recent_failure_score"))
-    }
-
-    var safeSummary: String {
-        guard let updatedAt else { return "网络守护状态未知（文件缺失、格式无效或超过 120 秒）" }
-        let health = healthy.map { $0 ? "网页探测正常（不验证持久连接）" : "网页探测失败" } ?? "网页探测未知"
-        let proxy = proxyAvailable.map { $0 ? "可用" : "不可用" } ?? "未知"
-        let pause = manualPause == true ? " · 手动暂停" : ""
-        let failures = newLogFailures.map { " · 新日志失败 \(String(format: "%.4g", $0))" } ?? ""
-        let score = recentFailureScore.map { " · 近期失败分数 \(String(format: "%.4g", $0))" } ?? ""
-        let clock = DateFormatter(); clock.dateFormat = "HH:mm:ss"
-        let tunnel = ["running": "运行中", "down": "未运行", "unknown": "未知"][tunnelState] ?? "未知"
-        return "\(health) · 代理\(proxy) · 隧道\(tunnel)\(pause)\(failures)\(score) · 更新 \(clock.string(from: updatedAt))"
-    }
-}
-
 struct IncidentDiagnosis {
     let title: String
     let startedAt: Date?
     let lastSeenAt: Date?
     let nextAction: String
     let evidence: String
-    let network: NetworkGuardianStatus
 
-    static func make(timeline: TimelineSummary, activity: ActivitySummary, network: NetworkGuardianStatus, service: String = "未知", channelState: String = "未知", now: Date) -> IncidentDiagnosis {
+    static func make(timeline: TimelineSummary, activity: ActivitySummary, service: String = "未知", channelState: String = "未知", now: Date) -> IncidentDiagnosis {
         let retained = timeline.history + (timeline.latestAppIssue.map { [$0] } ?? [])
         var seen = Set<String>()
         let events = retained.filter { event in
@@ -232,7 +178,6 @@ struct IncidentDiagnosis {
         let commanderConnectivity = recent.filter { $0.0.source == "commander" && ["Commander错误: 通道错误", "Commander错误: 通道订阅超时", "Commander错误: 通道关闭"].contains($0.0.event) }
         let commanderIssue = recent.filter { $0.0.source == "commander" && ($0.0.event.hasPrefix("Commander错误:") || $0.0.event.hasPrefix("调用error:")) }.max { $0.1 < $1.1 }
         let appAt = appDisruption?.1
-        let guardianBad = network.healthy == false || network.proxyAvailable == false || network.tunnelState == "down" || (network.newLogFailures ?? 0) > 0 || (network.recentFailureScore ?? 0) > 0
         let matchedCommander = appAt.flatMap { appDate in commanderConnectivity.filter { abs($0.1.timeIntervalSince(appDate)) <= 10 }.min { abs($0.1.timeIntervalSince(appDate)) < abs($1.1.timeIntervalSince(appDate)) } }
         let shared = appAt != nil && matchedCommander != nil
         let unknownActivity = activity.error || activity.coverageGap || activity.catchingUp || !activity.idleProven || activity.state.contains("未确认") || activity.state.contains("未知")
@@ -240,20 +185,18 @@ struct IncidentDiagnosis {
         let coverageUnknown = ["缺失", "不可读", "缺口", "读取失败", "截断", "轮换", "队列已满", "追赶中", "初次读取"].contains { timeline.coverage.contains($0) }
         let reopened = latestOpen.map { open in appAt.map { open > $0 } ?? false } ?? false
         let serviceIssue = service == "未运行" || ["通道异常", "通道不可用", "恢复尚未确认"].contains(channelState)
-        let networkIssue = network.updatedAt != nil && guardianBad
         let title: String
         let action: String
         let evidence: String
         var relevantDates: [Date] = []
-        var lastObservedOverride: Date?
         if serviceIssue {
             title = service == "未运行" ? "Commander 服务当前未运行" : "Commander 命令通道检查异常"
             action = "查看本机服务与操作记录；确认调用状态后再决定下一步。"
             evidence = "ping 只检查本机命令通道响应；未验证实际工具执行或 ChatGPT 回答。"
         } else if shared {
             title = "App 与 Commander 连接近期同时异常"
-            action = "检查网络连接；回到原对话核对回答，再决定是否继续。"
-            evidence = "Commander 使用本机观察时间；时间接近提示可能共享连接问题，但不证明根因或会话归属。"
+            action = "先核对 ChatGPT 与 Commander 当前状态；如两端仍同时异常，再用独立网络工具排查网络。"
+            evidence = "Commander 使用本机观察时间；时间接近只说明两端可能受共同环境影响，不证明网络、代理、隧道根因或会话归属。"
             relevantDates = [appAt, matchedCommander?.1].compactMap { $0 }
         } else if let appIssue {
             title = "ChatGPT 回答异常仍未确认恢复"
@@ -272,11 +215,6 @@ struct IncidentDiagnosis {
             action = unknownActivity || busyActivity ? "先查看操作记录并确认本机调用状态；当前不建议重启或重试。" : "查看对应本机操作记录，确认结果后再继续。"
             evidence = "Commander 时间是本机观察时间；记录不证明云端完成。"
             relevantDates = [commanderIssue.1]
-        } else if networkIssue {
-            title = "网络守护近期报告网络异常"
-            action = "检查网络守护当前状态与网络连接；此状态不说明 ChatGPT 回答结果。"
-            evidence = "网页探测失败或隧道状态只是选定的本机状态；不证明 ChatGPT 持久连接根因。"
-            lastObservedOverride = network.updatedAt
         } else if coverageUnknown {
             title = "诊断覆盖存在缺口"
             action = "先确认日志重新可读，再查看原对话与本机操作记录。"
@@ -303,7 +241,7 @@ struct IncidentDiagnosis {
             evidence = "ping 成功仅代表该次本机命令通道探测往返，不验证 ChatGPT 回答或工具执行。"
             relevantDates = []
         }
-        return IncidentDiagnosis(title: title, startedAt: relevantDates.min(), lastSeenAt: lastObservedOverride ?? relevantDates.max(), nextAction: action, evidence: evidence, network: network)
+        return IncidentDiagnosis(title: title, startedAt: relevantDates.min(), lastSeenAt: relevantDates.max(), nextAction: action, evidence: evidence)
     }
 }
 
@@ -2569,68 +2507,42 @@ func selfTest() {
     freshReader.poll(now: now)
     precondition(freshReader.summary.coverage.contains("覆盖有缺口"), "Skipping old bytes in a new path must still report a gap")
     precondition(NSImage(systemSymbolName: "shield", accessibilityDescription: nil) != nil && NSImage(systemSymbolName: "link", accessibilityDescription: nil) != nil)
-    let incidentURL = dir.appendingPathComponent("guardian-status.json")
-    let offsetFormatter = DateFormatter(); offsetFormatter.locale = Locale(identifier: "en_US_POSIX"); offsetFormatter.timeZone = TimeZone(secondsFromGMT: 8 * 3600); offsetFormatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ssZ"
-    let offsetStamp = offsetFormatter.string(from: now.addingTimeInterval(-50))
-    func writeGuardian(_ values: [String: Any]) { try! JSONSerialization.data(withJSONObject: values).write(to: incidentURL) }
-    let goodGuardian: [String: Any] = ["updated_at": offsetStamp, "healthy": true, "proxy_available": true, "tunnel_state": "running", "manual_pause": false, "new_log_failures": 0, "recent_failure_score": 0]
-    writeGuardian(goodGuardian)
-    let guardianGood = NetworkGuardianStatus.read(incidentURL, now: now)
-    precondition(guardianGood.updatedAt != nil && guardianGood.healthy == true)
-    precondition(NetworkGuardianStatus.read(dir.appendingPathComponent("missing-status.json"), now: now).updatedAt == nil)
-    writeGuardian(["updated_at": ISO8601DateFormatter.flex.string(from: now.addingTimeInterval(-121)), "healthy": true, "proxy_available": true, "tunnel_state": "running"])
-    precondition(NetworkGuardianStatus.read(incidentURL, now: now).updatedAt == nil, "Stale network status must be unknown")
-    writeGuardian(["updated_at": "2026-10-05T11:05:14", "healthy": true, "proxy_available": true, "tunnel_state": "running"])
-    precondition(NetworkGuardianStatus.read(incidentURL, now: now).updatedAt == nil, "A timezone-less timestamp must be rejected")
-    writeGuardian(goodGuardian.merging(["healthy": 1]) { _, new in new })
-    precondition(NetworkGuardianStatus.read(incidentURL, now: now).updatedAt == nil, "Malformed selected status must be unknown")
-    writeGuardian(goodGuardian.merging(["updated_at": ISO8601DateFormatter.flex.string(from: now.addingTimeInterval(1))]) { _, new in new })
-    precondition(NetworkGuardianStatus.read(incidentURL, now: now).updatedAt == nil, "Future status must not be treated as current")
     let safeIdle = ActivitySummary(state: "未观察到新调用", idleProven: true)
     let eventTime = ISO8601DateFormatter.flex.string(from: now.addingTimeInterval(-50))
     let appClose = TimelineEvent(source: "chatgpt_app", event: "chatgpt_pubsub_transport_closed", sourceAt: eventTime, observedAt: eventTime)
     let commanderChannel = TimelineEvent(source: "commander", event: "Commander错误: 通道错误", sourceAt: nil, observedAt: ISO8601DateFormatter.flex.string(from: now.addingTimeInterval(-45)))
-    var badGuardianJSON = goodGuardian
-    badGuardianJSON["healthy"] = false; badGuardianJSON["proxy_available"] = false; badGuardianJSON["tunnel_state"] = "down"
-    badGuardianJSON["updated_at"] = ISO8601DateFormatter.flex.string(from: now.addingTimeInterval(-48))
-    writeGuardian(badGuardianJSON)
-    let guardianBad = NetworkGuardianStatus.read(incidentURL, now: now)
-    let joint = IncidentDiagnosis.make(timeline: TimelineSummary(coverage: "已覆盖当前日志", history: [appClose, commanderChannel]), activity: safeIdle, network: guardianBad, service: "运行中", channelState: "通道畅通", now: now)
+    let joint = IncidentDiagnosis.make(timeline: TimelineSummary(coverage: "已覆盖当前日志", history: [appClose, commanderChannel]), activity: safeIdle, service: "运行中", channelState: "通道畅通", now: now)
     precondition(joint.title.contains("同时异常") && joint.evidence.contains("不证明"), "Near-time cross-service evidence must remain tentative")
-    precondition(joint.startedAt == ISO8601DateFormatter.parse(eventTime) && joint.lastSeenAt == ISO8601DateFormatter.parse(commanderChannel.observedAt), "A failed webpage check must not replace actual incident times")
-    let pairWithHealthyWeb = IncidentDiagnosis.make(timeline: TimelineSummary(coverage: "已覆盖当前日志", history: [appClose, commanderChannel]), activity: safeIdle, network: guardianGood, service: "运行中", channelState: "通道畅通", now: now)
-    precondition(pairWithHealthyWeb.title.contains("同时异常") && pairWithHealthyWeb.evidence.contains("不证明"), "A healthy public webpage probe must not hide a near-time App and Commander interruption")
-    let appOnly = IncidentDiagnosis.make(timeline: TimelineSummary(coverage: "已覆盖当前日志", history: [appClose]), activity: safeIdle, network: guardianGood, now: now)
+    precondition(joint.startedAt == ISO8601DateFormatter.parse(eventTime) && joint.lastSeenAt == ISO8601DateFormatter.parse(commanderChannel.observedAt), "Cross-service timing must use the actual observed events")
+    let appOnly = IncidentDiagnosis.make(timeline: TimelineSummary(coverage: "已覆盖当前日志", history: [appClose]), activity: safeIdle, now: now)
     precondition(appOnly.title.contains("连接近期中断") && appOnly.evidence.contains("不等同于 Commander ping"))
     let opened = TimelineEvent(source: "chatgpt_app", event: "chatgpt_pubsub_transport_opened", sourceAt: ISO8601DateFormatter.flex.string(from: now.addingTimeInterval(-10)), observedAt: eventTime)
     let duplicateClose = TimelineEvent(source: "chatgpt_app", event: appClose.event, sourceAt: eventTime, observedAt: ISO8601DateFormatter.flex.string(from: now.addingTimeInterval(-49)))
-    let interrupted = IncidentDiagnosis.make(timeline: TimelineSummary(coverage: "已覆盖当前日志", history: [appClose, duplicateClose, opened]), activity: safeIdle, network: guardianGood, now: now)
+    let interrupted = IncidentDiagnosis.make(timeline: TimelineSummary(coverage: "已覆盖当前日志", history: [appClose, duplicateClose, opened]), activity: safeIdle, now: now)
     precondition(interrupted.title.contains("之后观察到重新连接") && !interrupted.title.contains("次"), "Co-temporal close records should collapse into one incident")
     let repeatClose = TimelineEvent(source: "chatgpt_app", event: appClose.event, sourceAt: ISO8601DateFormatter.flex.string(from: now.addingTimeInterval(-20)), observedAt: ISO8601DateFormatter.flex.string(from: now.addingTimeInterval(-19)))
-    let repeatedDiagnosis = IncidentDiagnosis.make(timeline: TimelineSummary(coverage: "已覆盖当前日志", history: [appClose, duplicateClose, repeatClose]), activity: safeIdle, network: guardianGood, now: now)
+    let repeatedDiagnosis = IncidentDiagnosis.make(timeline: TimelineSummary(coverage: "已覆盖当前日志", history: [appClose, duplicateClose, repeatClose]), activity: safeIdle, now: now)
     precondition(repeatedDiagnosis.title.contains("近15分钟 2 个关闭时段"), "Distinct close groups should report the repeat count")
     let oldIssue = TimelineEvent(source: "chatgpt_app", event: "chatgpt_completion_transport_recovery_started", sourceAt: ISO8601DateFormatter.flex.string(from: now.addingTimeInterval(-1800)), observedAt: eventTime, failureKind: "resume_unavailable")
     let oldTimeline = TimelineSummary(coverage: "已覆盖当前日志", history: [oldIssue], latestAppIssue: oldIssue)
-    let oldDiagnosis = IncidentDiagnosis.make(timeline: oldTimeline, activity: safeIdle, network: guardianGood, now: now)
+    let oldDiagnosis = IncidentDiagnosis.make(timeline: oldTimeline, activity: safeIdle, now: now)
     precondition(oldDiagnosis.title.contains("较早") && chatMonitorSummary(oldTimeline).answer.contains("恢复流不可用"), "Old unresolved answer incidents must persist separately")
-    let oldPlusClose = IncidentDiagnosis.make(timeline: TimelineSummary(coverage: "已覆盖当前日志", history: [oldIssue, appClose], latestAppIssue: oldIssue), activity: safeIdle, network: guardianGood, now: now)
+    let oldPlusClose = IncidentDiagnosis.make(timeline: TimelineSummary(coverage: "已覆盖当前日志", history: [oldIssue, appClose], latestAppIssue: oldIssue), activity: safeIdle, now: now)
     precondition(oldPlusClose.title.contains("更新连接近期中断"), "An old answer issue must not hide a new connection interruption")
-    let stopped = IncidentDiagnosis.make(timeline: oldTimeline, activity: safeIdle, network: guardianGood, service: "未运行", channelState: "未知", now: now)
+    let stopped = IncidentDiagnosis.make(timeline: oldTimeline, activity: safeIdle, service: "未运行", channelState: "未知", now: now)
     precondition(stopped.title.contains("服务当前未运行"), "Current service state must outrank old answer history")
-    let expired = IncidentDiagnosis.make(timeline: TimelineSummary(coverage: "已覆盖当前日志", history: [TimelineEvent(source: "chatgpt_app", event: appClose.event, sourceAt: ISO8601DateFormatter.flex.string(from: now.addingTimeInterval(-901)), observedAt: eventTime)]), activity: safeIdle, network: guardianGood, now: now)
+    let expired = IncidentDiagnosis.make(timeline: TimelineSummary(coverage: "已覆盖当前日志", history: [TimelineEvent(source: "chatgpt_app", event: appClose.event, sourceAt: ISO8601DateFormatter.flex.string(from: now.addingTimeInterval(-901)), observedAt: eventTime)]), activity: safeIdle, now: now)
     precondition(expired.title.contains("没有可操作") && expired.startedAt == nil, "Expired incidents must not remain current")
     let earlierCommander = TimelineEvent(source: "commander", event: "Commander错误: 通道关闭", sourceAt: nil, observedAt: ISO8601DateFormatter.flex.string(from: now.addingTimeInterval(-600)))
-    let exactJoint = IncidentDiagnosis.make(timeline: TimelineSummary(coverage: "已覆盖当前日志", history: [earlierCommander, appClose, commanderChannel]), activity: safeIdle, network: guardianGood, now: now)
+    let exactJoint = IncidentDiagnosis.make(timeline: TimelineSummary(coverage: "已覆盖当前日志", history: [earlierCommander, appClose, commanderChannel]), activity: safeIdle, now: now)
     precondition(exactJoint.startedAt == ISO8601DateFormatter.parse(eventTime) && exactJoint.lastSeenAt == ISO8601DateFormatter.parse(commanderChannel.observedAt), "Unrelated older Commander events must not change incident times")
-    let unknownActivity = IncidentDiagnosis.make(timeline: TimelineSummary(coverage: "已覆盖当前日志"), activity: ActivitySummary(state: "状态未确认"), network: guardianGood, now: now)
+    let unknownActivity = IncidentDiagnosis.make(timeline: TimelineSummary(coverage: "已覆盖当前日志"), activity: ActivitySummary(state: "状态未确认"), now: now)
     precondition(unknownActivity.title.contains("未确认") && unknownActivity.nextAction.contains("当前不建议重启或重试"))
-    let busyDiagnosis = IncidentDiagnosis.make(timeline: TimelineSummary(coverage: "已覆盖当前日志"), activity: ActivitySummary(state: "收到调用（处理中）", active: ["read_file": 1]), network: guardianGood, now: now)
+    let busyDiagnosis = IncidentDiagnosis.make(timeline: TimelineSummary(coverage: "已覆盖当前日志"), activity: ActivitySummary(state: "收到调用（处理中）", active: ["read_file": 1]), now: now)
     precondition(busyDiagnosis.title.contains("进行中") && busyDiagnosis.nextAction.contains("等待当前调用返回"))
-    let missingCoverage = IncidentDiagnosis.make(timeline: TimelineSummary(coverage: "读取失败"), activity: ActivitySummary(state: "未观察到新调用", observed: now.addingTimeInterval(-600)), network: guardianGood, now: now)
+    let missingCoverage = IncidentDiagnosis.make(timeline: TimelineSummary(coverage: "读取失败"), activity: ActivitySummary(state: "未观察到新调用", observed: now.addingTimeInterval(-600)), now: now)
     precondition(missingCoverage.title.contains("覆盖") && missingCoverage.startedAt == nil, "An unrelated call timestamp cannot become a diagnostic gap start")
-    let networkOnly = IncidentDiagnosis.make(timeline: TimelineSummary(coverage: "已覆盖当前日志"), activity: safeIdle, network: guardianBad, now: now)
-    precondition(networkOnly.title.contains("网络守护近期") && networkOnly.startedAt == nil && networkOnly.lastSeenAt == guardianBad.updatedAt)
-    precondition(IncidentDiagnosis.make(timeline: oldTimeline, activity: safeIdle, network: guardianGood, now: now).title.contains("较早"), "A successful probe must not clear an answer issue")
+    precondition(IncidentDiagnosis.make(timeline: oldTimeline, activity: safeIdle, now: now).title.contains("较早"), "A successful probe must not clear an answer issue")
     print("CommanderGuard self-test passed")
 }
 
@@ -2676,9 +2588,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private var panelChat: NSTextField?
     private var panelChatTime: NSTextField?
     private var panelChatDetail: NSTextField?
-    private var panelNetwork: NSTextField?
-    private var panelNetworkTime: NSTextField?
-    private var panelNetworkDetail: NSTextField?
     private var panelRecoveryToggle: NSButton?
     private var panelRecoveryStatus: NSTextField?
     private var panelWakeToggle: NSButton?
@@ -3080,7 +2989,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         object["tool_execution"] = ["state": snapshot.toolExecutionState, "detail": snapshot.toolExecutionDetail, "checked_at": snapshot.toolExecutionChecked.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "fresh": toolExecutionFresh(snapshot, now: Date()), "evidence_ttl_seconds": Int(toolExecutionEvidenceTTL), "probe_deferred_reason": toolProbeDeferredReason]
         let latestHistory: [String: Any] = snapshot.toolHistory.latest.map { record in ["tool": record.tool, "label": record.label, "timestamp": ISO8601DateFormatter.flex.string(from: record.timestamp), "duration_seconds": record.duration as Any? ?? NSNull(), "result": record.resultLabel, "cloud_receipt": record.cloudReceiptLabel, "process_caveat": record.processCaveat as Any? ?? NSNull()] } ?? [:]
         object["tool_history"] = ["state": snapshot.toolHistory.state, "source_available": snapshot.toolHistory.sourceAvailable, "bootstrap_limited": snapshot.toolHistory.bootstrapLimited, "coverage_gap": snapshot.toolHistory.coverageGap, "gap_reason": snapshot.toolHistory.gapReason, "malformed_lines": snapshot.toolHistory.malformedLines, "backlog_bytes": snapshot.toolHistory.backlogBytes, "latest": latestHistory, "limitation": "结构化历史无可靠调用编号，不按时间与会话或 stdout 记录合并"]
-        object["diagnosis"] = ["title": diagnosis.title, "started_at": diagnosis.startedAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "last_seen_at": diagnosis.lastSeenAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "next_action": diagnosis.nextAction, "evidence": diagnosis.evidence, "network_guardian": diagnosis.network.safeSummary]
+        object["diagnosis"] = ["title": diagnosis.title, "started_at": diagnosis.startedAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "last_seen_at": diagnosis.lastSeenAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "next_action": diagnosis.nextAction, "evidence": diagnosis.evidence]
         guard let d = try? JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys]) else { return }
         do { try d.write(to: dir.appendingPathComponent("status.json"), options: .atomic) }
         catch { fputs("CommanderGuard: unable to write sanitized status file\n", stderr) }
@@ -3159,27 +3068,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let title = vertical(4)
         title.addArrangedSubview(label("COMMANDERGUARD", size: 11, weight: .bold, color: .secondaryLabelColor))
         title.addArrangedSubview(label("运行概览", size: 27, weight: .bold))
-        title.addArrangedSubview(label(previewMode ? "设计预览 · 以下为固定示例数据" : "消息通道、工具执行、ChatGPT 回答与网络路径分层观察", size: 13, color: .secondaryLabelColor))
+        title.addArrangedSubview(label(previewMode ? "设计预览 · 以下为固定示例数据" : "消息通道、工具执行与 ChatGPT 回答分层观察", size: 13, color: .secondaryLabelColor))
         layout.addArrangedSubview(title)
         panelHeading = title
 
         let commandValue = label("等待观察"); let commandTime = label("检查：暂无"); let commandDetail = label("")
         let toolValue = label("未验证"); let toolTime = label("检查：暂无"); let toolDetail = label("")
         let chatValue = label("等待读取"); let chatTime = label("问题：暂无"); let chatDetail = label("")
-        let networkValue = label("未确认"); let networkTime = label("检查：暂无"); let networkDetail = label("")
         panelConnection = commandValue; panelConnectionTime = commandTime; panelConnectionDetail = commandDetail
         panelToolExecution = toolValue; panelToolExecutionTime = toolTime; panelToolExecutionDetail = toolDetail
         panelChat = chatValue; panelChatTime = chatTime; panelChatDetail = chatDetail
-        panelNetwork = networkValue; panelNetworkTime = networkTime; panelNetworkDetail = networkDetail
         let heroes = NSStackView(); heroes.orientation = .horizontal; heroes.spacing = 10; heroes.distribution = .fillEqually
         let commandCard = heroCard("消息通道", value: commandValue, time: commandTime, detail: commandDetail)
         let toolCard = heroCard("工具执行", value: toolValue, time: toolTime, detail: toolDetail)
         let chatCard = heroCard("ChatGPT 回答", value: chatValue, time: chatTime, detail: chatDetail)
-        let networkCard = heroCard("网络路径", value: networkValue, time: networkTime, detail: networkDetail)
-        [commandCard, toolCard, chatCard, networkCard].forEach { heroes.addArrangedSubview($0) }
+        [commandCard, toolCard, chatCard].forEach { heroes.addArrangedSubview($0) }
         toolCard.heightAnchor.constraint(equalTo: commandCard.heightAnchor).isActive = true
         chatCard.heightAnchor.constraint(equalTo: commandCard.heightAnchor).isActive = true
-        networkCard.heightAnchor.constraint(equalTo: commandCard.heightAnchor).isActive = true
         panelHeroMinimum = heroes.heightAnchor.constraint(greaterThanOrEqualToConstant: 76)
         panelHeroMinimum?.isActive = true
         layout.addArrangedSubview(heroes)
@@ -3219,26 +3124,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private func eventStamp(_ event: TimelineEvent) -> String { stamp(ISO8601DateFormatter.parse(event.sourceAt ?? event.observedAt)) }
     private func displayPingResult(_ value: String) -> String { value.replacingOccurrences(of: "ping 成功", with: "命令连接检查成功") }
     private func currentDiagnosis(now: Date = Date()) -> IncidentDiagnosis {
-        let network: NetworkGuardianStatus
-        if previewMode {
-            network = NetworkGuardianStatus(updatedAt: nil, healthy: nil, proxyAvailable: nil, tunnelState: "unknown", manualPause: nil, newLogFailures: nil, recentFailureScore: nil)
-        } else {
-            let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/OpenAILinkGuardian/status.json")
-            network = NetworkGuardianStatus.read(url, now: now)
-        }
-        return IncidentDiagnosis.make(timeline: snapshot.timeline, activity: snapshot.activity, network: network,
-                                      service: snapshot.service, channelState: snapshot.channelState, now: now)
-    }
-    private func networkLayerStatus(_ network: NetworkGuardianStatus) -> String {
-        guard network.updatedAt != nil else { return "未确认" }
-        if network.healthy == false || network.proxyAvailable == false || network.tunnelState == "down" { return "异常" }
-        if network.healthy == true && network.proxyAvailable == true && network.tunnelState == "running" { return "网页探测正常" }
-        return "部分确认"
+        IncidentDiagnosis.make(timeline: snapshot.timeline, activity: snapshot.activity,
+                               service: snapshot.service, channelState: snapshot.channelState, now: now)
     }
     private func renderPanel() {
         guard panelWindow != nil else { return }
         let now = Date()
-        let diagnosis = currentDiagnosis(now: now)
         panelConnection?.stringValue = channelSummary(snapshot, now: now)
         let marker = channelIndicator(service: snapshot.service, state: snapshot.channelState, checked: snapshot.channelChecked, now: now)
         panelConnection?.textColor = marker == "●" ? .systemGreen : (marker == "!" ? .systemRed : .labelColor)
@@ -3265,11 +3156,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }
         panelChatDetail?.stringValue = middleTruncate("更新连接：\(chat.connection)", limit: 56)
 
-        let networkState = networkLayerStatus(diagnosis.network)
-        panelNetwork?.stringValue = networkState
-        panelNetwork?.textColor = networkState == "异常" ? .systemRed : (networkState == "网页探测正常" ? .systemGreen : .labelColor)
-        panelNetworkTime?.stringValue = "检查：\(prominentStamp(diagnosis.network.updatedAt))"
-        panelNetworkDetail?.stringValue = diagnosis.network.updatedAt == nil ? "守护状态缺失、无效或已过期" : middleTruncate(diagnosis.network.safeSummary, limit: 56)
 
         panelRecoveryToggle?.state = recoveryLedger.autoRecoveryEnabled ? .on : .off
         panelWakeToggle?.state = paused ? .off : .on
@@ -3309,7 +3195,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         panelConnectionDetail?.isHidden = panelPage == 1
         panelToolExecutionDetail?.isHidden = panelPage == 1
         panelChatDetail?.isHidden = panelPage == 1
-        panelNetworkDetail?.isHidden = panelPage == 1
         panelHeroMinimum?.constant = panelPage == 1 ? 64 : 76
         if panelPage == 1 { renderLogPage(); return }
         let chat = chatMonitorSummary(snapshot.timeline)
@@ -3335,7 +3220,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             }
             setSections([
                 section("诊断与下一步", rows: [("判断", diagnosis.title), ("建议", diagnosis.nextAction), ("首次观察", stamp(diagnosis.startedAt)), ("最近观察", stamp(diagnosis.lastSeenAt)), ("证据范围", diagnosis.evidence)]),
-                section("网络守护证据", subtitle: "顶部卡片只显示结论；这里保留判断依据", rows: [("选定状态", diagnosis.network.safeSummary)]),
                 section("Commander 诊断依据", subtitle: "不重复顶部状态与时间，只显示额外证据", rows: [("服务", snapshot.service), ("云端登记", snapshot.cloud), ("通道说明", displayPingResult(snapshot.channelDetail)), ("工具依据", snapshot.toolExecutionDetail), ("工具检查暂缓", toolProbeBusy ? "正在检查" : toolProbeDeferredReason), ("手动检查", displayPingResult(manualNotice ?? deferredReason))]),
                 section("自动恢复", rows: [("状态", recoveryAvailability()), ("冷却剩余", remaining.map { "\($0) 秒" } ?? "无"), ("最近尝试", stamp(recoveryLedger.lastAttempt)), ("最近结果", lastRecoveryOutcome ?? (recoveryLedger.lastAttempt == nil ? "暂无恢复尝试" : "本次运行未观察到结果"))]),
                 section("ChatGPT 观察范围", subtitle: "回答状态与更新连接已在顶部显示", rows: [("监控范围", "仅当前本机 App 的固定事件；其他设备或网页提示可能不可见"), ("覆盖限制", chat.deliveryLimit), ("处理建议", "回原对话确认回答状态，核对操作记录后再决定是否继续")]),
@@ -3500,7 +3384,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }
         panelPage = 1; renderPanel()
         guard let text = logTextView else { fputs("CommanderGuard UI check failed: records are missing\n", stderr); exit(2) }
-        verify((10...12).contains(panelConnectionTime?.font?.pointSize ?? 0) && (10...12).contains(panelToolExecutionTime?.font?.pointSize ?? 0) && (10...12).contains(panelChatTime?.font?.pointSize ?? 0) && (10...12).contains(panelNetworkTime?.font?.pointSize ?? 0), "layer timestamps are not secondary to state")
+        verify((10...12).contains(panelConnectionTime?.font?.pointSize ?? 0) && (10...12).contains(panelToolExecutionTime?.font?.pointSize ?? 0) && (10...12).contains(panelChatTime?.font?.pointSize ?? 0), "layer timestamps are not secondary to state")
         precondition(recordSteps.count == 4, "Record page must expose all source rows")
         recordFilter?.selectItem(at: 1); renderLogPage()
         precondition(recordSteps.count == 1 && recordSteps[0].id == "preview-2", "Ongoing filter must match only ongoing work")

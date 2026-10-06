@@ -1,19 +1,32 @@
-# CommanderGuard
+<p align="center">
+  <img src="Assets/AppIcon.png" width="112" alt="CommanderGuard icon">
+</p>
 
-CommanderGuard 是一个 macOS 菜单栏守护工具，用来观察 **Remote Desktop Commander、ChatGPT App 与本机网络路径** 的状态。
+<h1 align="center">CommanderGuard</h1>
 
-它不把“设备在线”“ping 成功”“本机命令已返回”混成同一件事，而是把链路拆成四层分别判断：
+<p align="center">
+  macOS 上用于观察 <strong>Remote Desktop Commander ↔ 本机工具执行 ↔ ChatGPT App</strong> 的轻量守护与诊断工具。
+</p>
+
+CommanderGuard 关注的是 **命令链路和 ChatGPT App 自身的可观察状态**。它不会把“设备在线”“ping 成功”“本机命令已返回”混成同一件事，而是把链路拆成三层分别判断：
 
 | 层级 | CommanderGuard 判断什么 | 主要证据 |
 |---|---|---|
-| **消息通道** | 远端消息是否还能到达这台 Mac | 针对当前设备、请求编号匹配的 MCP `ping` / `pong` |
+| **消息通道** | Remote Desktop Commander 的远端消息是否还能到达这台 Mac | 针对当前设备、请求编号匹配的 MCP `ping` / `pong` |
 | **工具执行** | 本机工具调用是否真的能执行并返回 | 近期真实成功调用，或满足安全条件时的只读 `list_sessions` 探针 |
-| **ChatGPT 回答** | 本机 ChatGPT App 最近是否出现回答恢复、断流或重连异常 | App 的结构化日志事件 |
-| **网络路径** | 本机已知网络守护是否报告代理、隧道或网页探测异常 | TunnelSentinel 的只读状态（如已安装） |
+| **ChatGPT 回答** | 本机 ChatGPT App 最近是否出现回答恢复、断流或重连异常 | App 的固定结构化日志事件 |
 
-> **重要：** 某一层正常，不代表其他层也正常。
+> **重要：** 某一层正常，不代表其他层也正常。 `ping` 成功只能证明消息通道可回应；它不能证明本机工具一定执行成功，也不能证明 ChatGPT 的原回答流已经恢复。
+
+### 产品边界
+
+CommanderGuard **不负责代理、隧道、节点或网络策略**。这类问题属于独立的网络诊断工具，不应通过读取另一个 App 的私有状态文件来耦合进 CommanderGuard。即使 ChatGPT 与 Commander 在相近时间同时异常，本项目也只报告“可能受共同环境影响”，不会据此认定代理、隧道或网络是根因。
+
+它同样不会读取聊天正文、自动重发消息、重试业务任务，或把未知状态当作“可以安全重启”。
+
+> **上游跟踪：ChatGPT 会话归属**
 >
-> 例如 `ping` 成功只能证明消息通道可回应，不能证明本机工具一定执行成功，更不能证明 ChatGPT 的原回答流已经恢复。
+> CommanderGuard 已兼容 OpenAI 的 `openai/session` 和建议的 `origin_context_id`，但 Remote Desktop Commander 当前尚未把稳定会话字段透传到配对设备。进展可直接跟踪 [Remote Desktop Commander #12 — Preserve stable ChatGPT conversation identity in remote tool-call metadata](https://github.com/desktop-commander/remote-desktop-commander/issues/12)。
 
 后续功能、优先级和验收条件见 [TODO.md](TODO.md)。待办里未完成的项目不属于当前能力。
 
@@ -54,12 +67,11 @@ CommanderGuard 是一个 macOS 菜单栏守护工具，用来观察 **Remote Des
 
 点击菜单栏图标，或再次打开桌面入口，会进入同一个主面板。
 
-顶部始终显示四张状态卡：
+顶部始终显示三张状态卡：
 
 - 消息通道
 - 工具执行
 - ChatGPT 回答
-- 网络路径
 
 主面板分为三个页面：
 
@@ -101,7 +113,6 @@ CommanderGuard 是一个 macOS 菜单栏守护工具，用来观察 **Remote Des
 - 自动恢复；
 - ChatGPT 回答异常；
 - 日志覆盖与缺口；
-- 网络守护状态；
 - 最近连接事件。
 
 ---
@@ -272,30 +283,6 @@ CommanderGuard 不会：
 
 ---
 
-## 网络路径与 TunnelSentinel
-
-如果本机安装了 TunnelSentinel，CommanderGuard 只读取它选定的状态：
-
-- 检查时间；
-- 网页探测结果；
-- 代理是否可用；
-- 隧道状态；
-- 手动暂停；
-- 失败计数。
-
-它不会读取：
-
-- 节点列表；
-- 代理配置；
-- 探测正文；
-- 原始日志。
-
-也不会启动、重启或修改 TunnelSentinel。
-
-网页探测正常只能说明某条网络路径可达，**不能证明 ChatGPT 的持续回答连接正常**。
-
----
-
 ## 隐私与安全边界
 
 CommanderGuard 的原则是：**尽量保存状态，不保存内容。**
@@ -372,9 +359,9 @@ CommanderGuard 会读取已有本机登录信息，用于查询设备登记、�
 
 ## 当前已知限制
 
-- Remote Desktop Commander 当前没有把稳定 ChatGPT session metadata 透传到配对设备，因此会话归属通常仍是“未确认”。
+- Remote Desktop Commander 当前没有把稳定 ChatGPT session metadata 透传到配对设备，因此会话归属通常仍是“未确认”；见 [上游 issue #12](https://github.com/desktop-commander/remote-desktop-commander/issues/12)。
 - 本机工具调用返回，不代表云端一定已经收到结果，也不代表整轮 ChatGPT 任务已经完成。
-- `ping`、网页探测和更新连接恢复都不能单独证明原回答流已经恢复。
+- `ping` 和更新连接恢复都不能单独证明原回答流已经恢复。
 - CommanderGuard 只能根据可观察证据避免误重启，不能保证识别所有独立后台任务。
 - ChatGPT App 当前没有经验证的、供第三方 Guard 控制原回答流的受支持接口。
 - 安装脚本目前仍依赖固定项目路径。
