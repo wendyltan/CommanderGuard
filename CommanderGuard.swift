@@ -192,8 +192,10 @@ struct IncidentDiagnosis {
         let answerIssues = events.filter { event, _ in
             event.source == "chatgpt_app" && (event.event == "chatgpt_completion_transport_recovery_started" || event.event == "chatgpt_completion_transport_recovery_poll_failed" || event.event == "chatgpt_conversation_refetch_completed · error")
         }
-        let appIssue = answerIssues.filter { now.timeIntervalSince($0.1) <= 900 }.max { $0.1 < $1.1 }
-        let oldAnswerIssue = answerIssues.max { $0.1 < $1.1 }
+        let currentChat = chatMonitorSummary(timeline)
+        let unresolvedAnswerIssue = currentChat.answer == "回答异常（恢复未确认）"
+        let appIssue = unresolvedAnswerIssue ? answerIssues.filter { now.timeIntervalSince($0.1) <= 900 }.max { $0.1 < $1.1 } : nil
+        let oldAnswerIssue = unresolvedAnswerIssue ? answerIssues.max { $0.1 < $1.1 } : nil
         let appDisruption = appDisruptions.max { $0.1 < $1.1 }
         let commanderConnectivity = recent.filter { $0.0.source == "commander" && ["Commander错误: 通道错误", "Commander错误: 云端实时服务连接池异常", "Commander错误: 通道订阅超时", "Commander错误: 通道关闭"].contains($0.0.event) }
         let commanderIssue = recent.filter { $0.0.source == "commander" && ($0.0.event.hasPrefix("Commander错误:") || $0.0.event.hasPrefix("调用error:")) }.max { $0.1 < $1.1 }
@@ -278,39 +280,105 @@ struct ChatMonitorEvidence {
 struct ChatMonitorSummary {
     let answer: String
     let connection: String
+    let history: String?
     let deliveryLimit = "Message delivery timed out 没有可读的专属结构化事件；响应恢复尝试只是前兆，不代表该提示已出现"
 
     var menuLine: String { "ChatGPT：" + (answer.components(separatedBy: "；").first ?? answer) }
 }
 
 func chatMonitorSummary(events: [ChatMonitorEvidence], timelineCoverage: String) -> ChatMonitorSummary {
-    let unreadable = ["不可读", "缺口", "缺失", "读取失败", "轮换或截断", "新日志路径", "队列已满", "追赶中", "初次读取"].contains { timelineCoverage.contains($0) }
-    let stamp: (String) -> String = { raw in
-        let parser = ISO8601DateFormatter(); parser.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        guard let date = parser.date(from: raw) ?? ISO8601DateFormatter().date(from: raw) else { return "时间未知" }
-        let f = DateFormatter(); f.locale = Locale(identifier: "zh_CN"); f.dateFormat = "MM-dd HH:mm:ss"
-        return f.string(from: date)
+    let unreadable = timelineCoverage.contains("初次读取") ||
+        timelineCoverage.hasPrefix("日志缺失") ||
+        timelineCoverage.contains("App 日志缺失") ||
+        timelineCoverage.contains("覆盖有缺口") ||
+        timelineCoverage.contains("时间线有缺口") ||
+        timelineCoverage.contains("时间线保存失败")
+    let date: (ChatMonitorEvidence) -> Date? = { ISO8601DateFormatter.parse($0.observedAt) }
+    let newer: (ChatMonitorEvidence, ChatMonitorEvidence) -> Bool = { lhs, rhs in
+        guard let ld = date(lhs), let rd = date(rhs) else { return lhs.observedAt > rhs.observedAt }
+        return ld > rd
     }
-
-    let answerEvents = events.filter {
-        $0.kind == "chatgpt_completion_transport_recovery_started" || $0.kind == "chatgpt_completion_transport_recovery_poll_failed" ||
+    let stamp: (String) -> String = { raw in
+        guard let parsed = ISO8601DateFormatter.parse(raw) else { return "时间未知" }
+        let f = DateFormatter(); f.locale = Locale(identifier: "zh_CN"); f.dateFormat = "MM-dd HH:mm:ss"
+        return f.string(from: parsed)
+    }
+    let issueEvents = events.filter {
+        $0.kind == "chatgpt_completion_transport_recovery_started" ||
+        $0.kind == "chatgpt_completion_transport_recovery_poll_failed" ||
         ($0.kind == "chatgpt_conversation_refetch_completed" && $0.outcome == "error")
     }
+    let latestIssue = issueEvents.max(by: { newer($1, $0) })
+
+    let recoveryEvents = events.filter {
+        $0.kind == "chatgpt_completion_transport_recovery_completed" ||
+        $0.kind == "chatgpt_pubsub_transport_opened" ||
+        ($0.kind == "chatgpt_conversation_refetch_completed" && ["idle", "streaming"].contains($0.outcome ?? ""))
+    }
+
+    let significantKinds: Set<String> = [
+        "chatgpt_completion_transport_recovery_started",
+        "chatgpt_completion_transport_recovery_poll_failed",
+        "chatgpt_completion_transport_recovery_completed",
+        "chatgpt_conversation_refetch_completed",
+        "chatgpt_pubsub_reconnect_exhausted",
+        "chatgpt_pubsub_connection_failed",
+        "chatgpt_pubsub_transport_closed",
+        "chatgpt_pubsub_reconnect_scheduled",
+        "chatgpt_pubsub_transport_opened"
+    ]
+    let latestSignificant = events.filter { significantKinds.contains($0.kind) }.max(by: { newer($1, $0) })
+
     let answer: String
-    if let latest = answerEvents.max(by: { $0.observedAt < $1.observedAt || ($0.observedAt == $1.observedAt && $0.failureKind == nil && $1.failureKind != nil) }) {
-        let type = latest.kind == "chatgpt_completion_transport_recovery_poll_failed" ? "回答恢复检查失败" : latest.kind == "chatgpt_completion_transport_recovery_started" ? (latest.failureKind == "resume_unavailable" ? "恢复流不可用" : "响应流恢复尝试") : "对话状态刷新失败"
-        answer = "最近异常：\(type) · \(stamp(latest.observedAt))；恢复情况未确认"
-    } else if unreadable {
-        answer = "日志不可读或有缺口；回答状态未知"
+    if unreadable {
+        answer = "状态未知"
+    } else if let latest = latestSignificant {
+        switch latest.kind {
+        case "chatgpt_completion_transport_recovery_started",
+             "chatgpt_completion_transport_recovery_poll_failed":
+            answer = "回答异常（恢复未确认）"
+        case "chatgpt_conversation_refetch_completed" where latest.outcome == "error":
+            answer = "回答异常（恢复未确认）"
+        case "chatgpt_pubsub_reconnect_exhausted",
+             "chatgpt_pubsub_connection_failed",
+             "chatgpt_pubsub_transport_closed",
+             "chatgpt_pubsub_reconnect_scheduled":
+            answer = "连接异常"
+        case "chatgpt_completion_transport_recovery_completed":
+            answer = "回答恢复已记录"
+        case "chatgpt_pubsub_transport_opened":
+            answer = "当前连接正常"
+        case "chatgpt_conversation_refetch_completed" where ["idle", "streaming"].contains(latest.outcome ?? ""):
+            answer = "当前连接正常"
+        default:
+            answer = "当前未见异常"
+        }
     } else {
-        answer = "尚未观察到可识别的回答异常"
+        answer = "当前未见异常"
+    }
+
+    let history: String?
+    if let issue = latestIssue {
+        let laterRecovery = recoveryEvents.filter { candidate in
+            guard let issueDate = date(issue), let candidateDate = date(candidate) else { return candidate.observedAt > issue.observedAt }
+            return candidateDate > issueDate
+        }.max(by: { newer($1, $0) })
+        if let laterRecovery, laterRecovery.kind == "chatgpt_completion_transport_recovery_completed" {
+            history = "后续已记录回答恢复完成"
+        } else if laterRecovery != nil {
+            history = "后续连接已恢复；原中断回答是否完整恢复无法从日志确认"
+        } else {
+            history = "恢复情况未确认"
+        }
+    } else {
+        history = nil
     }
 
     let connectionEvents = events.filter {
         ["chatgpt_pubsub_reconnect_exhausted", "chatgpt_pubsub_connection_failed", "chatgpt_pubsub_transport_closed", "chatgpt_pubsub_reconnect_scheduled", "chatgpt_pubsub_transport_opened"].contains($0.kind)
     }
     let connection: String
-    if let latest = connectionEvents.max(by: { $0.observedAt < $1.observedAt }) {
+    if let latest = connectionEvents.max(by: { newer($1, $0) }) {
         let detail: String
         switch latest.kind {
         case "chatgpt_pubsub_reconnect_exhausted": detail = "更新连接重连已耗尽"
@@ -319,14 +387,13 @@ func chatMonitorSummary(events: [ChatMonitorEvidence], timelineCoverage: String)
         case "chatgpt_pubsub_reconnect_scheduled": detail = "更新连接准备重连"
         default: detail = "更新连接已建立"
         }
-        let next = latest.kind == "chatgpt_pubsub_transport_opened" ? "仍需单独确认回答是否恢复" : "检查 ChatGPT 网络连接；恢复后确认原回答状态"
-        connection = "\(detail) · \(stamp(latest.observedAt))；\(next)"
+        connection = "\(detail) · \(stamp(latest.observedAt))"
     } else if unreadable {
         connection = "连接状态未知（日志不可读或有缺口）"
     } else {
-        connection = "暂无连接异常事件；连接事件缺失不代表回答成功"
+        connection = "暂无可识别的连接异常"
     }
-    return ChatMonitorSummary(answer: answer, connection: connection)
+    return ChatMonitorSummary(answer: answer, connection: connection, history: history)
 }
 
 
@@ -601,7 +668,12 @@ final class TimelineReader {
         if let row = try? JSONEncoder().encode(event), pendingBytes + row.count + 1 <= maxJournal / 2 { pending.append(event); pendingBytes += row.count + 1 }
         else { coverageGap = true; coverage = "时间线有缺口 · 保存队列已满" }
         if event.source == "commander" && (event.event.contains("错误") || event.event.contains("error")) { commanderErrors += 1 }
-        if event.source == "chatgpt_app" { latestAppEvent = event }
+        if event.source == "chatgpt_app" {
+            let stamp = event.sourceAt ?? event.observedAt
+            if latestAppEvent == nil || stamp > (latestAppEvent!.sourceAt ?? latestAppEvent!.observedAt) {
+                latestAppEvent = event
+            }
+        }
         rememberAppIssue(event)
         if events.count > 5000 { events.removeFirst(events.count - 5000) }
     }
@@ -637,7 +709,16 @@ final class TimelineReader {
         for file in [journal.appendingPathExtension("bak"), journal] {
             guard let size = try? manager.attributesOfItem(atPath: file.path)[.size] as? NSNumber, size.intValue <= maxJournal, let data = try? Data(contentsOf: file) else { continue }
             for line in data.split(separator: 10).suffix(2500) {
-                if let event = try? JSONDecoder().decode(TimelineEvent.self, from: Data(line)), valid(event) { events.append(event); if event.source == "chatgpt_app" { latestAppEvent = event }; rememberAppIssue(event) }
+                if let event = try? JSONDecoder().decode(TimelineEvent.self, from: Data(line)), valid(event) {
+                    events.append(event)
+                    if event.source == "chatgpt_app" {
+                        let stamp = event.sourceAt ?? event.observedAt
+                        if latestAppEvent == nil || stamp > (latestAppEvent!.sourceAt ?? latestAppEvent!.observedAt) {
+                            latestAppEvent = event
+                        }
+                    }
+                    rememberAppIssue(event)
+                }
             }
         }
         if events.count > 5000 { events = Array(events.suffix(5000)) }
@@ -2703,9 +2784,20 @@ func selfTest() {
     let issue = TimelineEvent(source: "chatgpt_app", event: "chatgpt_completion_transport_recovery_started", sourceAt: issueTime, observedAt: issueTime, failureKind: "resume_unavailable")
     let laterOpen = TimelineEvent(source: "chatgpt_app", event: "chatgpt_pubsub_transport_opened", sourceAt: "2026-10-04T11:41:00.000Z", observedAt: "2026-10-04T11:41:00.000Z")
     let laterIdle = TimelineEvent(source: "chatgpt_app", event: "chatgpt_conversation_refetch_completed · idle", sourceAt: "2026-10-04T11:42:00.000Z", observedAt: "2026-10-04T11:42:00.000Z")
+    let outOfOrderJournal = dir.appendingPathComponent("chat-out-of-order.jsonl")
+    let olderClosed = TimelineEvent(source: "chatgpt_app", event: "chatgpt_pubsub_transport_closed", sourceAt: "2026-10-04T11:39:00.000Z", observedAt: "2026-10-04T11:43:00.000Z")
+    let outOfOrderData = [laterOpen, olderClosed].map { try! JSONEncoder().encode($0) + Data([10]) }.reduce(into: Data()) { $0.append($1) }
+    try! outOfOrderData.write(to: outOfOrderJournal)
+    let outOfOrderReader = TimelineReader(appRoot: dir.appendingPathComponent("missing-order"), commanderLog: dir.appendingPathComponent("none-order"), commanderErrorLog: nil, journal: outOfOrderJournal)
+    precondition(outOfOrderReader.summary.latestAppEvent?.sourceAt == laterOpen.sourceAt, "Latest App event must follow source time, not journal append order")
     let chatResult = chatMonitorSummary(TimelineSummary(coverage: "已覆盖当前日志", history: [issue, laterOpen, laterIdle]))
-    precondition(chatResult.answer.contains("恢复流不可用") && chatResult.connection.contains("更新连接已建立") && !chatResult.answer.contains("回答已恢复"))
-    precondition(chatResult.answer.contains("恢复情况未确认"))
+    precondition(chatResult.answer == "当前连接正常" && chatResult.connection.contains("更新连接已建立"))
+    precondition(chatResult.history?.contains("原中断回答是否完整恢复无法从日志确认") == true)
+    let issueOnly = chatMonitorSummary(TimelineSummary(coverage: "已覆盖当前日志", history: [issue]))
+    precondition(issueOnly.answer == "回答异常（恢复未确认）" && issueOnly.history == "恢复情况未确认")
+    let laterStreaming = TimelineEvent(source: "chatgpt_app", event: "chatgpt_conversation_refetch_completed · streaming", sourceAt: "2026-10-04T11:42:30.000Z", observedAt: "2026-10-04T11:42:30.000Z")
+    let streamingResult = chatMonitorSummary(TimelineSummary(coverage: "已覆盖当前日志", history: [issue, laterStreaming]))
+    precondition(streamingResult.answer == "当前连接正常" && streamingResult.history?.contains("原中断回答是否完整恢复无法从日志确认") == true)
     precondition(appEventLabel(TimelineEvent(source: "chatgpt_app", event: "chatgpt_conversation_refetch_completed · error", sourceAt: issueTime, observedAt: issueTime)).contains("对话状态刷新失败"))
     let repeated = TimelineEvent(source: "chatgpt_app", event: "chatgpt_pubsub_transport_opened", sourceAt: "2026-10-04T11:41:00.100Z", observedAt: "2026-10-04T11:41:00.100Z")
     let repeated2 = TimelineEvent(source: "chatgpt_app", event: "chatgpt_pubsub_transport_opened", sourceAt: "2026-10-04T11:41:00.800Z", observedAt: "2026-10-04T11:41:00.800Z")
@@ -2715,9 +2807,9 @@ func selfTest() {
     precondition(groupedTimelineEvents([issue, TimelineEvent(source: issue.source, event: issue.event, sourceAt: issue.sourceAt, observedAt: issue.observedAt)]).count == 2, "Different failure classifications must remain separate")
     precondition(chatResult.menuLine.count < 100 && chatResult.deliveryLimit.contains("没有可读"))
     precondition(chatMonitorSummary(TimelineSummary(coverage: "App 日志缺失")).answer.contains("未知"))
-    precondition(chatMonitorSummary(TimelineSummary(coverage: "已覆盖当前日志")).answer.contains("尚未观察到"))
+    precondition(chatMonitorSummary(TimelineSummary(coverage: "已覆盖当前日志")).answer == "当前未见异常")
     let retainedIssue = chatMonitorSummary(TimelineSummary(coverage: "已覆盖当前日志", history: [laterOpen, laterIdle], latestAppIssue: issue))
-    precondition(retainedIssue.answer.contains("恢复流不可用"))
+    precondition(retainedIssue.answer == "当前连接正常" && retainedIssue.history?.contains("原中断回答是否完整恢复无法从日志确认") == true)
     let chatRoot = dir.appendingPathComponent("chat-monitor/2026/10/04"); try! FileManager.default.createDirectory(at: chatRoot, withIntermediateDirectories: true)
     let chatLog = chatRoot.appendingPathComponent("app.log")
     let chatJournal = dir.appendingPathComponent("chat-monitor.jsonl")
@@ -2739,11 +2831,12 @@ func selfTest() {
     let extraHandle = try! FileHandle(forWritingTo: chatLog); try! extraHandle.seekToEnd(); try! extraHandle.write(contentsOf: Data(extraLines.utf8)); try! extraHandle.close()
     chatReader.poll(now: now)
     precondition(chatReader.summary.history.suffix(3).map(\.event) == extraEvents)
-    precondition(chatMonitorSummary(chatReader.summary).answer.contains("恢复检查失败"))
+    precondition(chatMonitorSummary(chatReader.summary).answer == "连接异常" && chatMonitorSummary(chatReader.summary).history == "恢复情况未确认")
     precondition(chatMonitorSummary(chatReader.summary).connection.contains("重连已耗尽"))
     let recoveredEvent = chatReader.summary.history.first { $0.event == extraEvents[0] }!
     precondition(appEventLabel(recoveredEvent).contains("恢复完成"))
-    precondition(chatMonitorSummary(TimelineSummary(coverage: "已覆盖当前日志", history: [issue, recoveredEvent])).answer.contains("恢复情况未确认"))
+    let recoveredSummary = chatMonitorSummary(TimelineSummary(coverage: "已覆盖当前日志", history: [issue, recoveredEvent]))
+    precondition(recoveredSummary.answer == "回答恢复已记录" && recoveredSummary.history == "后续已记录回答恢复完成")
     let restoredExtra = TimelineReader(appRoot: dir.appendingPathComponent("missing"), commanderLog: dir.appendingPathComponent("none"), commanderErrorLog: nil, journal: chatJournal)
     precondition(restoredExtra.summary.history.suffix(3).map(\.event) == extraEvents)
     precondition(!String(decoding: try! Data(contentsOf: chatJournal), as: UTF8.self).contains("PRIVATE_TEST_PAYLOAD"))
@@ -2760,6 +2853,12 @@ func selfTest() {
     precondition(freshReader.summary.coverage.contains("覆盖有缺口"), "Skipping old bytes in a new path must still report a gap")
     precondition(NSImage(systemSymbolName: "shield", accessibilityDescription: nil) != nil && NSImage(systemSymbolName: "link", accessibilityDescription: nil) != nil)
     let safeIdle = ActivitySummary(state: "未观察到新调用", idleProven: true)
+    let recoveredAnswerDiagnosis = IncidentDiagnosis.make(
+        timeline: TimelineSummary(coverage: "已覆盖当前日志", history: [issue, laterOpen, laterIdle], latestAppIssue: issue),
+        activity: safeIdle,
+        now: now
+    )
+    precondition(!recoveredAnswerDiagnosis.title.contains("回答异常") && !recoveredAnswerDiagnosis.title.contains("较早"), "Recovered current ChatGPT state must not be replaced by retained history")
     let eventTime = ISO8601DateFormatter.flex.string(from: now.addingTimeInterval(-50))
     let appClose = TimelineEvent(source: "chatgpt_app", event: "chatgpt_pubsub_transport_closed", sourceAt: eventTime, observedAt: eventTime)
     let commanderChannel = TimelineEvent(source: "commander", event: "Commander错误: 通道错误", sourceAt: nil, observedAt: ISO8601DateFormatter.flex.string(from: now.addingTimeInterval(-45)))
@@ -2778,7 +2877,7 @@ func selfTest() {
     let oldIssue = TimelineEvent(source: "chatgpt_app", event: "chatgpt_completion_transport_recovery_started", sourceAt: ISO8601DateFormatter.flex.string(from: now.addingTimeInterval(-1800)), observedAt: eventTime, failureKind: "resume_unavailable")
     let oldTimeline = TimelineSummary(coverage: "已覆盖当前日志", history: [oldIssue], latestAppIssue: oldIssue)
     let oldDiagnosis = IncidentDiagnosis.make(timeline: oldTimeline, activity: safeIdle, now: now)
-    precondition(oldDiagnosis.title.contains("较早") && chatMonitorSummary(oldTimeline).answer.contains("恢复流不可用"), "Old unresolved answer incidents must persist separately")
+    precondition(oldDiagnosis.title.contains("较早") && chatMonitorSummary(oldTimeline).answer == "回答异常（恢复未确认）", "Old unresolved answer incidents must persist separately")
     let oldPlusClose = IncidentDiagnosis.make(timeline: TimelineSummary(coverage: "已覆盖当前日志", history: [oldIssue, appClose], latestAppIssue: oldIssue), activity: safeIdle, now: now)
     precondition(oldPlusClose.title.contains("更新连接近期中断"), "An old answer issue must not hide a new connection interruption")
     let stopped = IncidentDiagnosis.make(timeline: oldTimeline, activity: safeIdle, service: "未运行", channelState: "未知", now: now)
@@ -3418,7 +3517,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let lastAppEvent: [String: Any] = snapshot.timeline.latestAppEvent.map { ["event": $0.event, "conversation_title": $0.conversationTitle as Any? ?? NSNull(), "failure_kind": $0.failureKind as Any? ?? NSNull(), "source_timestamp": $0.sourceAt as Any? ?? NSNull(), "observed_at": $0.observedAt] } ?? [:]
         let chat = chatMonitorSummary(snapshot.timeline)
         let diagnosis = currentDiagnosis()
-        var object: [String: Any] = ["chatgpt": ["answer": chat.answer, "update_connection": chat.connection, "coverage": snapshot.timeline.coverage, "delivery_timeout_directly_observable": false, "limitation": chat.deliveryLimit], "service": snapshot.service, "cloud": snapshot.cloud, "last_seen": snapshot.lastSeen.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "checked_at": ISO8601DateFormatter.flex.string(from: snapshot.checked), "error_count": snapshot.errorCount, "paused": paused, "idle_prevention": assertion != 0, "message": snapshot.message, "channel": ["state": snapshot.channelState, "detail": snapshot.channelDetail, "consecutive_no_live": snapshot.channelFailures, "checked_at": snapshot.channelChecked.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "auto_recovery_enabled": recoveryLedger.autoRecoveryEnabled, "last_recovery_attempt": recoveryLedger.lastAttempt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "last_ping_at": lastPingAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "last_ping_result": lastPingResult, "check_deferred_reason": deferredReason, "recovery_status": recoveryAvailability(), "last_recovery_result": lastRecoveryOutcome as Any? ?? NSNull()], "menu": ["menubar_title": item.button?.title ?? "", "menubar_has_icon": item.button?.image != nil, "connection": summaryLines[0].title, "channel": summaryLines[0].title, "tool_execution": summaryLines[1].title, "action": summaryLines[2].title, "recovery": summaryLines[3].title, "chatgpt": summaryLines[4].title, "execution_step_rows": rows, "execution_steps": safeSteps, "tool_call_elapsed_seconds": callElapsed as Any? ?? NSNull(), "tool_call_state": currentState, "recent_actions": snapshot.activity.recent], "activity": ["state": snapshot.activity.state, "tool": snapshot.activity.tool, "active_count": snapshot.activity.activeCount, "observed_at": snapshot.activity.observed.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "recent": snapshot.activity.recent, "error": snapshot.activity.error, "coverage_gap": snapshot.activity.coverageGap, "gap_reason": snapshot.activity.gapReason, "gap_first_at": snapshot.activity.gapFirstAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "gap_last_at": snapshot.activity.gapLastAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "backlog_bytes": snapshot.activity.backlogBytes, "catching_up": snapshot.activity.catchingUp, "pending_line": snapshot.activity.pendingLine, "idle_proven": snapshot.activity.idleProven], "timeline": ["coverage": snapshot.timeline.coverage, "commander_errors_this_run": snapshot.timeline.commanderErrors, "conversation_labels_verified_at": snapshot.timeline.conversationLabelsVerifiedAt as Any? ?? NSNull(), "last_chatgpt_app_event": lastAppEvent, "events": timelineRows]]
+        var object: [String: Any] = ["chatgpt": ["answer": chat.answer, "update_connection": chat.connection, "recent_issue": chat.history as Any? ?? NSNull(), "coverage": snapshot.timeline.coverage, "delivery_timeout_directly_observable": false, "limitation": chat.deliveryLimit], "service": snapshot.service, "cloud": snapshot.cloud, "last_seen": snapshot.lastSeen.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "checked_at": ISO8601DateFormatter.flex.string(from: snapshot.checked), "error_count": snapshot.errorCount, "paused": paused, "idle_prevention": assertion != 0, "message": snapshot.message, "channel": ["state": snapshot.channelState, "detail": snapshot.channelDetail, "consecutive_no_live": snapshot.channelFailures, "checked_at": snapshot.channelChecked.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "auto_recovery_enabled": recoveryLedger.autoRecoveryEnabled, "last_recovery_attempt": recoveryLedger.lastAttempt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "last_ping_at": lastPingAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "last_ping_result": lastPingResult, "check_deferred_reason": deferredReason, "recovery_status": recoveryAvailability(), "last_recovery_result": lastRecoveryOutcome as Any? ?? NSNull()], "menu": ["menubar_title": item.button?.title ?? "", "menubar_has_icon": item.button?.image != nil, "connection": summaryLines[0].title, "channel": summaryLines[0].title, "tool_execution": summaryLines[1].title, "action": summaryLines[2].title, "recovery": summaryLines[3].title, "chatgpt": summaryLines[4].title, "execution_step_rows": rows, "execution_steps": safeSteps, "tool_call_elapsed_seconds": callElapsed as Any? ?? NSNull(), "tool_call_state": currentState, "recent_actions": snapshot.activity.recent], "activity": ["state": snapshot.activity.state, "tool": snapshot.activity.tool, "active_count": snapshot.activity.activeCount, "observed_at": snapshot.activity.observed.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "recent": snapshot.activity.recent, "error": snapshot.activity.error, "coverage_gap": snapshot.activity.coverageGap, "gap_reason": snapshot.activity.gapReason, "gap_first_at": snapshot.activity.gapFirstAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "gap_last_at": snapshot.activity.gapLastAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "backlog_bytes": snapshot.activity.backlogBytes, "catching_up": snapshot.activity.catchingUp, "pending_line": snapshot.activity.pendingLine, "idle_proven": snapshot.activity.idleProven], "timeline": ["coverage": snapshot.timeline.coverage, "commander_errors_this_run": snapshot.timeline.commanderErrors, "conversation_labels_verified_at": snapshot.timeline.conversationLabelsVerifiedAt as Any? ?? NSNull(), "last_chatgpt_app_event": lastAppEvent, "events": timelineRows]]
         object["tool_execution"] = ["state": snapshot.toolExecutionState, "detail": snapshot.toolExecutionDetail, "checked_at": snapshot.toolExecutionChecked.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "fresh": toolExecutionFresh(snapshot, now: Date()), "evidence_ttl_seconds": Int(toolExecutionEvidenceTTL), "probe_deferred_reason": toolProbeDeferredReason]
         object["channel_incident"] = [
             "active": channelIncident.activeCategory != nil,
@@ -3629,17 +3728,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         panelToolExecutionDetail?.stringValue = middleTruncate(toolProbeBusy ? "正在执行只读工具检查" : snapshot.toolExecutionDetail, limit: 56)
 
         let chat = chatMonitorSummary(snapshot.timeline)
-        if let issue = snapshot.timeline.latestAppIssue,
-           let issueAt = ISO8601DateFormatter.parse(issue.sourceAt ?? issue.observedAt) {
-            let recent = now.timeIntervalSince(issueAt) >= 0 && now.timeIntervalSince(issueAt) <= 900
-            panelChat?.stringValue = recent ? "回答异常（恢复未确认）" : "历史异常 · 原回答未确认"
-            panelChat?.textColor = recent ? .systemOrange : .secondaryLabelColor
-            panelChatTime?.stringValue = "回答问题：\(prominentStamp(issueAt))"
+        panelChat?.stringValue = chat.answer
+        if chat.answer.contains("异常") {
+            panelChat?.textColor = .systemOrange
+        } else if chat.answer.contains("未知") {
+            panelChat?.textColor = .secondaryLabelColor
         } else {
-            panelChat?.stringValue = chat.answer; panelChat?.textColor = .labelColor
-            panelChatTime?.stringValue = "回答问题：暂无"
+            panelChat?.textColor = .systemGreen
         }
-        panelChatDetail?.stringValue = middleTruncate("更新连接：\(chat.connection)", limit: 56)
+        let latestAppAt = snapshot.timeline.latestAppEvent.flatMap { ISO8601DateFormatter.parse($0.sourceAt ?? $0.observedAt) }
+        panelChatTime?.stringValue = "最近事件：\(prominentStamp(latestAppAt))"
+        panelChatDetail?.stringValue = middleTruncate(chat.connection, limit: 56)
 
 
         panelRecoveryToggle?.state = recoveryLedger.autoRecoveryEnabled ? .on : .off
@@ -3799,7 +3898,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             if channelIncident.activeCategory == nil {
                 issueRows.append(("恢复时间", stamp(channelIncident.recoveredAt)))
             }
-            sections.append(section("最近一次连接问题", rows: issueRows))
+            sections.append(section("最近一次 Commander 连接问题", rows: issueRows))
+        }
+
+        let chat = chatMonitorSummary(snapshot.timeline)
+        if let issue = snapshot.timeline.latestAppIssue,
+           let issueAt = ISO8601DateFormatter.parse(issue.sourceAt ?? issue.observedAt) {
+            let issueName: String
+            if issue.event == "chatgpt_completion_transport_recovery_poll_failed" {
+                issueName = "回答恢复检查失败"
+            } else if issue.event == "chatgpt_completion_transport_recovery_started" {
+                issueName = issue.failureKind == "resume_unavailable" ? "恢复流不可用" : "响应恢复尝试"
+            } else {
+                issueName = "对话状态刷新失败"
+            }
+            sections.append(section("最近一次 ChatGPT 异常", rows: [
+                ("问题", issueName),
+                ("发生时间", stamp(issueAt)),
+                ("当前情况", chat.history ?? "恢复情况未确认")
+            ]))
         }
 
         var notices: [(String, String)] = []
@@ -3991,7 +4108,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let issue = TimelineEvent(source: "chatgpt_app", event: "chatgpt_completion_transport_recovery_started", sourceAt: makeTime(-65), observedAt: makeTime(-64), conversationTitle: "设计讨论", failureKind: "resume_unavailable")
         let app = TimelineEvent(source: "chatgpt_app", event: "chatgpt_conversation_refetch_completed · error", sourceAt: makeTime(-58), observedAt: makeTime(-57), conversationTitle: "功能排查")
         let closed = TimelineEvent(source: "chatgpt_app", event: "chatgpt_pubsub_transport_closed", sourceAt: makeTime(-70), observedAt: makeTime(-69))
-        snapshot.timeline = TimelineSummary(coverage: "读取正常 · 示例", events: [closed, issue, app], history: [closed, issue, app], commanderErrors: 0, latestAppEvent: app, latestAppIssue: app, conversationLabelsVerifiedAt: makeTime(-3600))
+        let reopened = TimelineEvent(source: "chatgpt_app", event: "chatgpt_pubsub_transport_opened", sourceAt: makeTime(-30), observedAt: makeTime(-29))
+        let idle = TimelineEvent(source: "chatgpt_app", event: "chatgpt_conversation_refetch_completed · idle", sourceAt: makeTime(-20), observedAt: makeTime(-19), conversationTitle: "功能排查")
+        snapshot.timeline = TimelineSummary(coverage: "读取正常 · 示例", events: [closed, issue, app, reopened, idle], history: [closed, issue, app, reopened, idle], commanderErrors: 0, latestAppEvent: idle, latestAppIssue: app, conversationLabelsVerifiedAt: makeTime(-3600))
         render()
     }
     private func verifyPanelLayout() {
@@ -4011,6 +4130,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             }
         }
         panelPage = 0; renderPanel(); root.layoutSubtreeIfNeeded(); scroll.layoutSubtreeIfNeeded()
+        verify(panelChat?.stringValue == "当前连接正常", "Historical ChatGPT issues must not replace the current healthy state")
         verify(panelSectionCount == 2, "Overview must stay focused on status and current task")
         if let overviewRoot = scroll.documentView as? TopAlignedPanelDocumentView,
            let overviewStack = overviewRoot.subviews.first as? NSStackView {
