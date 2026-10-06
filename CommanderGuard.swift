@@ -2834,6 +2834,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private var panelScroll: NSScrollView?
     private var panelNav: NSSegmentedControl?
     private var panelHeading: NSStackView?
+    private var panelHeroes: NSStackView?
+    private var panelControlCard: NSView?
     private var panelHeroMinimum: NSLayoutConstraint?
     private var panelConnection: NSTextField?
     private var panelConnectionTime: NSTextField?
@@ -2847,12 +2849,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private var panelRecoveryToggle: NSButton?
     private var panelRecoveryStatus: NSTextField?
     private var panelWakeToggle: NSButton?
-    private var logTextView: NSTextView?
     private var recordSearch: NSSearchField?
     private var recordFilter: NSPopUpButton?
     private var recordTable: NSTableView?
     private var recordTableScroll: NSScrollView?
-    private var recordDocument: NSStackView?
+    private var recordDocument: NSView?
     private var recordDetail: NSTextField?
     private var recordSteps: [ActivityStep] = []
     private var selectedRecordID: String?
@@ -3522,6 +3523,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         panelToolExecution = toolValue; panelToolExecutionTime = toolTime; panelToolExecutionDetail = toolDetail
         panelChat = chatValue; panelChatTime = chatTime; panelChatDetail = chatDetail
         let heroes = NSStackView(); heroes.orientation = .horizontal; heroes.spacing = 10; heroes.distribution = .fillEqually
+        panelHeroes = heroes
         let commandCard = heroCard("消息通道", value: commandValue, time: commandTime, detail: commandDetail)
         let toolCard = heroCard("工具执行", value: toolValue, time: toolTime, detail: toolDetail)
         let chatCard = heroCard("ChatGPT 回答", value: chatValue, time: chatTime, detail: chatDetail)
@@ -3549,10 +3551,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         panelRecoveryStatus = recoveryStatus
         controlContent.addArrangedSubview(recoveryStatus)
         let controlCard = card(controlContent, padding: 16)
+        panelControlCard = controlCard
         layout.addArrangedSubview(controlCard)
         controlCard.widthAnchor.constraint(equalTo: layout.widthAnchor, constant: -56).isActive = true
 
-        let nav = NSSegmentedControl(labels: ["概览", "操作记录", "连接诊断"], trackingMode: .selectOne, target: self, action: #selector(panelPageChanged(_:)))
+        let nav = NSSegmentedControl(labels: ["概览", "操作记录", "连接状态"], trackingMode: .selectOne, target: self, action: #selector(panelPageChanged(_:)))
         nav.selectedSegment = panelPage; nav.segmentStyle = .rounded; nav.heightAnchor.constraint(equalToConstant: 32).isActive = true
         panelNav = nav; layout.addArrangedSubview(nav)
         let scroll = NSScrollView(); scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true; scroll.drawsBackground = false
@@ -3564,7 +3567,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
     private func stamp(_ date: Date?) -> String { date.map { DateFormatter.localizedString(from: $0, dateStyle: .medium, timeStyle: .medium) } ?? "暂无" }
     private func prominentStamp(_ date: Date?) -> String { date.map { let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd HH:mm:ss"; return f.string(from: $0) } ?? "暂无" }
-    private func eventStamp(_ event: TimelineEvent) -> String { stamp(ISO8601DateFormatter.parse(event.sourceAt ?? event.observedAt)) }
     private func displayPingResult(_ value: String) -> String { value.replacingOccurrences(of: "ping 成功", with: "命令连接检查成功") }
     private func currentDiagnosis(now: Date = Date()) -> IncidentDiagnosis {
         if let category = channelIncident.activeCategory {
@@ -3593,7 +3595,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                                      startedAt: nil,
                                      lastSeenAt: snapshot.channelChecked,
                                      nextAction: "无需因最近故障记录重复重启；继续观察当前通道和工具执行状态。",
-                                     evidence: "当前健康状态与最近故障记录分开保存；最近故障仍可在连接诊断中查看。")
+                                     evidence: "当前健康状态与最近故障记录分开保存；最近故障仍可在“连接状态”中查看。")
         }
         return base
     }
@@ -3669,106 +3671,214 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
     private func renderPanelPage() {
         guard panelWindow != nil else { return }
-        panelHeading?.isHidden = panelPage == 1
-        panelConnectionDetail?.isHidden = panelPage == 1
-        panelToolExecutionDetail?.isHidden = panelPage == 1
-        panelChatDetail?.isHidden = panelPage == 1
-        panelHeroMinimum?.constant = panelPage == 1 ? 64 : 76
-        if panelPage == 1 { renderLogPage(); return }
-        let chat = chatMonitorSummary(snapshot.timeline)
+        let recordsPage = panelPage == 1
+        panelHeading?.isHidden = panelPage != 0
+        panelHeroes?.isHidden = recordsPage
+        panelControlCard?.isHidden = recordsPage
+        panelConnectionDetail?.isHidden = recordsPage
+        panelToolExecutionDetail?.isHidden = recordsPage
+        panelChatDetail?.isHidden = recordsPage
+        panelHeroMinimum?.constant = recordsPage ? 0 : 76
+        panelScroll?.hasVerticalScroller = !recordsPage
+        if recordsPage { renderLogPage(); return }
+
         let activity = snapshot.activity
-        let events = visibleTimelineEvents(snapshot.timeline.history).sorted { ($0.sourceAt ?? $0.observedAt) > ($1.sourceAt ?? $1.observedAt) }
-        let activeFault = channelIncident.activeCategory?.title ?? "无活动故障"
-        let channelRows: [(String, String)] = [
-            ("当前健康", channelSummary(snapshot, now: Date())),
-            ("当前故障", activeFault),
-            ("处置状态", channelIncidentHandling()),
-            ("首次发现", stamp(channelIncident.firstSeen)),
-            ("最近发生", stamp(channelIncident.lastSeen)),
-            ("最近检查", stamp(channelIncident.lastProbeAt ?? lastPingAt)),
-            ("最近故障", recentChannelIncidentSummary()),
-            ("一次性告警", channelIncident.activeCategory == .cloudRealtimeCapacity && channelIncident.alertIssued ? "本次容量故障已记录；不会重复触发" : "无"),
-            ("恢复时间", stamp(channelIncident.recoveredAt))
-        ]
         if panelPage == 0 {
             let diagnosis = currentDiagnosis()
-            let active = currentCallStep(activity)
-            let action = active.map { "\($0.detail) · \($0.historical ? "开始时间未知" : stamp($0.startedAt))" } ?? callState(activity)
-            let recent = groupedTimelineEvents(events).prefix(5).map { event, count in
-                (eventStamp(event), (event.source == "chatgpt_app" ? appEventLabel(event) : commanderEventLabel(event.event)) + (count > 1 ? " ×\(count)" : ""))
+            var activityRows: [(String, String)] = []
+            if let active = currentCallStep(activity) {
+                activityRows.append(("状态", "正在执行"))
+                activityRows.append(("操作", active.detail))
+                activityRows.append(("已运行", durationText(active.elapsed(at: ProcessInfo.processInfo.systemUptime))))
+            } else {
+                activityRows.append(("状态", "当前没有正在执行的本机操作"))
+            }
+            if activity.error {
+                activityRows.append(("注意", "本机操作日志暂时不可读；Guard 不会据此判断空闲或自动重启"))
+            } else if activity.coverageGap {
+                activityRows.append(("注意", "本机操作日志存在覆盖缺口；Guard 会保持保守，不自动重启"))
+            } else if activity.catchingUp || activity.pendingLine {
+                activityRows.append(("注意", "本机操作日志仍在追赶；Guard 暂不判断为空闲"))
             }
             setSections([
-                section("当前需要处理", rows: [("判断", diagnosis.title), ("下一步", diagnosis.nextAction), ("首次观察", stamp(diagnosis.startedAt)), ("最近观察", stamp(diagnosis.lastSeenAt)), ("说明", diagnosis.evidence)]),
-                section("Commander 通道处置", subtitle: "当前健康与最近故障分开显示；持续异常只做有限频率的只读复查", rows: channelRows),
-                section("当前活动", subtitle: "仅表示本机已观察到的调用", rows: [("状态", action), ("日志", activity.error ? "暂时不可读" : activity.coverageGap ? "覆盖缺口 · \(activity.gapReason)" : activity.catchingUp ? "追赶中" : "读取正常")]),
-                section("最近事件", subtitle: "顶部三张状态卡已显示当前链路状态；这里仅保留事件经过", rows: recent.isEmpty ? [("记录", "暂无连接或异常事件")] : recent)
+                section("现在怎么样", rows: [("状态", diagnosis.title), ("你需要做", diagnosis.nextAction)]),
+                section("当前操作", rows: activityRows)
             ])
-        } else {
-            let diagnosis = currentDiagnosis()
-            let remaining = recoveryLedger.lastAttempt.map { max(0, 300 - Int(Date().timeIntervalSince($0))) }
-            let recent = groupedTimelineEvents(events).prefix(20).map { event, count in
-                (eventStamp(event), "\(event.source == "chatgpt_app" ? "ChatGPT" : "Commander") · \(event.source == "chatgpt_app" ? appEventLabel(event) : commanderEventLabel(event.event))" + (count > 1 ? " ×\(count)" : ""))
-            }
-            setSections([
-                section("诊断与下一步", rows: [("判断", diagnosis.title), ("建议", diagnosis.nextAction), ("首次观察", stamp(diagnosis.startedAt)), ("最近观察", stamp(diagnosis.lastSeenAt)), ("证据范围", diagnosis.evidence)]),
-                section("Commander 通道处置", subtitle: "只保存脱敏类别、时间、检查与恢复决策；不保存原始错误响应", rows: channelRows),
-                section("Commander 诊断依据", subtitle: "不重复顶部状态与时间，只显示额外证据", rows: [("服务", snapshot.service), ("云端登记", snapshot.cloud), ("通道说明", displayPingResult(snapshot.channelDetail)), ("工具依据", snapshot.toolExecutionDetail), ("工具检查暂缓", toolProbeBusy ? "正在检查" : toolProbeDeferredReason), ("手动检查", displayPingResult(manualNotice ?? deferredReason))]),
-                section("自动恢复", rows: [("状态", recoveryAvailability()), ("冷却剩余", remaining.map { "\($0) 秒" } ?? "无"), ("最近尝试", stamp(recoveryLedger.lastAttempt)), ("最近结果", lastRecoveryOutcome ?? (recoveryLedger.lastAttempt == nil ? "暂无恢复尝试" : "本次运行未观察到结果"))]),
-                section("ChatGPT 观察范围", subtitle: "回答状态与更新连接已在顶部显示", rows: [("监控范围", "仅当前本机 App 的固定事件；其他设备或网页提示可能不可见"), ("覆盖限制", chat.deliveryLimit), ("处理建议", "回原对话确认回答状态，核对操作记录后再决定是否继续")]),
-                section("日志覆盖", rows: [("本机活动", callState(activity)), ("调用日志", activity.error ? "暂时不可读" : activity.coverageGap ? "覆盖缺口 · \(activity.gapReason)" : activity.catchingUp ? "追赶中 · 剩余 \(activity.backlogBytes) 字节" : "当前未发现覆盖缺口"), ("结构化历史", snapshot.toolHistory.state), ("最近结构化记录", toolHistoryLatestSummary()), ("结构化限制", "无可靠调用编号；不按时间与会话或上方记录强行合并，也不能单独证明空闲"), ("缺口首次", stamp(activity.gapFirstAt)), ("缺口最近", stamp(activity.gapLastAt)), ("时间线", snapshot.timeline.coverage)]),
-                section("连接与异常", subtitle: "最多 20 条 · 新事件在前", rows: recent.isEmpty ? [("记录", "暂无连接事件")] : recent)
-            ])
+            return
         }
-    }
-    private func sourceColor(_ title: String) -> NSColor {
-        let colors: [NSColor] = [.systemBlue, .systemTeal, .systemPurple, .systemOrange, .systemPink]
-        return colors[Int(Array(SHA256.hash(data: Data(title.utf8)))[0]) % colors.count]
+
+        let now = Date()
+        let guardAction: String
+        if channelIncident.activeCategory == .cloudRealtimeCapacity {
+            guardAction = channelBusy || manualPingBusy ? "正在复查云端实时连接" : "正在等待云端恢复，并按退避节奏自动复查"
+        } else if channelIncident.activeCategory != nil {
+            if channelBusy || manualPingBusy {
+                guardAction = "正在复查 Commander 连接"
+            } else if let next = channelIncident.nextRecheck, next > now {
+                let seconds = max(1, Int(next.timeIntervalSince(now).rounded(.up)))
+                guardAction = "连接仍有异常，约 \(seconds) 秒后自动复查"
+            } else {
+                guardAction = "连接仍有异常，准备再次复查"
+            }
+        } else if watchdog.recovering {
+            guardAction = "正在执行安全恢复，并等待恢复结果"
+        } else if channelBusy || manualPingBusy {
+            guardAction = "正在检查 Commander 连接"
+        } else {
+            guardAction = "持续监控中；当前无需你操作"
+        }
+
+        let recoveryText: String
+        if localRestartSuppressed(for: channelIncident.activeCategory) {
+            recoveryText = "云端容量异常，本机不会重启；Guard 只等待并复查"
+        } else if !recoveryLedger.autoRecoveryEnabled {
+            recoveryText = "已关闭；断线时只提示，不会自动重启 Commander"
+        } else if watchdog.recovering {
+            recoveryText = "正在安全恢复 Commander"
+        } else if !recoveryLedger.canAttempt(at: now) {
+            recoveryText = "已开启；刚执行过恢复，当前处于冷却期"
+        } else if snapshot.service != "运行中" {
+            recoveryText = "已开启；正在等待 Commander 服务恢复"
+        } else if !activitySafeForRecovery(activity) {
+            if activity.activeCount > 0 {
+                recoveryText = "已开启；当前有本机任务，为避免打断暂不重启"
+            } else {
+                recoveryText = "已开启；当前无法确认安全空闲，为避免误伤暂不重启"
+            }
+        } else {
+            recoveryText = "已开启；只有明确断链且确认安全时才会重启 Commander"
+        }
+
+        var sections: [NSView] = [
+            section("Guard 正在做什么", rows: [
+                ("状态", guardAction),
+                ("自动恢复", recoveryText),
+                ("最近检查", stamp(channelIncident.lastProbeAt ?? lastPingAt))
+            ])
+        ]
+
+        if let recentCategory = channelIncident.recentCategory {
+            let result = channelIncident.activeCategory == nil ? "已恢复" : "仍在发生"
+            var issueRows: [(String, String)] = [
+                ("问题", recentCategory.title),
+                ("状态", result),
+                ("首次发现", stamp(channelIncident.firstSeen)),
+                ("最近发生", stamp(channelIncident.lastSeen))
+            ]
+            if channelIncident.activeCategory == nil {
+                issueRows.append(("恢复时间", stamp(channelIncident.recoveredAt)))
+            }
+            sections.append(section("最近一次连接问题", rows: issueRows))
+        }
+
+        var notices: [(String, String)] = []
+        if activity.error || activity.coverageGap || activity.catchingUp || activity.pendingLine {
+            notices.append(("自动恢复", "本机操作记录暂时不完整，因此 Guard 不会冒险重启 Commander"))
+        }
+        if !notices.isEmpty {
+            sections.append(section("需要你知道", rows: notices))
+        }
+        setSections(sections)
     }
     private func renderLogPage() {
         guard let scroll = panelScroll else { return }
-        let doc: NSStackView
+        let doc: NSView
         if let document = recordDocument {
             doc = document
         } else {
-            doc = vertical(12)
-            doc.translatesAutoresizingMaskIntoConstraints = false
-            let search = NSSearchField(); search.placeholderString = "搜索命令、工具、路径或会话"; (search.cell as? NSSearchFieldCell)?.sendsSearchStringImmediately = true
-            search.target = self; search.action = #selector(recordSearchChanged(_:)); recordSearch = search
-            let filter = NSPopUpButton(); filter.addItems(withTitles: ["全部", "进行中", "异常与未确认"])
-            filter.target = self; filter.action = #selector(recordFilterChanged(_:)); recordFilter = filter
-            let controls = NSStackView(views: [search, filter]); controls.orientation = .horizontal; controls.spacing = 10
-            search.widthAnchor.constraint(greaterThanOrEqualToConstant: 260).isActive = true
+            let root = NSView(frame: scroll.contentView.bounds)
+            root.autoresizingMask = [.width, .height]
+            doc = root
+            scroll.documentView = doc
+            recordDocument = doc
+
+            let title = label("本机操作记录", size: 16, weight: .semibold)
+            let hint = label("点击一条记录查看脱敏后的时间、状态、耗时和操作详情。", size: 12, color: .secondaryLabelColor)
+            title.translatesAutoresizingMaskIntoConstraints = false
+            hint.translatesAutoresizingMaskIntoConstraints = false
+
+            let search = NSSearchField()
+            search.placeholderString = "搜索命令、工具、路径或会话"
+            (search.cell as? NSSearchFieldCell)?.sendsSearchStringImmediately = true
+            search.target = self
+            search.action = #selector(recordSearchChanged(_:))
+            search.setContentHuggingPriority(.defaultLow, for: .horizontal)
+            recordSearch = search
+
+            let filter = NSPopUpButton()
+            filter.addItems(withTitles: ["全部", "进行中", "异常与未确认"])
+            filter.target = self
+            filter.action = #selector(recordFilterChanged(_:))
             filter.widthAnchor.constraint(equalToConstant: 180).isActive = true
-            doc.addArrangedSubview(label("本机操作记录 · 最多 100 条", size: 14, weight: .semibold))
-            doc.addArrangedSubview(label("会话关联只使用上游明确提供的匿名会话字段；字段缺失时保持“归属未确认”，不按时间或前台窗口猜测。", size: 12, color: .secondaryLabelColor))
-            doc.addArrangedSubview(controls)
+            recordFilter = filter
+
+            let controls = NSStackView(views: [search, filter])
+            controls.orientation = .horizontal
+            controls.spacing = 10
+            controls.translatesAutoresizingMaskIntoConstraints = false
+
             let detail = label("选择一条记录查看详情", size: 13)
             detail.isSelectable = true
             recordDetail = detail
-            let detailCard = card(detail, padding: 14); doc.addArrangedSubview(detailCard)
-            detailCard.widthAnchor.constraint(equalTo: doc.widthAnchor).isActive = true
-            let table = NSTableView(); table.headerView = nil; table.rowHeight = 44; table.delegate = self; table.dataSource = self
-            let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("record")); column.title = "本机操作"; column.width = 660
-            table.addTableColumn(column); table.usesAlternatingRowBackgroundColors = true
-            let tableScroll = NSScrollView(); tableScroll.hasVerticalScroller = true; tableScroll.documentView = table
-            tableScroll.heightAnchor.constraint(equalToConstant: 230).isActive = true
-            recordTable = table; recordTableScroll = tableScroll; doc.addArrangedSubview(tableScroll)
-            let eventTitle = label("ChatGPT App 事件 · 最近 25 条 · 原始事件时间", size: 15, weight: .semibold)
-            doc.addArrangedSubview(eventTitle)
-            let eventsText = NSTextView(); eventsText.isEditable = false; eventsText.isSelectable = true; eventsText.isRichText = true
-            eventsText.font = .monospacedSystemFont(ofSize: 12, weight: .regular); eventsText.textContainerInset = NSSize(width: 10, height: 8)
-            eventsText.isVerticallyResizable = true; eventsText.isHorizontallyResizable = false; eventsText.textContainer?.widthTracksTextView = true
-            eventsText.heightAnchor.constraint(greaterThanOrEqualToConstant: 90).isActive = true
-            doc.addArrangedSubview(eventsText); logTextView = eventsText
-            scroll.documentView = doc
-            recordDocument = doc
-            NSLayoutConstraint.activate([doc.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor), doc.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor), doc.topAnchor.constraint(equalTo: scroll.contentView.topAnchor)])
+            let detailCard = card(detail, padding: 14)
+            detailCard.translatesAutoresizingMaskIntoConstraints = false
+
+            let table = NSTableView()
+            table.headerView = nil
+            table.rowHeight = 44
+            table.delegate = self
+            table.dataSource = self
+            table.usesAlternatingRowBackgroundColors = true
+            table.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
+
+            let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("record"))
+            column.title = "本机操作"
+            column.minWidth = 500
+            column.width = 900
+            column.resizingMask = .autoresizingMask
+            table.addTableColumn(column)
+
+            let tableScroll = NSScrollView()
+            tableScroll.hasVerticalScroller = true
+            tableScroll.hasHorizontalScroller = false
+            tableScroll.autohidesScrollers = true
+            tableScroll.documentView = table
+            tableScroll.translatesAutoresizingMaskIntoConstraints = false
+            recordTable = table
+            recordTableScroll = tableScroll
+
+            [title, hint, controls, detailCard, tableScroll].forEach { root.addSubview($0) }
+            NSLayoutConstraint.activate([
+                title.topAnchor.constraint(equalTo: root.topAnchor),
+                title.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+                title.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+
+                hint.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 6),
+                hint.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+                hint.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+
+                controls.topAnchor.constraint(equalTo: hint.bottomAnchor, constant: 12),
+                controls.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+                controls.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+
+                detailCard.topAnchor.constraint(equalTo: controls.bottomAnchor, constant: 12),
+                detailCard.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+                detailCard.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+
+                tableScroll.topAnchor.constraint(equalTo: detailCard.bottomAnchor, constant: 12),
+                tableScroll.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+                tableScroll.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+                tableScroll.bottomAnchor.constraint(equalTo: root.bottomAnchor)
+            ])
         }
+
         if scroll.documentView !== doc { scroll.documentView = doc }
+        doc.frame = scroll.contentView.bounds
         let oldOrigin = scroll.contentView.bounds.origin
         let oldTableOrigin = recordTableScroll?.contentView.bounds.origin ?? .zero
         let query = recordSearch?.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
         let mode = recordFilter?.indexOfSelectedItem ?? 0
+
         recordSteps = snapshot.activity.steps.filter { step in
             let owner = step.sessionAttributionConflict ? "归属冲突" : (CommanderActivity.sessionDisplay(step.sessionKey) ?? "归属未确认")
             let text = "\(step.tool) \(step.detail) \(owner) \(step.sessionSource ?? "")".lowercased()
@@ -3776,36 +3886,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             let matchesMode = mode == 0 || (mode == 1 ? (!step.finished && !step.failed && !step.uncertain) : (step.failed || step.uncertain))
             return matchesQuery && matchesMode
         }
+
         if !recordSteps.contains(where: { $0.id == selectedRecordID }) { selectedRecordID = recordSteps.first?.id }
         recordTable?.reloadData()
         if let selectedRecordID, let index = recordSteps.firstIndex(where: { $0.id == selectedRecordID }) {
             recordTable?.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
         }
         updateRecordDetail()
-        let output = NSMutableAttributedString()
-        func append(_ value: String, color: NSColor = .labelColor, weight: NSFont.Weight = .regular) {
-            output.append(NSAttributedString(string: value, attributes: [.font: NSFont.monospacedSystemFont(ofSize: 12, weight: weight), .foregroundColor: color]))
-        }
-        for event in snapshot.timeline.history.filter({ $0.source == "chatgpt_app" }).sorted(by: { ($0.sourceAt ?? $0.observedAt) < ($1.sourceAt ?? $1.observedAt) }).suffix(25) {
-            append("\(eventStamp(event))  ", color: .secondaryLabelColor)
-            if let title = event.conversationTitle { append("[\(title)]  ", color: sourceColor(title), weight: .semibold) }
-            else { append("[来源未识别]  ", color: .tertiaryLabelColor) }
-            let value = appEventLabel(event), prefix = event.conversationTitle.map { "\($0) · " } ?? ""
-            append("\(!prefix.isEmpty && value.hasPrefix(prefix) ? String(value.dropFirst(prefix.count)) : value)\n")
-        }
-        if output.length == 0 { append("暂无 ChatGPT App 事件\n", color: .secondaryLabelColor) }
-        if let text = logTextView {
-            let selection = text.selectedRange(), selected = selection.length > 0 && NSMaxRange(selection) <= (text.string as NSString).length ? (text.string as NSString).substring(with: selection) : ""
-            text.textStorage?.setAttributedString(output)
-            if !selected.isEmpty { let range = (output.string as NSString).range(of: selected); if range.location != NSNotFound { text.setSelectedRange(range) } }
-        }
+
+        scroll.layoutSubtreeIfNeeded()
         doc.layoutSubtreeIfNeeded()
         if let table = recordTable, let tableScroll = recordTableScroll {
-            table.setFrameSize(NSSize(width: max(660, tableScroll.contentView.bounds.width), height: max(tableScroll.contentView.bounds.height, CGFloat(recordSteps.count) * table.rowHeight)))
-            table.sizeLastColumnToFit()
+            tableScroll.layoutSubtreeIfNeeded()
+            let width = max(500, tableScroll.contentView.bounds.width)
+            table.setFrameSize(NSSize(width: width, height: max(tableScroll.contentView.bounds.height, CGFloat(recordSteps.count) * table.rowHeight)))
+            if let column = table.tableColumns.first { column.width = width }
         }
-        scroll.contentView.scroll(to: oldOrigin); scroll.reflectScrolledClipView(scroll.contentView)
-        if let tableScroll = recordTableScroll { tableScroll.contentView.scroll(to: oldTableOrigin); tableScroll.reflectScrolledClipView(tableScroll.contentView) }
+
+        scroll.contentView.scroll(to: oldOrigin)
+        scroll.reflectScrolledClipView(scroll.contentView)
+        if let tableScroll = recordTableScroll {
+            tableScroll.contentView.scroll(to: oldTableOrigin)
+            tableScroll.reflectScrolledClipView(tableScroll.contentView)
+        }
     }
     @objc private func recordSearchChanged(_ sender: NSSearchField) { renderLogPage() }
     @objc private func recordFilterChanged(_ sender: NSPopUpButton) { renderLogPage() }
@@ -3876,9 +3979,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                 verify(scroll.documentView != nil, "panel page \(page) is empty")
             }
         }
-        panelPage = 1; renderPanel()
-        guard let text = logTextView else { fputs("CommanderGuard UI check failed: records are missing\n", stderr); exit(2) }
-        verify((10...12).contains(panelConnectionTime?.font?.pointSize ?? 0) && (10...12).contains(panelToolExecutionTime?.font?.pointSize ?? 0) && (10...12).contains(panelChatTime?.font?.pointSize ?? 0), "layer timestamps are not secondary to state")
+        panelPage = 0; renderPanel(); root.layoutSubtreeIfNeeded()
+        if let overview = scroll.documentView as? NSStackView {
+            verify(overview.arrangedSubviews.count == 2, "Overview must stay focused on status and current operation")
+        }
+        panelPage = 2; renderPanel(); root.layoutSubtreeIfNeeded()
+        if let connection = scroll.documentView as? NSStackView {
+            verify(connection.arrangedSubviews.count <= 3, "Connection status must not become a feature inventory")
+        }
+        verify(panelNav?.label(forSegment: 2) == "连接状态", "Third tab must use user-facing wording")
+
+        panelPage = 1; renderPanel(); root.layoutSubtreeIfNeeded(); scroll.layoutSubtreeIfNeeded()
+        guard let table = recordTable, let tableScroll = recordTableScroll else { fputs("CommanderGuard UI check failed: records are missing\n", stderr); exit(2) }
+        verify(tableScroll.frame.width >= scroll.contentView.bounds.width * 0.95, "Operation table must use the available page width (table \(Int(tableScroll.frame.width)), page \(Int(scroll.contentView.bounds.width)))")
+        verify((table.tableColumns.first?.width ?? 0) >= tableScroll.contentView.bounds.width * 0.85, "Operation column must expand with the page")
+        verify(panelHeroes?.isHidden == true && panelControlCard?.isHidden == true, "Records page must prioritize records over repeated status controls")
         precondition(recordSteps.count == 4, "Record page must expose all source rows")
         recordFilter?.selectItem(at: 1); renderLogPage()
         precondition(recordSteps.count == 1 && recordSteps[0].id == "preview-2", "Ongoing filter must match only ongoing work")
@@ -3889,26 +4004,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         recordSearch?.stringValue = "会话"; recordFilter?.selectItem(at: 0); renderLogPage()
         precondition(recordSteps.count == 2 && recordSteps.allSatisfy { $0.sessionKey != nil }, "Session search must match attributed rows only")
         recordSearch?.stringValue = ""; renderLogPage()
-        guard let table = recordTable, let selected = recordSteps.firstIndex(where: { $0.id == "preview-2" }) else { preconditionFailure("Filtered record rows are missing") }
+        guard let selected = recordSteps.firstIndex(where: { $0.id == "preview-2" }) else { preconditionFailure("Filtered record rows are missing") }
         table.selectRowIndexes(IndexSet(integer: selected), byExtendingSelection: false)
         precondition(recordDetail?.stringValue.contains("swift test --filter ConnectionTests") == true && recordDetail?.stringValue.contains("归属：会话 ") == true, "Selecting a row must reveal safe command and anonymized session attribution")
         let selectedID = selectedRecordID
         renderPanel()
         precondition(selectedRecordID == selectedID && recordDetail?.stringValue.contains("swift test --filter ConnectionTests") == true, "Selected record detail must survive refresh")
-        text.setSelectedRange(NSRange(location: 0, length: 4))
-        renderPanel()
-        precondition(logTextView === text && text.selectedRange().length == 4, "Record selection must survive refresh")
-        text.setSelectedRange(NSRange(location: 0, length: 0)); renderPanel()
-        precondition(logTextView === text, "Record view must be reused")
         precondition(item.button?.image?.isTemplate == true && item.button?.title.contains("通道可回应") == true && item.button?.title.contains("DC ") == false, "Menu bar must show an icon and scoped live status")
-        precondition(panelHeading?.isHidden == true && panelConnectionTime?.isHidden == false && panelRecoveryToggle?.isHidden == false, "Records must retain compact status and controls")
+        precondition(panelHeading?.isHidden == true && panelHeroes?.isHidden == true && panelControlCard?.isHidden == true, "Records page must remain visually focused")
         print("CommanderGuard UI check passed")
-    }
-    private func commanderEventLabel(_ event: String) -> String {
-        guard let separator = event.range(of: ": ") else { return event }
-        let kind = String(event[..<separator.lowerBound]), tool = String(event[separator.upperBound...])
-        let label = ["调用receipt": "收到调用", "调用completion": "本机调用已返回", "调用error": "本机调用异常"][kind] ?? kind
-        return "\(label)：\(tool)"
     }
 }
 
