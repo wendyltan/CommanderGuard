@@ -2798,6 +2798,10 @@ func selfTest() {
     print("CommanderGuard self-test passed")
 }
 
+final class TopAlignedPanelDocumentView: NSView {
+    override var isFlipped: Bool { true }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTableViewDelegate {
     private var item: NSStatusItem!
     private var timer: Timer?
@@ -2833,6 +2837,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private var panelPage = 0
     private var panelScroll: NSScrollView?
     private var panelNav: NSSegmentedControl?
+    private var panelSectionCount = 0
     private var panelHeading: NSStackView?
     private var panelHeroes: NSStackView?
     private var panelControlCard: NSView?
@@ -3660,14 +3665,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
     private func setSections(_ sections: [NSView]) {
         guard let scroll = panelScroll else { return }
-        let origin = scroll.contentView.bounds.origin
-        let doc = NSStackView(); doc.orientation = .vertical; doc.alignment = .leading; doc.spacing = 14
-        for section in sections { doc.addArrangedSubview(section); section.widthAnchor.constraint(equalTo: doc.widthAnchor).isActive = true }
-        scroll.documentView = doc
-        doc.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate([doc.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor), doc.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor), doc.topAnchor.constraint(equalTo: scroll.contentView.topAnchor)])
-        doc.layoutSubtreeIfNeeded()
-        scroll.contentView.scroll(to: origin); scroll.reflectScrolledClipView(scroll.contentView)
+        panelSectionCount = sections.count
+        let oldY = scroll.contentView.bounds.origin.y
+        let viewport = scroll.contentView.bounds
+
+        let root = TopAlignedPanelDocumentView(frame: NSRect(origin: .zero, size: viewport.size))
+        root.autoresizingMask = [.width]
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 14
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        root.addSubview(stack)
+
+        for section in sections {
+            stack.addArrangedSubview(section)
+            section.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        }
+
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            stack.topAnchor.constraint(equalTo: root.topAnchor)
+        ])
+
+        scroll.documentView = root
+        root.layoutSubtreeIfNeeded()
+        let contentHeight = max(viewport.height, stack.fittingSize.height)
+        root.setFrameSize(NSSize(width: viewport.width, height: contentHeight))
+        root.layoutSubtreeIfNeeded()
+
+        let maxY = max(0, contentHeight - viewport.height)
+        let restoredY = min(max(0, oldY), maxY)
+        scroll.contentView.scroll(to: NSPoint(x: 0, y: restoredY))
+        scroll.reflectScrolledClipView(scroll.contentView)
     }
     private func renderPanelPage() {
         guard panelWindow != nil else { return }
@@ -3701,8 +3732,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                 activityRows.append(("注意", "本机操作日志仍在追赶；Guard 暂不判断为空闲"))
             }
             setSections([
-                section("现在怎么样", rows: [("状态", diagnosis.title), ("你需要做", diagnosis.nextAction)]),
-                section("当前操作", rows: activityRows)
+                section("当前状态", rows: [("状态", diagnosis.title), ("建议", diagnosis.nextAction)]),
+                section("当前任务", rows: activityRows)
             ])
             return
         }
@@ -3750,7 +3781,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }
 
         var sections: [NSView] = [
-            section("Guard 正在做什么", rows: [
+            section("连接处理", rows: [
                 ("状态", guardAction),
                 ("自动恢复", recoveryText),
                 ("最近检查", stamp(channelIncident.lastProbeAt ?? lastPingAt))
@@ -3776,7 +3807,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             notices.append(("自动恢复", "本机操作记录暂时不完整，因此 Guard 不会冒险重启 Commander"))
         }
         if !notices.isEmpty {
-            sections.append(section("需要你知道", rows: notices))
+            sections.append(section("安全限制", rows: notices))
         }
         setSections(sections)
     }
@@ -3979,13 +4010,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                 verify(scroll.documentView != nil, "panel page \(page) is empty")
             }
         }
-        panelPage = 0; renderPanel(); root.layoutSubtreeIfNeeded()
-        if let overview = scroll.documentView as? NSStackView {
-            verify(overview.arrangedSubviews.count == 2, "Overview must stay focused on status and current operation")
+        panelPage = 0; renderPanel(); root.layoutSubtreeIfNeeded(); scroll.layoutSubtreeIfNeeded()
+        verify(panelSectionCount == 2, "Overview must stay focused on status and current task")
+        if let overviewRoot = scroll.documentView as? TopAlignedPanelDocumentView,
+           let overviewStack = overviewRoot.subviews.first as? NSStackView {
+            verify(overviewStack.frame.minY <= 2, "Overview content must start at the top without a blank band")
+        } else {
+            verify(false, "Overview document must use the top-aligned container")
         }
-        panelPage = 2; renderPanel(); root.layoutSubtreeIfNeeded()
-        if let connection = scroll.documentView as? NSStackView {
-            verify(connection.arrangedSubviews.count <= 3, "Connection status must not become a feature inventory")
+
+        panelPage = 2; renderPanel(); root.layoutSubtreeIfNeeded(); scroll.layoutSubtreeIfNeeded()
+        verify(panelSectionCount <= 3, "Connection status must not become a feature inventory")
+        if let connectionRoot = scroll.documentView as? TopAlignedPanelDocumentView,
+           let connectionStack = connectionRoot.subviews.first as? NSStackView {
+            verify(connectionStack.frame.minY <= 2, "Connection content must start at the top without a blank band")
+        } else {
+            verify(false, "Connection document must use the top-aligned container")
         }
         verify(panelNav?.label(forSegment: 2) == "连接状态", "Third tab must use user-facing wording")
 
