@@ -3389,8 +3389,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         return "\(prominentStamp(record.timestamp)) · \(record.label) · \(record.resultLabel) · \(duration)\(caveat) · \(record.cloudReceiptLabel)"
     }
     private func middleTruncate(_ value: String, limit: Int) -> String {
+        guard limit > 0 else { return "" }
         guard value.count > limit else { return value }
-        let prefix = String(value.prefix(12)), suffix = String(value.suffix(limit - prefix.count - 1))
+        guard limit > 1 else { return "…" }
+        let budget = limit - 1
+        let prefixCount = max(1, (budget + 1) / 2)
+        let suffixCount = max(0, budget - prefixCount)
+        let prefix = String(value.prefix(prefixCount))
+        let suffix = String(value.suffix(suffixCount))
         return "\(prefix)…\(suffix)"
     }
     private func writeStatus() {
@@ -3859,6 +3865,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             guard condition() else { fputs("CommanderGuard UI check failed: \(message)\n", stderr); exit(2) }
         }
         guard let window = panelWindow, let root = window.contentView, let scroll = panelScroll else { fputs("CommanderGuard UI check failed: panel was not created\n", stderr); exit(2) }
+        verify(middleTruncate("云端实时服务连接池异常", limit: 12).count <= 12, "small-limit middle truncation overflowed")
+        verify(middleTruncate("abcdef", limit: 1) == "…", "single-character truncation must stay bounded")
         for size in [NSSize(width: 940, height: 720), NSSize(width: 760, height: 560)] {
             window.setContentSize(size)
             for page in 0...2 {
