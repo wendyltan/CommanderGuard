@@ -55,7 +55,7 @@ Download or clone this repository, then run these commands in the project direct
 
 Open `build/CommanderGuard.app` in Finder after the build completes. Click its menu bar icon to open the panel. The source build is ad hoc signed locally; Developer ID notarization is not configured.
 
-On a first run without an existing configuration, “自动恢复命令连接” (automatic connection recovery) is enabled by default. Turn it off in the panel if you only want observation and diagnosis. “保持电脑唤醒” (keep awake) is a separate toggle.
+On a first run without an existing configuration, “自动恢复本机 Commander” (automatically recover local Commander) is enabled by default. Turn it off in the panel if you only want observation and diagnosis. “防止闲置睡眠（Guard）” (prevent idle sleep) is a separate toggle.
 
 ### 3. Check the connection
 
@@ -82,8 +82,8 @@ The panel has three pages, a resizable window, and support for system light and 
 | Page | What to look for |
 |---|---|
 | 概览 (Overview) | The status needing attention, local task activity, usage, main toggles, and the connection-check button |
-| 操作记录 (Activity) | Recent calls; search by command, tool, path, or session, filter all / in progress / errors and unconfirmed, and select a row for details |
-| 连接状态 (Connection) | Current handling, reasons for deferred recovery, and recent incident and recovery times |
+| 操作记录 (Activity) | Hides `ping` checks by default; search commands, tools, paths, or known sessions, and select a row for its tool name, details, time and duration; choose “全部（含连接检查）” to include checks |
+| 故障与恢复 (Incidents and recovery) | Recent incidents, probes, recovery times and results, without repeating Overview status cards or controls |
 
 The menu bar keeps updating. The internal marker `●` means the message channel recently responded, `!` means the service is not running or the channel explicitly failed, and `?` means the result is unconfirmed, stale, or lacks evidence.
 
@@ -96,7 +96,9 @@ This shows Desktop Commander cloud tool calls usage, separate from your ChatGPT 
 3. In Chrome, enable View → Developer → Allow JavaScript from Apple Events (Chinese: “视图 → 开发者 → 允许来自 Apple Events 的 JavaScript”).
 4. Return to Guard and click “刷新” (refresh). Check that usage and a last successful sync time appear.
 
-Keep the official usage tab open; a background tab works. Once enabled, usage syncs every 10 minutes. Routine refreshes do not repeatedly open or bring the browser forward. Closing Chrome or the tab prevents fresh reads, and Guard reports the missing page. If several official usage tabs are open, make the account you want to read the active tab in the front Chrome window.
+You can close the usage page after signing in. Once enabled, usage syncs every 2 minutes; manual refresh shows progress and failure reasons. Chrome must already be running with a regular window. Guard reuses a unique existing usage page, or creates a temporary background tab in the current Chrome window, reads usage, and closes only its own tab while preserving your active tab. It does not launch a Chrome you have quit. If several official usage tabs are open, make the account you want to read the active tab in the front Chrome window.
+
+Without an existing usage page, the read uses the account in the current Chrome window, rather than a permanently bound account. With no existing usage page, a front incognito window prevents a new read; ambiguous page selection also pauses the read with guidance to select a regular window or account.
 
 “暂停同步” (pause sync) stops further syncing without signing you out of Chrome. An unlimited Pro plan has no finite progress bar. Temporary failures retain and label the last successful values; data older than 15 minutes is marked stale, and an expired login clears old values.
 
@@ -128,7 +130,9 @@ An update connection reopening establishes only that connection's recovery; a re
 
 ## When automatic recovery runs
 
-Guard starts evaluating recovery after accumulating three explicit “device has no live connection” results. Unknown results between them do not clear that evidence; a confirmed healthy `ping` does.
+Guard starts evaluating recovery after automatic probes accumulate three explicit “device has no live connection” results. Unknown results between them do not clear that evidence; a confirmed healthy `ping` does.
+
+Enabling this toggle permits Guard to restart the managed local Commander service. Turning it off keeps observation and alerts running but prevents new automatic restarts; a restart already launched cannot be undone. The setting is saved. It does not unconditionally start a stopped service, repair the cloud, or sign you in again.
 
 Before a restart, automatic recovery must be enabled and all of the following must be established:
 
@@ -140,6 +144,10 @@ Before a restart, automatic recovery must be enabled and all of the following mu
 Timeouts, expired authentication, unrecognized responses, failed tool probes, and cloud capacity errors do not individually trigger a restart. Guard reports recovery success only after the service PID changes and the new service responds to `ping`. That result does not establish that the original business task continued or finished.
 
 These checks cannot cover every independently running background task. Turn off automatic recovery when you need manual control of the service.
+
+### Prevent idle sleep
+
+With “防止闲置睡眠（Guard）” enabled, Guard requests that macOS prevent idle system sleep only while it identifies the Commander service as running. The panel distinguishes an active request, waiting for the service, and an unsuccessful request. Disabling it releases only Guard's own request; other apps, including Commander's own sleep-prevention process, can still keep the Mac awake. The display may turn off, and manual sleep, restart, or other forced sleep is not prevented. This preference survives Guard relaunches and is independent of automatic recovery.
 
 ## Data and privacy
 
@@ -162,9 +170,9 @@ State files live in `~/Library/Application Support/CommanderGuard/`:
 | `channel-decisions.jsonl` | Probe and recovery decisions, capped at 512 KiB with one rotated copy |
 | `channel-recovery.json` | Recovery toggle and last attempt time, without credentials |
 
-Session attribution accepts only upstream `_meta["openai/session"]` or `origin_context_id`. Raw identifiers are SHA-256 hashed into short anonymous fingerprints. Missing fields show “归属未确认” (unconfirmed attribution); conflicting fields show “归属冲突” (attribution conflict). Timing, the foreground chat, terminal processes, and `origin_instance` are not attribution evidence.
+Session attribution accepts only upstream `_meta["openai/session"]` or `origin_context_id`. Raw identifiers are SHA-256 hashed into short anonymous fingerprints. Missing fields produce no attribution label; conflicting fields still show “归属冲突” (attribution conflict). Timing, the foreground chat, terminal processes, and `origin_instance` are not attribution evidence.
 
-The current pairing path still lacks stable session metadata forwarding, so real calls may remain unattributed. Follow [Remote Desktop Commander #12](https://github.com/desktop-commander/remote-desktop-commander/issues/12) and [CHAT-COMMANDER-ATTRIBUTION-REVIEW.md](CHAT-COMMANDER-ATTRIBUTION-REVIEW.md).
+The current pairing path still lacks stable session metadata forwarding, so real calls may remain unattributed. Guard shows the tool and operation without repeatedly adding an unconfirmed-attribution label. Follow [Remote Desktop Commander #12](https://github.com/desktop-commander/remote-desktop-commander/issues/12) and [CHAT-COMMANDER-ATTRIBUTION-REVIEW.md](CHAT-COMMANDER-ATTRIBUTION-REVIEW.md).
 
 Guard also reads `~/.claude-server-commander/tool-history.jsonl`, extracting only tool names, actual timestamps, duration, and return state. Argument and result bodies are discarded. That format lacks reliable call IDs, so Guard does not merge it with other records by timing or use it alone to establish that the device is idle.
 

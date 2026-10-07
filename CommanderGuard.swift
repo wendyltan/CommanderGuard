@@ -7,7 +7,7 @@ import CoreFoundation
 import CryptoKit
 
 struct UsageQuota {
-    enum State: String { case disconnected, connecting, loginRequired, browserTabMissing, browserTabAmbiguous, browserPermissionRequired, unavailable, fresh, stale, unlimited }
+    enum State: String { case disconnected, connecting, refreshing, loginRequired, browserTabMissing, browserTabAmbiguous, browserPermissionRequired, unavailable, fresh, stale, unlimited }
     var state: State = .disconnected
     var used: Int?
     var total: Int?
@@ -62,8 +62,28 @@ func appleScriptLiteral(_ value: String) -> String {
         .replacingOccurrences(of: "\r", with: " ") + "\""
 }
 
+let quotaRefreshInterval: TimeInterval = 120
+let quotaStaleInterval: TimeInterval = 900
+
 func quotaIsStale(_ quota: UsageQuota, now: Date) -> Bool {
-    quota.used != nil && quota.syncedAt.map { now.timeIntervalSince($0) > 900 } == true
+    quota.used != nil && quota.syncedAt.map { now.timeIntervalSince($0) > quotaStaleInterval } == true
+}
+
+func quotaCreatedWindowIDs(_ value: String?, marker: String) -> (window: String, tab: String)? {
+    guard let value else { return nil }
+    let fields = value.split(separator: ":", omittingEmptySubsequences: false)
+    guard fields.count == 4, fields[0] == "owned", String(fields[3]) == marker, !fields[1].isEmpty, !fields[2].isEmpty,
+          fields[1].utf8.allSatisfy({ $0 >= 48 && $0 <= 57 }),
+          fields[2].utf8.allSatisfy({ $0 >= 48 && $0 <= 57 }) else { return nil }
+    return (String(fields[1]), String(fields[2]))
+}
+
+func quotaOwnedWindowCondition(id: String) -> String {
+    "id of browserWindow is \(appleScriptLiteral(id))"
+}
+
+func quotaOwnedTabCondition(id: String, marker: String) -> String {
+    "id of browserTab is \(appleScriptLiteral(id)) and URL of browserTab is \(appleScriptLiteral("https://mcp.desktopcommander.app/usage#\(marker)"))"
 }
 
 struct Snapshot {
@@ -132,7 +152,7 @@ struct ToolHistoryRecord {
     let duration: TimeInterval?
     let returned: Bool
     let failed: Bool
-    var label: String { CommanderActivity.tools[tool] ?? "本机工具调用" }
+    var label: String { CommanderActivity.toolLabel(tool) }
     var resultLabel: String { failed ? "工具调用返回错误" : (returned ? "工具调用已返回" : "返回状态未知") }
     var cloudReceiptLabel: String { "云端结果接收未知" }
     var processCaveat: String? { tool == "start_process" && returned && !failed ? "调用已返回；后台进程仍可能运行" : nil }
@@ -155,8 +175,8 @@ func activityStepRows(_ steps: [ActivityStep], uptime: TimeInterval) -> [String]
     return steps.map { step in
         let symbol = step.historical && step.finished ? (step.failed ? "!" : "✓") : (step.uncertain ? "?" : (step.failed ? "!" : (step.finished || step.duration != nil ? "✓" : "●")))
         let duration = step.historical ? (step.finished ? "已返回 · 耗时未知" : "开始时间未知 · 状态未确认") : (step.uncertain ? "未确认" : (step.duration == nil ? "进行中 \(barCallClock(step, uptime: uptime))" : barCallClock(step, uptime: uptime)))
-        let owner = step.sessionAttributionConflict ? "归属冲突" : (CommanderActivity.sessionDisplay(step.sessionKey) ?? "归属未确认")
-        return "\(step.historical ? "时间未知" : clock.string(from: step.startedAt))  \(symbol)  [\(owner)]  \(step.detail)  · \(duration)"
+        let attribution = step.sessionAttributionConflict ? "归属冲突" : CommanderActivity.sessionDisplay(step.sessionKey)
+        return "\(step.historical ? "时间未知" : clock.string(from: step.startedAt))  \(symbol)  \(attribution.map { "[\($0)]  " } ?? "")\(step.detail)  · \(duration)"
     }
 }
 
@@ -884,6 +904,12 @@ func channelSummary(_ snapshot: Snapshot, now: Date) -> String {
     return ["启动宽限": "启动等待中", "通道异常": "异常", "通道不可用": "不可用", "通道状态未知": "未确认", "正在恢复通道": "正在恢复", "恢复尚未确认": "恢复尚未确认"][snapshot.channelState] ?? snapshot.channelState
 }
 
+func wakePreventionSummary(enabled: Bool, serviceRunning: Bool, assertionActive: Bool) -> String {
+    guard enabled else { return "已关闭" }
+    guard serviceRunning else { return "等待 Commander 服务运行" }
+    return assertionActive ? "Guard 正在防止闲置睡眠" : "Guard 的防睡眠请求未生效"
+}
+
 enum CommanderActivity {
     struct SessionAttribution {
         let key: String
@@ -892,9 +918,20 @@ enum CommanderActivity {
         init(key: String, source: String, conflict: Bool = false) { self.key = key; self.source = source; self.conflict = conflict }
     }
 
-    static let tools = ["read_file": "读取文件", "read_multiple_files": "读取文件", "read_process_output": "读取进程输出", "list_sessions": "查看终端会话", "list_processes": "查看进程", "list_directory": "查看目录", "search_files": "搜索文件", "start_search": "开始搜索", "get_more_search_results": "读取搜索结果", "stop_search": "停止搜索", "list_searches": "查看搜索任务", "get_file_info": "查看文件信息", "start_process": "启动进程", "interact_with_process": "操作进程", "kill_process": "结束进程", "force_terminate": "结束进程", "write_file": "写入文件", "edit_block": "编辑文件", "create_directory": "创建目录", "move_file": "移动文件", "get_config": "读取配置"]
+    static let tools = ["ping": "连接检查（ping）", "read_file": "读取文件", "read_multiple_files": "读取文件", "read_process_output": "读取进程输出", "list_sessions": "查看终端会话", "list_processes": "查看进程", "list_directory": "查看目录", "search_files": "搜索文件", "start_search": "开始搜索", "get_more_search_results": "读取搜索结果", "stop_search": "停止搜索", "list_searches": "查看搜索任务", "get_file_info": "查看文件信息", "start_process": "启动进程", "interact_with_process": "操作进程", "kill_process": "结束进程", "force_terminate": "结束进程", "write_file": "写入文件", "edit_block": "编辑文件", "create_directory": "创建目录", "move_file": "移动文件", "get_config": "读取配置"]
     static let uuidPattern = try! NSRegularExpression(pattern: #"^🔧 Received tool call ([0-9a-fA-F-]{36}): ([A-Za-z0-9_-]+) "#)
     static let completionPattern = try! NSRegularExpression(pattern: #"^[✅❌] Tool call ([A-Za-z0-9_-]+) (completed|failed):"#)
+
+    static func toolLabel(_ tool: String) -> String {
+        if let label = tools[tool] { return label }
+        guard tool.range(of: #"^[A-Za-z][A-Za-z0-9_-]{0,63}$"#, options: .regularExpression) != nil,
+              safeName(tool),
+              !["sk-", "ghp_", "github_pat_", "eyj"].contains(where: tool.lowercased().hasPrefix),
+              tool.range(of: #"(?i)^[0-9a-f]{8}-[0-9a-f-]{27,}$"#, options: .regularExpression) == nil else { return "未知工具" }
+        return tool
+    }
+
+    static func safeToolIdentifier(_ tool: String) -> String { toolLabel(tool) == "未知工具" ? "未知工具" : tool }
 
     static func parse(_ bytes: Data, partial: Bool = false) -> (String, String, String, String)? {
         // A bounded prefix may end inside a UTF-8 scalar; discard only that incomplete suffix.
@@ -912,7 +949,7 @@ enum CommanderActivity {
         }
         if let m = completionPattern.firstMatch(in: line, range: range), let toolRange = Range(m.range(at: 1), in: line), let resultRange = Range(m.range(at: 2), in: line) {
             let tool = String(line[toolRange])
-            return ("", tool, String(line[resultRange]), tools[tool] ?? "本机工具调用")
+            return ("", tool, String(line[resultRange]), toolLabel(tool))
         }
         return nil
     }
@@ -964,7 +1001,7 @@ enum CommanderActivity {
         case "start_process": return processDetail(args)
         case "search_files", "start_search": return "搜索文件内容"
         case "get_more_search_results", "list_searches": return "查看搜索结果"
-        default: return tools[tool] ?? "本机工具调用"
+        default: return toolLabel(tool)
         }
     }
 
@@ -2299,7 +2336,16 @@ func selfTest() {
     precondition(quota(["plan": "free", "callsUsed": 1, "callsIncluded": 10, "month": 202610]) == nil)
     precondition(UsageQuota.parse(Data(repeating: 65, count: 8193), now: now) == nil)
     precondition(UsageQuota(state: .loginRequired).used == nil && UsageQuota(state: .loginRequired).total == nil)
+    precondition(quotaRefreshInterval == 120 && quotaStaleInterval == 900 && UsageQuota.State.refreshing.rawValue == "refreshing")
     precondition(quotaIsStale(freeQuota!, now: now.addingTimeInterval(901)) && !quotaIsStale(freeQuota!, now: now.addingTimeInterval(899)))
+    let createdWindow = quotaCreatedWindowIDs("owned:52:71:random-marker", marker: "random-marker")
+    precondition(createdWindow?.window == "52" && createdWindow?.tab == "71")
+    precondition(quotaCreatedWindowIDs("owned:52:71:other-marker", marker: "random-marker") == nil)
+    precondition(quotaCreatedWindowIDs("owned:x:71:random-marker", marker: "random-marker") == nil)
+    precondition(quotaCreatedWindowIDs("owned:52::random-marker", marker: "random-marker") == nil)
+    let ownerGuard = quotaOwnedWindowCondition(id: "52")
+    let tabGuard = quotaOwnedTabCondition(id: "71", marker: "random-marker")
+    precondition(ownerGuard.contains("id of browserWindow") && tabGuard.contains("id of browserTab") && tabGuard.contains("/usage#random-marker"))
     precondition(trustedQuotaURL(URL(string: "https://mcp.desktopcommander.app/usage")))
     precondition(!trustedQuotaURL(URL(string: "https://auth.desktopcommander.app/auth")))
     precondition(!trustedQuotaURL(URL(string: "https://mcp.desktopcommander.app/usage/extra")))
@@ -2375,6 +2421,9 @@ func selfTest() {
     precondition(channelIndicator(service: "运行中", state: "通道畅通", checked: now.addingTimeInterval(-76), now: now) == "?")
     precondition(channelIndicator(service: "运行中", state: "通道不可用", checked: now, now: now) == "!")
     precondition(channelIndicator(service: "未运行", state: "通道畅通", checked: now, now: now) == "!")
+    precondition(wakePreventionSummary(enabled: true, serviceRunning: true, assertionActive: true) == "Guard 正在防止闲置睡眠")
+    precondition(wakePreventionSummary(enabled: true, serviceRunning: false, assertionActive: false) == "等待 Commander 服务运行")
+    precondition(wakePreventionSummary(enabled: false, serviceRunning: true, assertionActive: false) == "已关闭")
     var displaySnapshot = Snapshot(service: "运行中", channelState: "通道畅通", channelChecked: now)
     precondition(channelSummary(displaySnapshot, now: now) == "通道可回应")
     precondition(channelSummary(displaySnapshot, now: now.addingTimeInterval(76)) == "待复查（上次通道探测成功）")
@@ -2408,12 +2457,16 @@ func selfTest() {
     precondition(evidenceActivity.steps[0].tool == "read_file", "Tool evidence fixture changed")
     var probeOnly = completed; probeOnly = ActivityStep(id: probeOnly.id, tool: "list_sessions", detail: probeOnly.detail, startedAt: probeOnly.startedAt, startedUptime: probeOnly.startedUptime, duration: probeOnly.duration, uncertain: probeOnly.uncertain, failed: probeOnly.failed, historical: probeOnly.historical, finished: probeOnly.finished)
     precondition(recentSuccessfulToolExecution(ActivitySummary(steps: [probeOnly]), now: now.addingTimeInterval(2)) == nil)
-    precondition(activityStepRows([pending], uptime: 13)[0].contains("●  [归属未确认]  读取文件  · 进行中 3 秒"))
-    precondition(activityStepRows([completed], uptime: 99)[0].contains("✓  [归属未确认]  读取文件  · 2 秒"))
+    precondition(activityStepRows([pending], uptime: 13)[0].contains("●  读取文件  · 进行中 3 秒") && !activityStepRows([pending], uptime: 13)[0].contains("归属"))
+    precondition(activityStepRows([completed], uptime: 99)[0].contains("✓  读取文件  · 2 秒") && !activityStepRows([completed], uptime: 99)[0].contains("归属"))
     var failedStep = completed; failedStep.failed = true
-    precondition(activityStepRows([failedStep], uptime: 99)[0].contains("!  [归属未确认]  读取文件  · 2 秒"))
+    precondition(activityStepRows([failedStep], uptime: 99)[0].contains("!  读取文件  · 2 秒") && !activityStepRows([failedStep], uptime: 99)[0].contains("归属"))
     var uncertainStep = failedStep; uncertainStep.uncertain = true
-    precondition(activityStepRows([uncertainStep], uptime: 99)[0].contains("?  [归属未确认]  读取文件  · 未确认"))
+    precondition(activityStepRows([uncertainStep], uptime: 99)[0].contains("?  读取文件  · 未确认") && !activityStepRows([uncertainStep], uptime: 99)[0].contains("归属"))
+    var attributed = pending; attributed.sessionKey = String(repeating: "a", count: 64)
+    precondition(activityStepRows([attributed], uptime: 13)[0].contains("[会话 AAAAAAAAAA]"))
+    attributed.sessionAttributionConflict = true
+    precondition(activityStepRows([attributed], uptime: 13)[0].contains("[归属冲突]"))
     let uiTimeline = [TimelineEvent(source: "commander", event: "调用receipt: 读取文件", sourceAt: nil, observedAt: ""), TimelineEvent(source: "commander", event: "调用completion: 读取文件", sourceAt: nil, observedAt: ""), TimelineEvent(source: "commander", event: "调用error: 未匹配步骤", sourceAt: nil, observedAt: ""), TimelineEvent(source: "commander", event: "Commander错误: 通道错误", sourceAt: nil, observedAt: ""), TimelineEvent(source: "chatgpt_app", event: "chatgpt_pubsub_transport_opened", sourceAt: nil, observedAt: "")]
     precondition(visibleTimelineEvents(uiTimeline).map(\.event) == ["调用error: 未匹配步骤", "Commander错误: 通道错误", "chatgpt_pubsub_transport_opened"])
     let nextCall = ActivityStep(id: "call-2", tool: "read_file", detail: "读取文件", startedAt: now, startedUptime: 20, duration: nil)
@@ -2530,7 +2583,11 @@ func selfTest() {
     precondition(CommanderActivity.parse(Data("🔧 Received tool call \(safeID): write_file {\"file_path\":\"/tmp/sk-secret-token-0123456789abcdef0123456789abcdef\",\"content\":\"private\"}".utf8))?.3 == "更新文件")
     precondition(CommanderActivity.parse(Data("🔧 Received tool call \(safeID): read_file {\"content\":\"fake path /tmp/DO_NOT_SHOW.md\"}".utf8))?.3 == "读取文件")
     precondition(CommanderActivity.parse(Data("prefix 🔧 Received tool call \(safeID): read_file {".utf8)) == nil)
-    precondition(CommanderActivity.parse(Data("🔧 Received tool call \(safeID): read_file_extra {".utf8))?.3 == "本机工具调用")
+    precondition(CommanderActivity.parse(Data("🔧 Received tool call \(safeID): read_file_extra {".utf8))?.3 == "read_file_extra")
+    precondition(ToolHistoryRecord(fingerprint: "", timestamp: now, tool: "safe_tool_42", duration: nil, returned: true, failed: false).label == "safe_tool_42")
+    precondition(ToolHistoryRecord(fingerprint: "", timestamp: now, tool: "tool\nsecret", duration: nil, returned: true, failed: false).label == "未知工具")
+    precondition(ToolHistoryRecord(fingerprint: "", timestamp: now, tool: "a" + String(repeating: "b", count: 64), duration: nil, returned: true, failed: false).label == "未知工具")
+    precondition(ToolHistoryRecord(fingerprint: "", timestamp: now, tool: "sk-ABCDEFGHIJKLMNOPQRSTUV123456", duration: nil, returned: true, failed: false).label == "未知工具")
     selfTestSessionAttributionParser()
     let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
     try! FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -2538,6 +2595,8 @@ func selfTest() {
     let ledgerFile = dir.appendingPathComponent("recovery.json")
     precondition(ledgerTest.save(to: ledgerFile))
     precondition(!ChannelRecoveryLedger.load(from: ledgerFile).canAttempt(at: now.addingTimeInterval(299)))
+    var disabledLedger = ledgerTest; disabledLedger.autoRecoveryEnabled = false
+    precondition(disabledLedger.save(to: ledgerFile) && !ChannelRecoveryLedger.load(from: ledgerFile).autoRecoveryEnabled)
     try! Data("invalid".utf8).write(to: ledgerFile)
     precondition(!ChannelRecoveryLedger.load(from: ledgerFile).autoRecoveryEnabled)
 
@@ -2993,7 +3052,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private var timer: Timer?
     private var channelTimer: Timer?
     private var assertion: IOPMAssertionID = 0
-    private var paused = false
+    private var paused = !(UserDefaults.standard.object(forKey: "keepAwakeEnabled") as? Bool ?? true)
     private var snapshot = Snapshot()
     private var summaryLines: [NSMenuItem] = []
     private var statusMenu: NSMenu?
@@ -3039,6 +3098,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private var panelChatDetail: NSTextField?
     private var panelRecoveryToggle: NSButton?
     private var panelRecoveryStatus: NSTextField?
+    private var panelWakeStatus: NSTextField?
     private var panelWakeToggle: NSButton?
     private var recordSearch: NSSearchField?
     private var recordFilter: NSPopUpButton?
@@ -3058,6 +3118,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private var quotaTimer: Timer?
     private var quota = UsageQuota()
     private var quotaPollTimer: Timer?
+    private var quotaOwnedWindowID: String?
+    private var quotaOwnedTabID: String?
+    private var quotaOwnedMarker: String?
+    private var quotaFailureReason: String?
     private var quotaRequestID: String?
     private var quotaPollBusy = false
     private var quotaDeadline = Date.distantPast
@@ -3067,7 +3131,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private var quotaStatus: NSTextField?
     private var quotaSynced: NSTextField?
     private var quotaProgress: NSProgressIndicator?
+    private var quotaRefreshButton: NSButton?
     private var quotaRequestInFlight = false
+    private var quotaCancelRequested = false
+    private var quotaTerminateWhenIdle = false
     private var quotaEnabled: Bool { UserDefaults.standard.bool(forKey: "quotaConnectionEnabled") }
 
     init(previewMode: Bool = false) { self.previewMode = previewMode; super.init() }
@@ -3090,14 +3157,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         DistributedNotificationCenter.default().addObserver(self, selector: #selector(openPanel), name: NSNotification.Name("com.wuwendi.commander-guard.open-panel"), object: nil)
         poll()
         if quotaEnabled { refreshQuota() }
-        quotaTimer = Timer.scheduledTimer(withTimeInterval: 600, repeats: true) { _ in self.refreshQuota() }
+        quotaTimer = Timer.scheduledTimer(withTimeInterval: quotaRefreshInterval, repeats: true) { _ in self.refreshQuota() }
         timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { _ in self.poll() }
         channelTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { _ in self.pollChannel(); self.pollToolExecution() }
         activityTimer = Timer(timeInterval: 1, repeats: true) { _ in self.pollActivity() }
         RunLoop.main.add(activityTimer!, forMode: .common)
         pollActivity()
     }
-    func applicationWillTerminate(_ n: Notification) { timer?.invalidate(); channelTimer?.invalidate(); activityTimer?.invalidate(); quotaTimer?.invalidate(); quotaPollTimer?.invalidate(); releaseAssertion() }
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard quotaRequestInFlight else { closeOwnedQuotaWindow(wait: true); return .terminateNow }
+        quotaTerminateWhenIdle = true
+        return .terminateLater
+    }
+    func applicationWillTerminate(_ n: Notification) { timer?.invalidate(); channelTimer?.invalidate(); activityTimer?.invalidate(); quotaTimer?.invalidate(); quotaPollTimer?.invalidate(); closeOwnedQuotaWindow(wait: true); releaseAssertion() }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool { openPanel(); return true }
     private func rebuild() {
         let m = NSMenu()
@@ -3584,7 +3656,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         guard snapshot.service == "运行中" else { return "已开启 · 等待 Commander 服务" }
         if !activitySafeForRecovery(snapshot.activity) { return "已开启 · 暂缓：\(activityDeferralReason(snapshot.activity))" }
         if channelIncident.activeCategory != nil { return "已开启 · \(channelIncidentHandling())" }
-        return "已开启 · 等待检查"
+        return channelIndicator(service: snapshot.service, state: snapshot.channelState, checked: snapshot.channelChecked, now: Date()) == "●"
+            ? "已开启 · 监测中，当前无需恢复" : "已开启 · 等待下一次通道检查"
     }
     private func durationText(_ value: TimeInterval?) -> String {
         guard let value else { return "未确认" }
@@ -3598,7 +3671,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
     private func quotaDisplay() -> String {
         if quota.total == nil, let used = quota.used, !quota.plan.isEmpty { return "\(used) 次 · \(quota.plan.lowercased() == "pro" ? "Pro" : quota.plan) 无限制" }
-        guard let used = quota.used, let total = quota.total else { return quota.state == .connecting ? "正在连接…" : "暂无额度数据" }
+        guard let used = quota.used, let total = quota.total else { return quota.state == .connecting ? "正在连接…" : quota.state == .refreshing ? "正在读取…" : "暂无额度数据" }
         return "\(used) / \(total) 次 · 剩余 \(quota.remaining ?? 0) 次"
     }
     private func ageQuota() {
@@ -3609,15 +3682,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let old = quotaIsStale(quota, now: Date()) ? " · 上次数据已过期" : ""
         switch quota.state {
         case .disconnected: return "未连接 · 连接后读取官方用量"
-        case .connecting: return "正在读取官方用量"
+        case .connecting: return "正在连接官方用量页"
+        case .refreshing: return "正在刷新额度" + (quota.used == nil ? "" : " · 保留上次成功数据") + old
         case .loginRequired: return "登录已失效 · 请在 Chrome 打开官方用量页重新登录" + old
-        case .browserTabMissing: return "请在 Chrome 保持官方用量页打开" + old
+        case .browserTabMissing: return (quotaFailureReason ?? "Chrome 未运行或用量页不可用") + old
         case .browserTabAmbiguous: return "有多个官方用量页 · 请将要读取的账户标签页切到 Chrome 最前方" + old
         case .browserPermissionRequired: return "请允许 Chrome 的“来自 Apple Events 的 JavaScript”和 macOS 自动化权限" + old
-        case .unavailable: return (quota.used == nil ? "额度暂不可用 · 可稍后刷新" : "同步失败 · 显示上次成功数据") + old
-        case .fresh: return "当前周期：\(quota.month) · \(quota.plan)" + old
-        case .stale: return "数据已过期 · 保留上次成功读取（\(quota.month)）"
-        case .unlimited: return "当前周期：\(quota.month) · \(quota.plan) · 无限制" + old
+        case .unavailable: return (quotaFailureReason.map { "同步失败：\($0)" } ?? "额度暂不可用") + (quota.used == nil ? " · 可稍后刷新" : " · 保留上次成功数据") + old
+        case .fresh: return "当前 Chrome 账户 · 当前周期：\(quota.month) · \(quota.plan)" + old
+        case .stale: return "数据已过期 · 保留上次成功读取（\(quota.month)）" + (quotaFailureReason.map { " · \($0)" } ?? "")
+        case .unlimited: return "当前 Chrome 账户 · 当前周期：\(quota.month) · \(quota.plan) · 无限制" + old
         }
     }
     private func renderQuota() {
@@ -3627,7 +3701,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         quotaStatus?.stringValue = quotaStateText()
         quotaSynced?.stringValue = "最近成功同步：\(prominentStamp(quota.syncedAt))"
         quotaButton?.title = quotaEnabled ? "打开额度账户" : "连接额度账户"
-        quotaButton?.isEnabled = !previewMode && quota.state != .connecting
+        quotaButton?.isEnabled = !previewMode && !quotaRequestInFlight && quota.state != .connecting && quota.state != .refreshing
+        quotaRefreshButton?.isEnabled = !previewMode && !quotaRequestInFlight && quota.state != .connecting && quota.state != .refreshing
         quotaPauseButton?.isEnabled = !previewMode && quotaEnabled
         if let progress = quotaProgress {
             let finite = quota.total.flatMap { total in quota.used.map { (total, $0) } }
@@ -3637,8 +3712,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         if item != nil { render() }
     }
     private func quotaSection() -> NSView {
-        let connect = NSButton(title: quotaEnabled ? "打开额度账户" : "连接额度账户", target: self, action: #selector(connectQuota)); connect.bezelStyle = .rounded; connect.isEnabled = !previewMode
-        let refresh = NSButton(title: "刷新", target: self, action: #selector(manualQuotaRefresh)); refresh.bezelStyle = .rounded; refresh.isEnabled = !previewMode
+        let connect = NSButton(title: quotaEnabled ? "打开额度账户" : "连接额度账户", target: self, action: #selector(connectQuota)); connect.bezelStyle = .rounded; connect.isEnabled = !previewMode && !quotaRequestInFlight && quota.state != .connecting && quota.state != .refreshing
+        let refresh = NSButton(title: "刷新", target: self, action: #selector(manualQuotaRefresh)); refresh.bezelStyle = .rounded; refresh.isEnabled = !previewMode && !quotaRequestInFlight && quota.state != .connecting && quota.state != .refreshing
         let pause = NSButton(title: "暂停同步", target: self, action: #selector(pauseQuota)); pause.bezelStyle = .rounded; pause.isEnabled = !previewMode && quotaEnabled
         let title = label("云端额度", size: 12, weight: .semibold, color: .secondaryLabelColor)
         let actions = NSStackView(views: [title, NSView(), pause, refresh, connect]); actions.orientation = .horizontal; actions.alignment = .centerY; actions.spacing = 8
@@ -3651,10 +3726,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         if quotaIsStale(quota, now: Date()) { value.textColor = .systemOrange }
         let stack = vertical(7)
         [actions, value, progress, status, synced].forEach { stack.addArrangedSubview($0); $0.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true }
-        quotaButton = connect; quotaPauseButton = pause; quotaValue = value; quotaStatus = status; quotaSynced = synced; quotaProgress = progress
+        quotaButton = connect; quotaPauseButton = pause; quotaRefreshButton = refresh; quotaValue = value; quotaStatus = status; quotaSynced = synced; quotaProgress = progress
         return card(stack, padding: 14)
     }
     private func clearQuota(_ state: UsageQuota.State) {
+        quotaFailureReason = nil
         quota = UsageQuota(state: state)
         renderQuota()
     }
@@ -3665,10 +3741,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         return FileManager.default.fileExists(atPath: standard.path) ? standard : nil
     }
     @objc private func connectQuota() {
+        guard !previewMode, !quotaRequestInFlight, !quotaTerminateWhenIdle, quota.state != .connecting else { return }
         guard let browser = chromeApplicationURL() else {
             quotaFailed(.unavailable); return
         }
         UserDefaults.standard.set(true, forKey: "quotaConnectionEnabled")
+        quotaFailureReason = nil
         quota.state = .connecting; renderQuota()
         NSWorkspace.shared.open([quotaPageURL()], withApplicationAt: browser, configuration: NSWorkspace.OpenConfiguration()) { _, error in
             DispatchQueue.main.async {
@@ -3683,14 +3761,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
     @objc private func pauseQuota() {
         UserDefaults.standard.set(false, forKey: "quotaConnectionEnabled")
-        quotaPollTimer?.invalidate(); quotaPollTimer = nil
-        quotaRequestID = nil; quotaRequestInFlight = false; quotaPollBusy = false
-        clearQuota(.disconnected)
+        quotaCancelRequested = quotaRequestInFlight
+        if !quotaRequestInFlight {
+            quotaPollTimer?.invalidate(); quotaPollTimer = nil
+            quotaRequestID = nil; quotaPollBusy = false
+        }
+        closeOwnedQuotaWindow()
+        quotaFailureReason = nil
+        if quotaCancelRequested { quota.state = .disconnected; renderQuota() }
+        else { clearQuota(.disconnected) }
     }
-    private func browserJavaScript(_ script: String, selectAccount: Bool = false, completion: @escaping (String?, Bool) -> Void) {
+    private func browserJavaScript(_ script: String, selectAccount: Bool = false, ownedWindowID: String? = nil, ownedTabID: String? = nil, marker: String? = nil, waitForReady: Bool = false, completion: @escaping (String?, Bool) -> Void) {
         guard !NSRunningApplication.runningApplications(withBundleIdentifier: "com.google.Chrome").isEmpty else { completion("tab-missing", false); return }
         guard let browser = chromeApplicationURL() else { completion(nil, false); return }
-        let action = selectAccount ? """
+        let action: String
+        if let ownedWindowID, let ownedTabID, let marker {
+            let executeOwned = "return execute browserTab javascript \(appleScriptLiteral(script))"
+            action = waitForReady ? """
+            repeat 20 times
+              repeat with browserWindow in every window
+                if \(quotaOwnedWindowCondition(id: ownedWindowID)) then
+                  set foundOwnedTab to false
+                  repeat with browserTab in every tab of browserWindow
+                    if id of browserTab is \(appleScriptLiteral(ownedTabID)) then
+                      set foundOwnedTab to true
+                      if URL of browserTab is not \(appleScriptLiteral("https://mcp.desktopcommander.app/usage#\(marker)")) then return "owned-page-missing"
+                      try
+                        set readyState to execute browserTab javascript \(appleScriptLiteral("location.href === \"https://mcp.desktopcommander.app/usage#\(marker)\" ? document.readyState : \"loading\""))
+                        if readyState is "complete" then \(executeOwned)
+                      on error errorMessage number errorNumber
+                        if errorNumber is -1743 or errorNumber is -2740 or errorMessage contains "JavaScript" then return "javascript-permission"
+                        return "page-error"
+                      end try
+                    end if
+                  end repeat
+                  if not foundOwnedTab then return "owned-page-missing"
+                end if
+              end repeat
+              delay 0.25
+            end repeat
+            return "page-timeout"
+            """ : """
+            repeat with browserWindow in every window
+              if \(quotaOwnedWindowCondition(id: ownedWindowID)) then
+                repeat with browserTab in every tab of browserWindow
+                  if \(quotaOwnedTabCondition(id: ownedTabID, marker: marker)) then \(executeOwned)
+                end repeat
+                return "owned-page-missing"
+              end if
+            end repeat
+            return "owned-page-missing"
+            """
+        } else if selectAccount {
+            action = """
             set candidateCount to 0
             set candidateTab to missing value
             repeat with browserWindow in every window
@@ -3701,14 +3824,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                 end if
               end repeat
             end repeat
-            if candidateCount is 0 then return "tab-missing"
-            if URL of active tab of front window is "https://mcp.desktopcommander.app/usage" then
-              set candidateTab to active tab of front window
-            else if candidateCount is greater than 1 then
-              return "tab-ambiguous"
+            if candidateCount is 0 then
+              if (count of windows) is 0 then return "no-regular-window"
+              set candidateWindow to front window
+              if mode of candidateWindow is not "normal" then return "no-regular-window"
+              set candidateWindowID to id of candidateWindow
+              set originalActiveTabID to id of active tab of candidateWindow
+              set candidateTabID to ""
+              set marker to \(appleScriptLiteral(marker ?? ""))
+              set ownedURL to "https://mcp.desktopcommander.app/usage#" & marker
+              try
+                set candidateTab to make new tab at end of tabs of candidateWindow with properties {URL:ownedURL}
+                set candidateTabID to id of candidateTab
+                set activeIndex to 0
+                set originalActiveIndex to 0
+                repeat with browserTab in every tab of candidateWindow
+                  set activeIndex to activeIndex + 1
+                  if id of browserTab is originalActiveTabID then set originalActiveIndex to activeIndex
+                end repeat
+                if originalActiveIndex > 0 and id of active tab of candidateWindow is candidateTabID then set active tab index of candidateWindow to originalActiveIndex
+                return "owned:" & candidateWindowID & ":" & candidateTabID & ":" & marker
+              on error errorMessage number errorNumber
+                try
+                  set activeIndex to 0
+                  set originalActiveIndex to 0
+                  repeat with browserTab in every tab of candidateWindow
+                    set activeIndex to activeIndex + 1
+                    if id of browserTab is originalActiveTabID then set originalActiveIndex to activeIndex
+                  end repeat
+                  if originalActiveIndex > 0 and id of active tab of candidateWindow is candidateTabID then set active tab index of candidateWindow to originalActiveIndex
+                  repeat with browserTab in every tab of candidateWindow
+                    if id of browserTab is candidateTabID and URL of browserTab is ownedURL then close browserTab
+                  end repeat
+                end try
+                if errorNumber is -1743 or errorNumber is -2740 or errorMessage contains "JavaScript" then return "javascript-permission"
+                return "creation-failed"
+              end try
+            else
+              if URL of active tab of front window is "https://mcp.desktopcommander.app/usage" then
+                set candidateTab to active tab of front window
+              else if candidateCount is greater than 1 then
+                return "tab-ambiguous"
+              end if
+              return execute candidateTab javascript \(appleScriptLiteral(script))
             end if
-            return execute candidateTab javascript \(appleScriptLiteral(script))
-            """ : """
+            """
+        } else {
+            action = """
             set sawOfficialPage to false
             repeat with browserWindow in every window
               repeat with browserTab in every tab of browserWindow
@@ -3722,9 +3884,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             if sawOfficialPage then return "key-missing"
             return "tab-missing"
             """
+        }
         let source = """
         if application \(appleScriptLiteral(browser.path)) is not running then return "tab-missing"
-        with timeout of 8 seconds
+        with timeout of 12 seconds
           tell application \(appleScriptLiteral(browser.path))
             \(action)
           end tell
@@ -3739,77 +3902,168 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             DispatchQueue.main.async { completion(value, permission) }
         }
     }
-    private func quotaStartScript(_ key: String) -> String {
+    private func quotaStartScript(_ key: String, marker: String? = nil) -> String {
         // ponytail: one transient page key per read; an official browser API would remove this bridge.
         return #"""
-        (() => { if (location.origin !== "https://mcp.desktopcommander.app" || location.pathname !== "/usage") return "wrong-page";
+        (() => { if (location.origin !== "https://mcp.desktopcommander.app" || location.pathname !== "/usage" || ("\#(marker ?? "")" && location.hash !== "#\#(marker ?? "")")) return "wrong-page";
         const key = "\#(key)"; window[key] = "pending";
         (async () => { const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), 12000);
           try { const response = await fetch("https://auth.desktopcommander.app/auth/billing/usage", {credentials:"include", redirect:"error", signal:controller.signal});
             if (response.status === 401 || response.status === 403) { window[key] = "login"; return; }
-            if (!response.ok || Number(response.headers.get("content-length") || 0) > 262144 || !response.body) { window[key] = "unavailable"; return; }
+            if (!response.ok) { window[key] = "http-" + response.status; return; }
+            if (Number(response.headers.get("content-length") || 0) > 262144 || !response.body) { window[key] = "invalid-response"; return; }
             const reader = response.body.getReader(); let bytes = 0; const chunks = [];
-            while (true) { const part = await reader.read(); if (part.done) break; bytes += part.value.byteLength; if (bytes > 262144) { await reader.cancel(); window[key] = "unavailable"; return; } chunks.push(part.value); }
+            while (true) { const part = await reader.read(); if (part.done) break; bytes += part.value.byteLength; if (bytes > 262144) { await reader.cancel(); window[key] = "invalid-response"; return; } chunks.push(part.value); }
             const raw = new Uint8Array(bytes); let offset = 0; for (const part of chunks) { raw.set(part, offset); offset += part.length; }
-            const data = JSON.parse(new TextDecoder().decode(raw)); const usage = data && data.usage;
-            if (!usage || !Number.isSafeInteger(usage.callsUsed) || usage.callsUsed < 0 || usage.callsUsed > 1000000000 || typeof usage.plan !== "string" || usage.plan.length > 64 || !["free","pro"].includes(usage.plan.toLowerCase()) || (usage.month !== undefined && (typeof usage.month !== "string" || !/^\d{4}-(0[1-9]|1[0-2])$/.test(usage.month))) || (usage.callsIncluded === null ? usage.plan.toLowerCase() !== "pro" : (!Number.isSafeInteger(usage.callsIncluded) || usage.callsIncluded <= 0 || usage.callsIncluded > 1000000000))) { window[key] = "unavailable"; return; }
+            let data; try { data = JSON.parse(new TextDecoder().decode(raw)); } catch (_) { window[key] = "invalid-response"; return; }
+            const usage = data && data.usage;
+            if (!usage || !Number.isSafeInteger(usage.callsUsed) || usage.callsUsed < 0 || usage.callsUsed > 1000000000 || typeof usage.plan !== "string" || usage.plan.length > 64 || !["free","pro"].includes(usage.plan.toLowerCase()) || (usage.month !== undefined && (typeof usage.month !== "string" || !/^\d{4}-(0[1-9]|1[0-2])$/.test(usage.month))) || (usage.callsIncluded === null ? usage.plan.toLowerCase() !== "pro" : (!Number.isSafeInteger(usage.callsIncluded) || usage.callsIncluded <= 0 || usage.callsIncluded > 1000000000))) { window[key] = "invalid-response"; return; }
             window[key] = JSON.stringify({usage:{callsUsed:usage.callsUsed, callsIncluded:usage.callsIncluded, plan:usage.plan, month:usage.month}});
-          } catch (_) { window[key] = "unavailable"; } finally { clearTimeout(timer); }
+          } catch (_) { window[key] = controller.signal.aborted ? "timeout" : "network"; } finally { clearTimeout(timer); }
         })(); return "started"; })()
         """#
     }
+    private func closeQuotaWindow(id: String, tabID: String, marker: String, wait: Bool = false) {
+        guard !NSRunningApplication.runningApplications(withBundleIdentifier: "com.google.Chrome").isEmpty else { return }
+        guard let browser = chromeApplicationURL() else { return }
+        let source = """
+        with timeout of 3 seconds
+          if application \(appleScriptLiteral(browser.path)) is not running then return
+          tell application \(appleScriptLiteral(browser.path))
+            repeat with browserWindow in every window
+              if \(quotaOwnedWindowCondition(id: id)) then
+                repeat with browserTab in every tab of browserWindow
+                  if \(quotaOwnedTabCondition(id: tabID, marker: marker)) then close browserTab
+                end repeat
+                exit repeat
+              end if
+            end repeat
+          end tell
+        end timeout
+        """
+        let close = {
+            var error: NSDictionary?
+            _ = NSAppleScript(source: source)?.executeAndReturnError(&error)
+        }
+        if wait { close() } else { DispatchQueue.global(qos: .utility).async(execute: close) }
+    }
+    private func closeOwnedQuotaWindow(wait: Bool = true) {
+        guard let id = quotaOwnedWindowID, let tabID = quotaOwnedTabID, let marker = quotaOwnedMarker else { return }
+        quotaOwnedWindowID = nil; quotaOwnedTabID = nil; quotaOwnedMarker = nil
+        closeQuotaWindow(id: id, tabID: tabID, marker: marker, wait: wait)
+    }
+    private func finishDeferredTermination() {
+        guard quotaTerminateWhenIdle, !quotaRequestInFlight else { return }
+        quotaTerminateWhenIdle = false
+        closeOwnedQuotaWindow(wait: true)
+        NSApp.reply(toApplicationShouldTerminate: true)
+    }
     @objc private func refreshQuota() {
-        guard !previewMode, quotaEnabled, !quotaRequestInFlight else { return }
+        guard !previewMode, quotaEnabled, !quotaRequestInFlight, !quotaTerminateWhenIdle else { return }
         quotaRequestInFlight = true
-        if quota.used == nil { quota.state = .connecting; renderQuota() }
+        closeOwnedQuotaWindow()
+        quota.state = .refreshing; renderQuota()
         let key = "__commanderGuardQuota_" + UUID().uuidString.replacingOccurrences(of: "-", with: "")
         quotaRequestID = key
-        quotaDeadline = Date().addingTimeInterval(16)
-        browserJavaScript(quotaStartScript(key), selectAccount: true) { [self] value, permission in
-            guard self.quotaRequestID == key else { return }
-            if permission { self.finishQuota(key, state: .browserPermissionRequired); return }
+        quotaDeadline = Date().addingTimeInterval(25)
+        browserJavaScript(quotaStartScript(key), selectAccount: true, marker: key) { [self] value, permission in
+            if self.quotaRequestID != key {
+                if let value, value.utf8.count <= 8192, let ownedIDs = quotaCreatedWindowIDs(value, marker: key) {
+                    self.closeQuotaWindow(id: ownedIDs.window, tabID: ownedIDs.tab, marker: key)
+                }
+                return
+            }
+            if permission || value == "javascript-permission" { self.finishQuota(key, state: self.quotaCancelRequested || self.quotaTerminateWhenIdle ? .disconnected : .browserPermissionRequired); return }
+            guard let value, value.utf8.count <= 8192 else { self.finishQuota(key, state: self.quotaCancelRequested || self.quotaTerminateWhenIdle ? .disconnected : .unavailable, reason: "Chrome 返回了无效结果"); return }
+            if let ownedIDs = quotaCreatedWindowIDs(value, marker: key) {
+                self.quotaOwnedWindowID = ownedIDs.window; self.quotaOwnedTabID = ownedIDs.tab; self.quotaOwnedMarker = key
+                if self.quotaCancelRequested || self.quotaTerminateWhenIdle { self.finishQuota(key, state: .disconnected); return }
+                self.browserJavaScript(self.quotaStartScript(key, marker: key), ownedWindowID: ownedIDs.window, ownedTabID: ownedIDs.tab, marker: key, waitForReady: true) { result, permission in
+                    guard self.quotaRequestID == key else { return }
+                    if self.quotaCancelRequested || self.quotaTerminateWhenIdle { self.finishQuota(key, state: .disconnected); return }
+                    if permission { self.finishQuota(key, state: .browserPermissionRequired); return }
+                    guard let result, result.utf8.count <= 8192 else { self.finishQuota(key, state: .unavailable, reason: "Chrome 返回了无效结果"); return }
+                    if result == "javascript-permission" { self.finishQuota(key, state: .browserPermissionRequired); return }
+                    guard result == "started" else {
+                        let reason = result == "page-timeout" ? "官方用量页加载超时" : result == "owned-page-missing" ? "临时用量页已关闭" : "官方用量页无法读取"
+                        self.finishQuota(key, state: .unavailable, reason: reason); return
+                    }
+                    self.startQuotaPolling(key)
+                }
+                return
+            }
+            if self.quotaCancelRequested || self.quotaTerminateWhenIdle { self.finishQuota(key, state: .disconnected); return }
             guard value == "started" else {
                 let state: UsageQuota.State = value == "tab-missing" ? .browserTabMissing : value == "tab-ambiguous" ? .browserTabAmbiguous : .unavailable
-                self.finishQuota(key, state: state); return
+                let reason = value == "no-regular-window" ? "当前 Chrome 窗口不是普通窗口，未创建页面" : value == "creation-failed" ? "临时用量页创建失败" : nil
+                self.finishQuota(key, state: state, reason: reason); return
             }
-            self.quotaPollTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in self?.pollQuota(key) }
-            self.pollQuota(key)
+            self.startQuotaPolling(key)
         }
     }
+    private func startQuotaPolling(_ key: String) {
+        quotaPollTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in self?.pollQuota(key) }
+        pollQuota(key)
+    }
     private func pollQuota(_ key: String) {
-        guard quotaRequestID == key, !quotaPollBusy else { return }
-        if Date() > quotaDeadline { finishQuota(key, state: .unavailable); return }
+        guard quotaRequestID == key else { return }
+        if quotaCancelRequested || quotaTerminateWhenIdle {
+            if !quotaPollBusy { finishQuota(key, state: .disconnected) }
+            return
+        }
+        guard !quotaPollBusy else { return }
+        if Date() > quotaDeadline { finishQuota(key, state: .unavailable, reason: "额度请求超时"); return }
         quotaPollBusy = true
         let script = #"(() => { if (location.origin !== "https://mcp.desktopcommander.app" || location.pathname !== "/usage") return "key-missing"; const key = "\#(key)"; if (!(key in window)) return "key-missing"; const result = window[key]; if (result !== "pending") delete window[key]; return result; })()"#
-        browserJavaScript(script) { value, permission in
+        browserJavaScript(script, ownedWindowID: self.quotaOwnedWindowID, ownedTabID: self.quotaOwnedTabID, marker: self.quotaOwnedMarker) { value, permission in
             guard self.quotaRequestID == key else { return }
             self.quotaPollBusy = false
+            if self.quotaCancelRequested || self.quotaTerminateWhenIdle { self.finishQuota(key, state: .disconnected); return }
             if permission { self.finishQuota(key, state: .browserPermissionRequired); return }
-            guard let value else { self.finishQuota(key, state: .unavailable); return }
+            guard let value, value.utf8.count <= 8192 else { self.finishQuota(key, state: .unavailable, reason: "未能读取 Chrome 页面"); return }
             if value == "pending" { return }
-            if value == "tab-missing" { self.finishQuota(key, state: .browserTabMissing); return }
-            if value == "key-missing" { self.finishQuota(key, state: .unavailable); return }
+            if value == "tab-missing" || value == "owned-page-missing" { self.finishQuota(key, state: .browserTabMissing, reason: "Chrome 中的用量页已关闭"); return }
+            if value == "key-missing" { self.finishQuota(key, state: .unavailable, reason: "用量页脚本状态已丢失"); return }
             if value == "login" { self.finishQuota(key, state: .loginRequired); return }
-            guard value.utf8.count <= 8192, let data = value.data(using: .utf8), let validated = UsageQuota.parse(data) else { self.finishQuota(key, state: .unavailable); return }
+            if value == "timeout" { self.finishQuota(key, state: .unavailable, reason: "额度请求超时"); return }
+            if value == "network" { self.finishQuota(key, state: .unavailable, reason: "额度服务连接失败"); return }
+            if value == "invalid-response" { self.finishQuota(key, state: .unavailable, reason: "额度服务返回的数据无效"); return }
+            if value.range(of: #"^http-[1-5][0-9]{2}$"#, options: .regularExpression) != nil { self.finishQuota(key, state: .unavailable, reason: "额度服务 HTTP \(value.dropFirst(5))"); return }
+            guard let data = value.data(using: .utf8), let validated = UsageQuota.parse(data) else { self.finishQuota(key, state: .unavailable, reason: "额度服务返回的数据无效"); return }
             self.quota = validated
             self.finishQuota(key, state: nil)
         }
     }
-    private func finishQuota(_ key: String, state: UsageQuota.State?) {
+    private func finishQuota(_ key: String, state: UsageQuota.State?, reason: String? = nil) {
         guard quotaRequestID == key else { return }
         quotaPollTimer?.invalidate(); quotaPollTimer = nil
         quotaRequestInFlight = false; quotaPollBusy = false; quotaRequestID = nil
+        quotaCancelRequested = false
+        quotaFailureReason = state == nil || state == .disconnected ? nil : reason ?? quotaFailureLabel(state!)
         if let state {
             if state == .loginRequired { quota = UsageQuota(state: .loginRequired) }
+            else if state == .disconnected { quota = UsageQuota(state: .disconnected) }
             else { quota.state = state }
             if state != .browserTabMissing && state != .browserTabAmbiguous && state != .browserPermissionRequired {
                 let script = #"(() => { if (location.origin !== "https://mcp.desktopcommander.app" || location.pathname !== "/usage" || !("\#(key)" in window)) return "key-missing"; delete window["\#(key)"]; return ""; })()"#
                 browserJavaScript(script) { _, _ in }
             }
         }
+        closeOwnedQuotaWindow(wait: true)
         renderQuota()
+        finishDeferredTermination()
+    }
+    private func quotaFailureLabel(_ state: UsageQuota.State) -> String {
+        switch state {
+        case .browserTabMissing: return "未找到官方用量页"
+        case .browserTabAmbiguous: return "检测到多个用量页，未选择账户"
+        case .browserPermissionRequired: return "Chrome 自动化权限未开启"
+        case .loginRequired: return "官方用量页需要重新登录"
+        default: return "暂时无法读取"
+        }
     }
     private func quotaFailed(_ state: UsageQuota.State = .unavailable) {
+        quotaFailureReason = "无法打开 Chrome"
         quota.state = quota.used == nil ? state : .stale
         renderQuota()
     }
@@ -3830,7 +4084,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         do { try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true) }
         catch { fputs("CommanderGuard: unable to create status directory\n", stderr); return }
         let rows = activityStepRows(snapshot.activity.steps, uptime: ProcessInfo.processInfo.systemUptime)
-        let safeSteps: [[String: Any]] = snapshot.activity.steps.map { step in ["tool": step.tool, "detail": step.detail, "started_at": step.historical ? NSNull() : ISO8601DateFormatter.flex.string(from: step.startedAt) as Any, "elapsed_seconds": step.elapsed(at: ProcessInfo.processInfo.systemUptime) as Any? ?? NSNull(), "duration_seconds": step.duration as Any? ?? NSNull(), "uncertain": step.uncertain, "failed": step.failed, "historical": step.historical, "finished": step.finished, "session": CommanderActivity.sessionDisplay(step.sessionKey) as Any? ?? NSNull(), "session_source": step.sessionSource as Any? ?? NSNull(), "session_attribution_conflict": step.sessionAttributionConflict] }
+        let safeSteps: [[String: Any]] = snapshot.activity.steps.map { step in ["tool": CommanderActivity.safeToolIdentifier(step.tool), "detail": step.detail, "started_at": step.historical ? NSNull() : ISO8601DateFormatter.flex.string(from: step.startedAt) as Any, "elapsed_seconds": step.elapsed(at: ProcessInfo.processInfo.systemUptime) as Any? ?? NSNull(), "duration_seconds": step.duration as Any? ?? NSNull(), "uncertain": step.uncertain, "failed": step.failed, "historical": step.historical, "finished": step.finished, "session": CommanderActivity.sessionDisplay(step.sessionKey) as Any? ?? NSNull(), "session_source": step.sessionSource as Any? ?? NSNull(), "session_attribution_conflict": step.sessionAttributionConflict] }
         let latestStep = currentCallStep(snapshot.activity)
         let callElapsed = latestStep?.elapsed(at: ProcessInfo.processInfo.systemUptime)
         let currentState = callState(snapshot.activity)
@@ -3838,9 +4092,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let lastAppEvent: [String: Any] = snapshot.timeline.latestAppEvent.map { ["event": $0.event, "conversation_title": $0.conversationTitle as Any? ?? NSNull(), "failure_kind": $0.failureKind as Any? ?? NSNull(), "source_timestamp": $0.sourceAt as Any? ?? NSNull(), "observed_at": $0.observedAt] } ?? [:]
         let chat = chatMonitorSummary(snapshot.timeline)
         let diagnosis = currentDiagnosis()
-        var object: [String: Any] = ["chatgpt": ["answer": chat.answer, "update_connection": chat.connection, "recent_issue": chat.history as Any? ?? NSNull(), "coverage": snapshot.timeline.coverage, "delivery_timeout_directly_observable": false, "limitation": chat.deliveryLimit], "service": snapshot.service, "cloud": snapshot.cloud, "last_seen": snapshot.lastSeen.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "checked_at": ISO8601DateFormatter.flex.string(from: snapshot.checked), "error_count": snapshot.errorCount, "paused": paused, "idle_prevention": assertion != 0, "message": snapshot.message, "channel": ["state": snapshot.channelState, "detail": snapshot.channelDetail, "consecutive_no_live": snapshot.channelFailures, "checked_at": snapshot.channelChecked.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "auto_recovery_enabled": recoveryLedger.autoRecoveryEnabled, "last_recovery_attempt": recoveryLedger.lastAttempt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "last_ping_at": lastPingAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "last_ping_result": lastPingResult, "check_deferred_reason": deferredReason, "recovery_status": recoveryAvailability(), "last_recovery_result": lastRecoveryOutcome as Any? ?? NSNull()], "menu": ["menubar_title": item.button?.title ?? "", "menubar_has_icon": item.button?.image != nil, "connection": summaryLines[0].title, "channel": summaryLines[0].title, "tool_execution": summaryLines[1].title, "action": summaryLines[2].title, "recovery": summaryLines[3].title, "chatgpt": summaryLines[4].title, "execution_step_rows": rows, "execution_steps": safeSteps, "tool_call_elapsed_seconds": callElapsed as Any? ?? NSNull(), "tool_call_state": currentState, "recent_actions": snapshot.activity.recent], "activity": ["state": snapshot.activity.state, "tool": snapshot.activity.tool, "active_count": snapshot.activity.activeCount, "observed_at": snapshot.activity.observed.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "recent": snapshot.activity.recent, "error": snapshot.activity.error, "coverage_gap": snapshot.activity.coverageGap, "gap_reason": snapshot.activity.gapReason, "gap_first_at": snapshot.activity.gapFirstAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "gap_last_at": snapshot.activity.gapLastAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "backlog_bytes": snapshot.activity.backlogBytes, "catching_up": snapshot.activity.catchingUp, "pending_line": snapshot.activity.pendingLine, "idle_proven": snapshot.activity.idleProven], "timeline": ["coverage": snapshot.timeline.coverage, "commander_errors_this_run": snapshot.timeline.commanderErrors, "conversation_labels_verified_at": snapshot.timeline.conversationLabelsVerifiedAt as Any? ?? NSNull(), "last_chatgpt_app_event": lastAppEvent, "events": timelineRows]]
+        var object: [String: Any] = ["chatgpt": ["answer": chat.answer, "update_connection": chat.connection, "recent_issue": chat.history as Any? ?? NSNull(), "coverage": snapshot.timeline.coverage, "delivery_timeout_directly_observable": false, "limitation": chat.deliveryLimit], "service": snapshot.service, "cloud": snapshot.cloud, "last_seen": snapshot.lastSeen.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "checked_at": ISO8601DateFormatter.flex.string(from: snapshot.checked), "error_count": snapshot.errorCount, "paused": paused, "idle_prevention": assertion != 0, "message": snapshot.message, "channel": ["state": snapshot.channelState, "detail": snapshot.channelDetail, "consecutive_no_live": snapshot.channelFailures, "checked_at": snapshot.channelChecked.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "auto_recovery_enabled": recoveryLedger.autoRecoveryEnabled, "last_recovery_attempt": recoveryLedger.lastAttempt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "last_ping_at": lastPingAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "last_ping_result": lastPingResult, "check_deferred_reason": deferredReason, "recovery_status": recoveryAvailability(), "last_recovery_result": lastRecoveryOutcome as Any? ?? NSNull()], "menu": ["menubar_title": item.button?.title ?? "", "menubar_has_icon": item.button?.image != nil, "connection": summaryLines[0].title, "channel": summaryLines[0].title, "tool_execution": summaryLines[1].title, "action": summaryLines[2].title, "recovery": summaryLines[3].title, "chatgpt": summaryLines[4].title, "execution_step_rows": rows, "execution_steps": safeSteps, "tool_call_elapsed_seconds": callElapsed as Any? ?? NSNull(), "tool_call_state": currentState, "recent_actions": snapshot.activity.recent], "activity": ["state": snapshot.activity.state, "tool": CommanderActivity.safeToolIdentifier(snapshot.activity.tool), "active_count": snapshot.activity.activeCount, "observed_at": snapshot.activity.observed.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "recent": snapshot.activity.recent, "error": snapshot.activity.error, "coverage_gap": snapshot.activity.coverageGap, "gap_reason": snapshot.activity.gapReason, "gap_first_at": snapshot.activity.gapFirstAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "gap_last_at": snapshot.activity.gapLastAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "backlog_bytes": snapshot.activity.backlogBytes, "catching_up": snapshot.activity.catchingUp, "pending_line": snapshot.activity.pendingLine, "idle_proven": snapshot.activity.idleProven], "timeline": ["coverage": snapshot.timeline.coverage, "commander_errors_this_run": snapshot.timeline.commanderErrors, "conversation_labels_verified_at": snapshot.timeline.conversationLabelsVerifiedAt as Any? ?? NSNull(), "last_chatgpt_app_event": lastAppEvent, "events": timelineRows]]
         object["tool_execution"] = ["state": snapshot.toolExecutionState, "detail": snapshot.toolExecutionDetail, "checked_at": snapshot.toolExecutionChecked.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "fresh": toolExecutionFresh(snapshot, now: Date()), "evidence_ttl_seconds": Int(toolExecutionEvidenceTTL), "probe_deferred_reason": toolProbeDeferredReason]
-        object["usage_quota"] = ["state": quota.state.rawValue, "used": quota.used as Any? ?? NSNull(), "total": quota.total as Any? ?? NSNull(), "remaining": quota.remaining as Any? ?? NSNull(), "plan": quota.plan.isEmpty ? NSNull() : quota.plan as Any, "month": quota.month.isEmpty ? NSNull() : quota.month as Any, "last_successful_sync": quota.syncedAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull()]
+        object["usage_quota"] = ["state": quota.state.rawValue, "used": quota.used as Any? ?? NSNull(), "total": quota.total as Any? ?? NSNull(), "remaining": quota.remaining as Any? ?? NSNull(), "plan": quota.plan.isEmpty ? NSNull() : quota.plan as Any, "month": quota.month.isEmpty ? NSNull() : quota.month as Any, "last_successful_sync": quota.syncedAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "last_error": quotaFailureReason as Any? ?? NSNull()]
         object["channel_incident"] = [
             "active": channelIncident.activeCategory != nil,
             "category": channelIncident.activeCategory?.rawValue as Any? ?? NSNull(),
@@ -3857,17 +4111,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             "last_probe_result": channelIncident.lastProbeResult as Any? ?? NSNull(),
             "decision_log": "channel-decisions.jsonl"
         ]
-        let latestHistory: [String: Any] = snapshot.toolHistory.latest.map { record in ["tool": record.tool, "label": record.label, "timestamp": ISO8601DateFormatter.flex.string(from: record.timestamp), "duration_seconds": record.duration as Any? ?? NSNull(), "result": record.resultLabel, "cloud_receipt": record.cloudReceiptLabel, "process_caveat": record.processCaveat as Any? ?? NSNull()] } ?? [:]
+        let latestHistory: [String: Any] = snapshot.toolHistory.latest.map { record in ["tool": CommanderActivity.safeToolIdentifier(record.tool), "label": record.label, "timestamp": ISO8601DateFormatter.flex.string(from: record.timestamp), "duration_seconds": record.duration as Any? ?? NSNull(), "result": record.resultLabel, "cloud_receipt": record.cloudReceiptLabel, "process_caveat": record.processCaveat as Any? ?? NSNull()] } ?? [:]
         object["tool_history"] = ["state": snapshot.toolHistory.state, "source_available": snapshot.toolHistory.sourceAvailable, "bootstrap_limited": snapshot.toolHistory.bootstrapLimited, "coverage_gap": snapshot.toolHistory.coverageGap, "gap_reason": snapshot.toolHistory.gapReason, "malformed_lines": snapshot.toolHistory.malformedLines, "backlog_bytes": snapshot.toolHistory.backlogBytes, "latest": latestHistory, "limitation": "结构化历史无可靠调用编号，不按时间与会话或 stdout 记录合并"]
         object["diagnosis"] = ["title": diagnosis.title, "started_at": diagnosis.startedAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "last_seen_at": diagnosis.lastSeenAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "next_action": diagnosis.nextAction, "evidence": diagnosis.evidence]
         guard let d = try? JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys]) else { return }
         do { try d.write(to: dir.appendingPathComponent("status.json"), options: .atomic) }
         catch { fputs("CommanderGuard: unable to write sanitized status file\n", stderr) }
     }
-    @objc private func togglePause() { paused.toggle(); updateGuard(); render() }
+    @objc private func togglePause() { paused.toggle(); UserDefaults.standard.set(!paused, forKey: "keepAwakeEnabled"); updateGuard(); render() }
     @objc private func toggleAutoRecovery() {
         var next = recoveryLedger; next.autoRecoveryEnabled.toggle()
-        guard next.save(to: recoveryURL) else { snapshot.channelDetail = "自动恢复设置无法保存"; render(); return }
+        guard next.save(to: recoveryURL) else { manualNotice = "自动恢复设置无法保存；设置未改变"; snapshot.channelDetail = manualNotice!; render(); return }
+        manualNotice = nil
         recoveryLedger = next; recoveryItem.state = next.autoRecoveryEnabled ? .on : .off
         if !next.autoRecoveryEnabled && watchdog.recovering && !recoveryLaunched { abortRecovery("自动恢复已关闭；未开始重启") }
         else { render() }
@@ -3962,8 +4217,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         heroes.widthAnchor.constraint(equalTo: layout.widthAnchor, constant: -56).isActive = true
 
         let controls = NSStackView(); controls.orientation = .horizontal; controls.alignment = .centerY; controls.spacing = 22
-        let recovery = NSButton(checkboxWithTitle: "自动恢复命令连接", target: self, action: #selector(toggleAutoRecovery))
-        let wake = NSButton(checkboxWithTitle: "保持电脑唤醒", target: self, action: #selector(togglePause))
+        let recovery = NSButton(checkboxWithTitle: "自动恢复本机 Commander", target: self, action: #selector(toggleAutoRecovery))
+        recovery.toolTip = "自动探测累计 3 次明确断链，且日志完整并确认没有本机任务时，才重启本机 Commander；不会重试原任务或修复云端问题。"
+        let wake = NSButton(checkboxWithTitle: "防止闲置睡眠（Guard）", target: self, action: #selector(togglePause))
+        wake.toolTip = "仅防止系统因闲置而睡眠，不阻止手动睡眠、屏幕息屏或重启。关闭只撤销 Guard 的请求；其他程序仍可能保持唤醒。"
         let check = NSButton(title: "检查链路", target: self, action: #selector(manualCheck)); check.bezelStyle = .rounded
         [recovery, wake, check].forEach { $0.isEnabled = !previewMode }
         panelRecoveryToggle = recovery; panelWakeToggle = wake
@@ -3973,15 +4230,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let controlContent = vertical(5)
         controlContent.addArrangedSubview(controls)
         controls.widthAnchor.constraint(equalTo: controlContent.widthAnchor).isActive = true
-        let recoveryStatus = label("自动恢复：等待检查", size: 11, color: .secondaryLabelColor)
+        let recoveryStatus = label("自动恢复：等待检查", size: 12, weight: .semibold)
         panelRecoveryStatus = recoveryStatus
         controlContent.addArrangedSubview(recoveryStatus)
+        controlContent.addArrangedSubview(label("自动探测累计 3 次明确断链且确认无本机任务后，才重启本机 Commander；不会重试原任务或修复云端。", size: 12, color: .secondaryLabelColor))
+        let wakeStatus = label("保持唤醒：等待检查", size: 12, weight: .semibold)
+        panelWakeStatus = wakeStatus
+        controlContent.addArrangedSubview(wakeStatus)
+        controlContent.addArrangedSubview(label("只防闲置睡眠；不阻止手动睡眠或屏幕息屏。关闭只撤销 Guard 请求，其他程序仍可能保持唤醒。", size: 12, color: .secondaryLabelColor))
         let controlCard = card(controlContent, padding: 16)
         panelControlCard = controlCard
         layout.addArrangedSubview(controlCard)
         controlCard.widthAnchor.constraint(equalTo: layout.widthAnchor, constant: -56).isActive = true
 
-        let nav = NSSegmentedControl(labels: ["概览", "操作记录", "连接状态"], trackingMode: .selectOne, target: self, action: #selector(panelPageChanged(_:)))
+        let nav = NSSegmentedControl(labels: ["概览", "操作记录", "故障与恢复"], trackingMode: .selectOne, target: self, action: #selector(panelPageChanged(_:)))
         nav.selectedSegment = panelPage; nav.segmentStyle = .rounded; nav.heightAnchor.constraint(equalToConstant: 32).isActive = true
         panelNav = nav; layout.addArrangedSubview(nav)
         let scroll = NSScrollView(); scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true; scroll.drawsBackground = false
@@ -4022,7 +4284,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                                      startedAt: nil,
                                      lastSeenAt: snapshot.channelChecked,
                                      nextAction: "无需因最近故障记录重复重启；继续观察当前通道和工具执行状态。",
-                                     evidence: "当前健康状态与最近故障记录分开保存；最近故障仍可在“连接状态”中查看。")
+                                     evidence: "当前健康状态与最近故障记录分开保存；故障和恢复时间可在“故障与恢复”中查看。")
         }
         return base
     }
@@ -4067,6 +4329,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         panelRecoveryToggle?.state = recoveryLedger.autoRecoveryEnabled ? .on : .off
         panelWakeToggle?.state = paused ? .off : .on
         panelRecoveryStatus?.stringValue = "自动恢复：\(middleTruncate(recoveryAvailability(), limit: 85))"
+        panelWakeStatus?.stringValue = "保持唤醒：\(wakePreventionSummary(enabled: !paused, serviceRunning: snapshot.service == "运行中", assertionActive: assertion != 0))"
         renderPanelPage()
     }
     private func row(_ title: String, _ value: String, color: NSColor = .labelColor) -> NSView {
@@ -4126,17 +4389,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         guard panelWindow != nil else { return }
         let recordsPage = panelPage == 1
         panelHeading?.isHidden = panelPage != 0
-        panelHeroes?.isHidden = recordsPage
-        panelControlCard?.isHidden = recordsPage
-        panelConnectionDetail?.isHidden = recordsPage
-        panelToolExecutionDetail?.isHidden = recordsPage
-        panelChatDetail?.isHidden = recordsPage
-        panelHeroMinimum?.constant = recordsPage ? 0 : 76
+        panelHeroes?.isHidden = panelPage != 0
+        panelControlCard?.isHidden = panelPage != 0
+        panelConnectionDetail?.isHidden = panelPage != 0
+        panelToolExecutionDetail?.isHidden = panelPage != 0
+        panelChatDetail?.isHidden = panelPage != 0
+        panelHeroMinimum?.constant = panelPage == 0 ? 76 : 0
         panelScroll?.hasVerticalScroller = !recordsPage
         if recordsPage { renderLogPage(); return }
 
-        let activity = snapshot.activity
         if panelPage == 0 {
+            let activity = snapshot.activity
             let diagnosis = currentDiagnosis()
             var activityRows: [(String, String)] = []
             if let active = currentCallStep(activity) {
@@ -4153,75 +4416,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             } else if activity.catchingUp || activity.pendingLine {
                 activityRows.append(("注意", "本机操作日志仍在追赶；Guard 暂不判断为空闲"))
             }
+            var statusRows = [("状态", diagnosis.title), ("建议", diagnosis.nextAction)]
+            if let notice = manualNotice { statusRows.append(("操作提示", displayPingResult(notice))) }
+            else if manualPingBusy || channelBusy { statusRows.append(("链路检查", "正在检查消息通道…")) }
+            else if toolProbeBusy { statusRows.append(("链路检查", "正在执行只读工具检查…")) }
             setSections([
-                section("当前状态", rows: [("状态", diagnosis.title), ("建议", diagnosis.nextAction)]),
+                section("当前状态", rows: statusRows),
                 quotaSection(),
                 section("当前任务", rows: activityRows)
             ])
             return
         }
 
-        let now = Date()
-        let guardAction: String
-        if channelIncident.activeCategory == .cloudRealtimeCapacity {
-            guardAction = channelBusy || manualPingBusy ? "正在复查云端实时连接" : "正在等待云端恢复，并按退避节奏自动复查"
-        } else if channelIncident.activeCategory != nil {
-            if channelBusy || manualPingBusy {
-                guardAction = "正在复查 Commander 连接"
-            } else if let next = channelIncident.nextRecheck, next > now {
-                let seconds = max(1, Int(next.timeIntervalSince(now).rounded(.up)))
-                guardAction = "连接仍有异常，约 \(seconds) 秒后自动复查"
-            } else {
-                guardAction = "连接仍有异常，准备再次复查"
-            }
-        } else if watchdog.recovering {
-            guardAction = "正在执行安全恢复，并等待恢复结果"
-        } else if channelBusy || manualPingBusy {
-            guardAction = "正在检查 Commander 连接"
-        } else {
-            guardAction = "持续监控中；当前无需你操作"
-        }
-
-        let recoveryText: String
-        if localRestartSuppressed(for: channelIncident.activeCategory) {
-            recoveryText = "云端容量异常，本机不会重启；Guard 只等待并复查"
-        } else if !recoveryLedger.autoRecoveryEnabled {
-            recoveryText = "已关闭；断线时只提示，不会自动重启 Commander"
-        } else if watchdog.recovering {
-            recoveryText = "正在安全恢复 Commander"
-        } else if !recoveryLedger.canAttempt(at: now) {
-            recoveryText = "已开启；刚执行过恢复，当前处于冷却期"
-        } else if snapshot.service != "运行中" {
-            recoveryText = "已开启；正在等待 Commander 服务恢复"
-        } else if !activitySafeForRecovery(activity) {
-            if activity.activeCount > 0 {
-                recoveryText = "已开启；当前有本机任务，为避免打断暂不重启"
-            } else {
-                recoveryText = "已开启；当前无法确认安全空闲，为避免误伤暂不重启"
-            }
-        } else {
-            recoveryText = "已开启；只有明确断链且确认安全时才会重启 Commander"
-        }
-
-        var sections: [NSView] = [
-            section("连接处理", rows: [
-                ("状态", guardAction),
-                ("自动恢复", recoveryText),
-                ("最近检查", stamp(channelIncident.lastProbeAt ?? lastPingAt))
-            ])
-        ]
+        var sections: [NSView] = []
 
         if let recentCategory = channelIncident.recentCategory {
-            let result = channelIncident.activeCategory == nil ? "已恢复" : "仍在发生"
+            let result = channelIncident.activeCategory == nil ? "已恢复" : "恢复尚未确认"
             var issueRows: [(String, String)] = [
                 ("问题", recentCategory.title),
                 ("状态", result),
-                ("首次发现", stamp(channelIncident.firstSeen)),
-                ("最近发生", stamp(channelIncident.lastSeen))
+                ("首次发现", prominentStamp(channelIncident.firstSeen)),
+                ("最近发生", prominentStamp(channelIncident.lastSeen))
             ]
             if channelIncident.activeCategory == nil {
-                issueRows.append(("恢复时间", stamp(channelIncident.recoveredAt)))
+                issueRows.append(("恢复时间", prominentStamp(channelIncident.recoveredAt)))
             }
+            if let lastPingAt { issueRows.append(("最近探测", "\(prominentStamp(lastPingAt)) · \(displayPingResult(lastPingResult))")) }
+            if let lastRecoveryOutcome { issueRows.append(("恢复结果", lastRecoveryOutcome)) }
             sections.append(section("最近一次 Commander 连接问题", rows: issueRows))
         }
 
@@ -4238,17 +4459,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             }
             sections.append(section("最近一次 ChatGPT 异常", rows: [
                 ("问题", issueName),
-                ("发生时间", stamp(issueAt)),
+                ("发生时间", prominentStamp(issueAt)),
                 ("当前情况", chat.history ?? "恢复情况未确认")
             ]))
         }
 
-        var notices: [(String, String)] = []
-        if activity.error || activity.coverageGap || activity.catchingUp || activity.pendingLine {
-            notices.append(("自动恢复", "本机操作记录暂时不完整，因此 Guard 不会冒险重启 Commander"))
-        }
-        if !notices.isEmpty {
-            sections.append(section("安全限制", rows: notices))
+        if sections.isEmpty {
+            sections.append(section("故障记录", rows: [("状态", "近期未记录到故障")]))
         }
         setSections(sections)
     }
@@ -4265,12 +4482,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             recordDocument = doc
 
             let title = label("本机操作记录", size: 16, weight: .semibold)
-            let hint = label("点击一条记录查看脱敏后的时间、状态、耗时和操作详情。", size: 12, color: .secondaryLabelColor)
+            let hint = label("默认隐藏连接检查；选择记录可查看脱敏后的操作详情。", size: 12, color: .secondaryLabelColor)
             title.translatesAutoresizingMaskIntoConstraints = false
             hint.translatesAutoresizingMaskIntoConstraints = false
 
             let search = NSSearchField()
-            search.placeholderString = "搜索命令、工具、路径或会话"
+            search.placeholderString = "搜索命令、工具、路径或已有会话"
             (search.cell as? NSSearchFieldCell)?.sendsSearchStringImmediately = true
             search.target = self
             search.action = #selector(recordSearchChanged(_:))
@@ -4278,7 +4495,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             recordSearch = search
 
             let filter = NSPopUpButton()
-            filter.addItems(withTitles: ["全部", "进行中", "异常与未确认"])
+            filter.addItems(withTitles: ["常规操作", "进行中", "异常与未确认", "全部（含连接检查）"])
             filter.target = self
             filter.action = #selector(recordFilterChanged(_:))
             filter.widthAnchor.constraint(equalToConstant: 180).isActive = true
@@ -4352,11 +4569,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let mode = recordFilter?.indexOfSelectedItem ?? 0
 
         recordSteps = snapshot.activity.steps.filter { step in
-            let owner = step.sessionAttributionConflict ? "归属冲突" : (CommanderActivity.sessionDisplay(step.sessionKey) ?? "归属未确认")
-            let text = "\(step.tool) \(step.detail) \(owner) \(step.sessionSource ?? "")".lowercased()
+            let owner = step.sessionAttributionConflict ? "归属冲突" : (CommanderActivity.sessionDisplay(step.sessionKey) ?? "")
+            let text = "\(CommanderActivity.safeToolIdentifier(step.tool)) \(step.detail) \(owner)".lowercased()
             let matchesQuery = query.isEmpty || text.contains(query)
-            let matchesMode = mode == 0 || (mode == 1 ? (!step.finished && !step.failed && !step.uncertain) : (step.failed || step.uncertain))
-            return matchesQuery && matchesMode
+            let matchesMode = mode == 1 ? (!step.finished && !step.failed && !step.uncertain) : (mode == 2 ? (step.failed || step.uncertain) : true)
+            return matchesQuery && matchesMode && (mode == 3 || step.tool != "ping")
         }
 
         if !recordSteps.contains(where: { $0.id == selectedRecordID }) { selectedRecordID = recordSteps.first?.id }
@@ -4389,8 +4606,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let step = recordSteps[row]
         let time = step.historical ? "时间未知" : prominentStamp(step.startedAt)
         let status = step.uncertain ? "未确认" : step.failed ? "异常" : step.finished ? "已返回" : "进行中"
-        let owner = step.sessionAttributionConflict ? "归属冲突" : (CommanderActivity.sessionDisplay(step.sessionKey) ?? "归属未确认")
-        let field = NSTextField(wrappingLabelWithString: "\(time) · [\(owner)] · \(status) · \(step.detail)")
+        let attribution = step.sessionAttributionConflict ? "归属冲突" : CommanderActivity.sessionDisplay(step.sessionKey)
+        let field = NSTextField(wrappingLabelWithString: "\(time) · \(status) · \(attribution.map { "[\($0)] · " } ?? "")\(step.detail)")
         field.lineBreakMode = .byTruncatingTail; field.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
         field.textColor = step.uncertain ? .systemOrange : step.failed ? .systemRed : .labelColor
         return field
@@ -4404,11 +4621,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let time = step.historical ? "时间未知" : prominentStamp(step.startedAt)
         let state = step.uncertain ? "未确认" : step.failed ? "异常" : step.finished ? "已返回" : "进行中"
         let duration = step.historical ? "耗时未知" : step.uncertain ? "耗时未确认" : step.duration.map(durationText) ?? barCallClock(step, uptime: ProcessInfo.processInfo.systemUptime)
-        let owner: String
-        if step.sessionAttributionConflict { owner = "归属冲突 · 未采用" }
-        else if let display = CommanderActivity.sessionDisplay(step.sessionKey) { owner = "\(display)（\(step.sessionSource ?? "上游会话字段")）" }
-        else { owner = "归属未确认 · 上游未提供稳定会话字段" }
-        let value = "\(time)  ·  \(state)  ·  \(duration)\n归属：\(owner)\n\(step.detail)"
+        let attribution = step.sessionAttributionConflict ? "归属冲突 · 未采用" : CommanderActivity.sessionDisplay(step.sessionKey).map { "归属：\($0)（\(step.sessionSource ?? "上游会话字段")）" }
+        let value = "\(time)  ·  \(state)  ·  \(duration)\n工具：\(CommanderActivity.safeToolIdentifier(step.tool))\n\(attribution.map { $0 + "\n" } ?? "")\(step.detail)"
         if recordDetail?.currentEditor() == nil, recordDetail?.stringValue != value { recordDetail?.stringValue = value }
     }
     private func loadPreviewSnapshot() {
@@ -4424,10 +4638,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         snapshot.activity.active = ["执行命令": 1]
         let previewSession = CommanderActivity.sessionAttribution(Data(" metadata: {\"openai/session\":\"preview-session-alpha\"}".utf8))!.key
         snapshot.activity.steps = [
-            ActivityStep(id: "preview-1", tool: "读取文件", detail: "读取文件 · /Projects/example/README.md", startedAt: now.addingTimeInterval(-95), startedUptime: uptime - 95, duration: 2, finished: true, sessionKey: previewSession, sessionSource: "openai/session"),
-            ActivityStep(id: "preview-2", tool: "执行命令", detail: "执行命令 · swift test --filter ConnectionTests", startedAt: now.addingTimeInterval(-34), startedUptime: uptime - 34, duration: nil, sessionKey: previewSession, sessionSource: "openai/session"),
-            ActivityStep(id: "preview-3", tool: "搜索", detail: "搜索 · rg -n 'connection' Sources", startedAt: now.addingTimeInterval(-240), startedUptime: uptime - 240, duration: 1, finished: true),
-            ActivityStep(id: "preview-4", tool: "读取文件", detail: "读取文件 · /Projects/example/error.log", startedAt: now.addingTimeInterval(-18), startedUptime: uptime - 18, duration: 0.4, failed: true, finished: true)
+            ActivityStep(id: "preview-1", tool: "read_file", detail: "读取文件 · /Projects/example/README.md", startedAt: now.addingTimeInterval(-95), startedUptime: uptime - 95, duration: 2, finished: true, sessionKey: previewSession, sessionSource: "openai/session"),
+            ActivityStep(id: "preview-2", tool: "start_process", detail: "执行命令 · swift test --filter ConnectionTests", startedAt: now.addingTimeInterval(-34), startedUptime: uptime - 34, duration: nil, sessionKey: previewSession, sessionSource: "openai/session"),
+            ActivityStep(id: "preview-3", tool: "start_search", detail: "搜索 · rg -n 'connection' Sources", startedAt: now.addingTimeInterval(-240), startedUptime: uptime - 240, duration: 1, finished: true),
+            ActivityStep(id: "preview-4", tool: "read_file", detail: "读取文件 · /Projects/example/error.log", startedAt: now.addingTimeInterval(-18), startedUptime: uptime - 18, duration: 0.4, failed: true, finished: true),
+            ActivityStep(id: "preview-5", tool: "ping", detail: "连接检查（ping）", startedAt: now.addingTimeInterval(-20), startedUptime: uptime - 20, duration: 0.1, finished: true)
         ]
         let makeTime: (TimeInterval) -> String = { ISO8601DateFormatter.flex.string(from: now.addingTimeInterval($0)) }
         let issue = TimelineEvent(source: "chatgpt_app", event: "chatgpt_completion_transport_recovery_started", sourceAt: makeTime(-65), observedAt: makeTime(-64), conversationTitle: "设计讨论", failureKind: "resume_unavailable")
@@ -4443,6 +4658,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             guard condition() else { fputs("CommanderGuard UI check failed: \(message)\n", stderr); exit(2) }
         }
         guard let window = panelWindow, let root = window.contentView, let scroll = panelScroll else { fputs("CommanderGuard UI check failed: panel was not created\n", stderr); exit(2) }
+        let savedSnapshot = snapshot, savedRecoveryLedger = recoveryLedger
+        recoveryLedger = ChannelRecoveryLedger()
+        snapshot.activity = ActivitySummary(state: "未观察到新调用", idleProven: true)
+        snapshot.channelChecked = Date()
+        verify(recoveryAvailability() == "已开启 · 监测中，当前无需恢复", "Healthy checked channel must not claim it is still waiting for its first check")
+        snapshot.channelChecked = Date().addingTimeInterval(-3600)
+        verify(recoveryAvailability() == "已开启 · 等待下一次通道检查", "Expired channel evidence must remain due for a new check")
+        snapshot = savedSnapshot; recoveryLedger = savedRecoveryLedger
         verify(middleTruncate("云端实时服务连接池异常", limit: 12).count <= 12, "small-limit middle truncation overflowed")
         verify(middleTruncate("abcdef", limit: 1) == "…", "single-character truncation must stay bounded")
         for size in [NSSize(width: 940, height: 720), NSSize(width: 760, height: 560)] {
@@ -4457,6 +4680,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         panelPage = 0; renderPanel(); root.layoutSubtreeIfNeeded(); scroll.layoutSubtreeIfNeeded()
         verify(panelChat?.stringValue == "当前连接正常", "Historical ChatGPT issues must not replace the current healthy state")
         verify(panelSectionCount == 3, "Overview must show status, current task, and compact quota")
+        verify(panelControlCard?.isHidden == false && panelRecoveryToggle?.title == "自动恢复本机 Commander" && panelRecoveryToggle?.toolTip?.contains("不会重试原任务") == true, "Recovery control must explain its local-only action and safeguards")
+        verify(panelWakeToggle?.title == "防止闲置睡眠（Guard）" && panelWakeToggle?.toolTip?.contains("其他程序仍可能保持唤醒") == true && panelWakeStatus?.stringValue.contains("保持唤醒：") == true, "Wake control must describe its actual assertion and limits")
         verify(quotaProgress?.isHidden == false && quotaSynced?.stringValue.range(of: #"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}"#, options: .regularExpression) != nil, "Quota card must show finite progress and prominent last successful sync")
         if let overviewRoot = scroll.documentView as? TopAlignedPanelDocumentView,
            let overviewStack = overviewRoot.subviews.first as? NSStackView {
@@ -4464,6 +4689,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         } else {
             verify(false, "Overview document must use the top-aligned container")
         }
+
+        let savedNotice = manualNotice
+        manualNotice = "启动等待中，暂不能手动检查"; renderPanelPage()
+        var pendingViews = [scroll.documentView!], noticeVisible = false
+        while let view = pendingViews.popLast() {
+            if let field = view as? NSTextField, field.stringValue == manualNotice { noticeVisible = true }
+            pendingViews.append(contentsOf: view.subviews)
+        }
+        verify(noticeVisible, "Manual check deferral and setting errors must be visible on Overview")
+        manualNotice = savedNotice
 
         panelPage = 2; renderPanel(); root.layoutSubtreeIfNeeded(); scroll.layoutSubtreeIfNeeded()
         verify(panelSectionCount <= 3, "Connection status must not become a feature inventory")
@@ -4473,14 +4708,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         } else {
             verify(false, "Connection document must use the top-aligned container")
         }
-        verify(panelNav?.label(forSegment: 2) == "连接状态", "Third tab must use user-facing wording")
+        verify(panelNav?.label(forSegment: 2) == "故障与恢复", "Third tab must focus on incident history")
+        verify(panelControlCard?.isHidden == true && panelHeroes?.isHidden == true, "Controls and current-state cards must appear only on the overview")
 
         panelPage = 1; renderPanel(); root.layoutSubtreeIfNeeded(); scroll.layoutSubtreeIfNeeded()
         guard let table = recordTable, let tableScroll = recordTableScroll else { fputs("CommanderGuard UI check failed: records are missing\n", stderr); exit(2) }
         verify(tableScroll.frame.width >= scroll.contentView.bounds.width * 0.95, "Operation table must use the available page width (table \(Int(tableScroll.frame.width)), page \(Int(scroll.contentView.bounds.width)))")
         verify((table.tableColumns.first?.width ?? 0) >= tableScroll.contentView.bounds.width * 0.85, "Operation column must expand with the page")
         verify(panelHeroes?.isHidden == true && panelControlCard?.isHidden == true, "Records page must prioritize records over repeated status controls")
-        verify(recordSteps.count == 4, "Record page must expose all source rows")
+        verify(recordSteps.count == 4 && !recordSteps.contains(where: { $0.tool == "ping" }), "Record page must hide connection checks by default")
+        recordFilter?.selectItem(at: 3); renderLogPage()
+        verify(recordSteps.count == 5 && recordSteps.contains(where: { $0.detail.contains("ping") }), "All filter must include connection checks")
         recordFilter?.selectItem(at: 1); renderLogPage()
         verify(recordSteps.count == 1 && recordSteps[0].id == "preview-2", "Ongoing filter must match only ongoing work")
         recordFilter?.selectItem(at: 2); renderLogPage()
@@ -4488,11 +4726,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         recordSearch?.stringValue = "error.log"; renderLogPage()
         verify(recordSteps.count == 1 && recordSteps[0].detail.contains("error.log"), "Search must match sanitized paths")
         recordSearch?.stringValue = "会话"; recordFilter?.selectItem(at: 0); renderLogPage()
-        verify(recordSteps.count == 2 && recordSteps.allSatisfy { $0.sessionKey != nil }, "Session search must match attributed rows only")
+        verify(recordSteps.count == 2 && recordSteps.allSatisfy { $0.sessionKey != nil }, "Search must retain known sessions")
+        recordSearch?.stringValue = "归属未确认"; renderLogPage()
+        verify(recordSteps.isEmpty, "Unconfirmed ownership must not appear in record search")
         recordSearch?.stringValue = ""; renderLogPage()
         guard let selected = recordSteps.firstIndex(where: { $0.id == "preview-2" }) else { preconditionFailure("Filtered record rows are missing") }
         table.selectRowIndexes(IndexSet(integer: selected), byExtendingSelection: false)
-        verify(recordDetail?.stringValue.contains("swift test --filter ConnectionTests") == true && recordDetail?.stringValue.contains("归属：会话 ") == true, "Selecting a row must reveal safe command and anonymized session attribution")
+        verify(recordDetail?.stringValue.contains("swift test --filter ConnectionTests") == true && recordDetail?.stringValue.contains("归属：会话 ") == true && recordDetail?.stringValue.contains("归属未确认") == false, "Selecting a row must retain verified attribution without unconfirmed ownership noise")
         let selectedID = selectedRecordID
         renderPanel()
         verify(selectedRecordID == selectedID && recordDetail?.stringValue.contains("swift test --filter ConnectionTests") == true, "Selected record detail must survive refresh")
