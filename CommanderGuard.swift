@@ -6,6 +6,66 @@ import Darwin
 import CoreFoundation
 import CryptoKit
 
+struct UsageQuota {
+    enum State: String { case disconnected, connecting, loginRequired, browserTabMissing, browserTabAmbiguous, browserPermissionRequired, unavailable, fresh, stale, unlimited }
+    var state: State = .disconnected
+    var used: Int?
+    var total: Int?
+    var plan = ""
+    var month = ""
+    var syncedAt: Date?
+
+    var remaining: Int? { total.map { max(0, $0 - (used ?? 0)) } }
+    static func parse(_ data: Data, now: Date = Date()) -> UsageQuota? {
+        guard data.count <= 8192,
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let usage = root["usage"] as? [String: Any],
+              let used = integer(usage["callsUsed"]),
+              let plan = usage["plan"] as? String, !plan.isEmpty, plan.count <= 64,
+              ["free", "pro"].contains(plan.lowercased()),
+              validMonth(usage["month"])
+        else { return nil }
+        let total: Int?
+        if usage["callsIncluded"] is NSNull, plan.lowercased() == "pro" { total = nil }
+        else if let finite = integer(usage["callsIncluded"]), finite > 0 { total = finite }
+        else { return nil }
+        return UsageQuota(state: total == nil ? .unlimited : .fresh, used: used, total: total, plan: plan, month: usage["month"] as? String ?? "本月", syncedAt: now)
+    }
+
+    private static func integer(_ value: Any?) -> Int? {
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID(),
+              number.doubleValue.isFinite, number.doubleValue >= 0,
+              number.doubleValue <= 1_000_000_000,
+              number.doubleValue.rounded(.towardZero) == number.doubleValue else { return nil }
+        return number.intValue
+    }
+    private static func validMonth(_ value: Any?) -> Bool {
+        guard let value else { return true }
+        if value is NSNull { return true }
+        guard let month = value as? String else { return false }
+        return month.range(of: #"^\d{4}-(0[1-9]|1[0-2])$"#, options: .regularExpression) != nil
+    }
+}
+
+func trustedQuotaURL(_ url: URL?) -> Bool {
+    guard let url, url.scheme == "https", url.user == nil, url.password == nil,
+          url.port == nil || url.port == 443, url.host?.lowercased() == "mcp.desktopcommander.app",
+          url.path == "/usage", url.query == nil, url.fragment == nil else { return false }
+    return true
+}
+
+func appleScriptLiteral(_ value: String) -> String {
+    "\"" + value.replacingOccurrences(of: "\\", with: "\\\\")
+        .replacingOccurrences(of: "\"", with: "\\\"")
+        .replacingOccurrences(of: "\n", with: " ")
+        .replacingOccurrences(of: "\r", with: " ") + "\""
+}
+
+func quotaIsStale(_ quota: UsageQuota, now: Date) -> Bool {
+    quota.used != nil && quota.syncedAt.map { now.timeIntervalSince($0) > 900 } == true
+}
+
 struct Snapshot {
     var service = "未知"
     var cloud = "未知"
@@ -2221,6 +2281,33 @@ private func selfTestSessionAttributionReader(dir: URL, now: Date) {
 
 func selfTest() {
     let now = Date(timeIntervalSince1970: 2_000_000_000)
+    func quota(_ usage: [String: Any]) -> UsageQuota? {
+        guard let data = try? JSONSerialization.data(withJSONObject: ["usage": usage]) else { return nil }
+        return UsageQuota.parse(data, now: now)
+    }
+    let freeQuota = quota(["plan": "free", "callsUsed": 100, "callsIncluded": 100, "month": "2026-10"])
+    precondition(freeQuota?.remaining == 0 && freeQuota?.state == .fresh && freeQuota?.month == "2026-10")
+    let proQuota = quota(["plan": "pro", "callsUsed": 90, "callsIncluded": NSNull()])
+    precondition(proQuota?.state == .unlimited && proQuota?.total == nil && proQuota?.remaining == nil)
+    precondition(quota(["plan": "free", "callsUsed": 1, "callsIncluded": NSNull()]) == nil)
+    precondition(quota(["plan": "enterprise", "callsUsed": 1, "callsIncluded": 10]) == nil)
+    precondition(quota(["plan": "free", "callsUsed": -1, "callsIncluded": 10]) == nil)
+    precondition(quota(["plan": "free", "callsUsed": true, "callsIncluded": 10]) == nil)
+    precondition(quota(["plan": "free", "callsUsed": 1, "callsIncluded": true]) == nil)
+    precondition(quota(["plan": "free", "callsUsed": 1, "callsIncluded": 1_000_000_001]) == nil)
+    precondition(quota(["plan": "free", "callsUsed": 1, "callsIncluded": 10, "month": "2026-13"]) == nil)
+    precondition(quota(["plan": "free", "callsUsed": 1, "callsIncluded": 10, "month": 202610]) == nil)
+    precondition(UsageQuota.parse(Data(repeating: 65, count: 8193), now: now) == nil)
+    precondition(UsageQuota(state: .loginRequired).used == nil && UsageQuota(state: .loginRequired).total == nil)
+    precondition(quotaIsStale(freeQuota!, now: now.addingTimeInterval(901)) && !quotaIsStale(freeQuota!, now: now.addingTimeInterval(899)))
+    precondition(trustedQuotaURL(URL(string: "https://mcp.desktopcommander.app/usage")))
+    precondition(!trustedQuotaURL(URL(string: "https://auth.desktopcommander.app/auth")))
+    precondition(!trustedQuotaURL(URL(string: "https://mcp.desktopcommander.app/usage/extra")))
+    precondition(!trustedQuotaURL(URL(string: "http://mcp.desktopcommander.app/usage")))
+    precondition(!trustedQuotaURL(URL(string: "https://example.com/usage")))
+    precondition(!trustedQuotaURL(URL(string: "https://user@mcp.desktopcommander.app/usage")))
+    precondition(!trustedQuotaURL(URL(string: "https://mcp.desktopcommander.app:444/usage")))
+    precondition(appleScriptLiteral("a\"b\\c\n") == "\"a\\\"b\\\\c \"")
     let fresh = now.addingTimeInterval(-300)
     let device = "00000000-0000-4000-8000-000000000001"
     func probeKind(_ value: ChannelProbeResult) -> Int {
@@ -2916,7 +3003,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private var recoveryLedger = ChannelRecoveryLedger.load(from: FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/CommanderGuard/channel-recovery.json"))
     private let channelIncidentURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/CommanderGuard/channel-incident.json")
     private let channelDecisionURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/CommanderGuard/channel-decisions.jsonl")
-    private lazy var channelIncident = ChannelIncidentState.load(from: channelIncidentURL, now: Date())
+    private lazy var channelIncident = previewMode ? ChannelIncidentState(now: Date()) : ChannelIncidentState.load(from: channelIncidentURL, now: Date())
     private lazy var channelDecisionJournal = ChannelDecisionJournal(url: channelDecisionURL)
     private var watchdog = ChannelWatchdogState(startedAt: Date())
     private var channelBusy = false
@@ -2968,6 +3055,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private let timelineReader = TimelineReader()
     private var activityBusy = false
     private var activityTimer: Timer?
+    private var quotaTimer: Timer?
+    private var quota = UsageQuota()
+    private var quotaPollTimer: Timer?
+    private var quotaRequestID: String?
+    private var quotaPollBusy = false
+    private var quotaDeadline = Date.distantPast
+    private var quotaButton: NSButton?
+    private var quotaPauseButton: NSButton?
+    private var quotaValue: NSTextField?
+    private var quotaStatus: NSTextField?
+    private var quotaSynced: NSTextField?
+    private var quotaProgress: NSProgressIndicator?
+    private var quotaRequestInFlight = false
+    private var quotaEnabled: Bool { UserDefaults.standard.bool(forKey: "quotaConnectionEnabled") }
 
     init(previewMode: Bool = false) { self.previewMode = previewMode; super.init() }
 
@@ -2988,13 +3089,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }
         DistributedNotificationCenter.default().addObserver(self, selector: #selector(openPanel), name: NSNotification.Name("com.wuwendi.commander-guard.open-panel"), object: nil)
         poll()
+        if quotaEnabled { refreshQuota() }
+        quotaTimer = Timer.scheduledTimer(withTimeInterval: 600, repeats: true) { _ in self.refreshQuota() }
         timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { _ in self.poll() }
         channelTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { _ in self.pollChannel(); self.pollToolExecution() }
         activityTimer = Timer(timeInterval: 1, repeats: true) { _ in self.pollActivity() }
         RunLoop.main.add(activityTimer!, forMode: .common)
         pollActivity()
     }
-    func applicationWillTerminate(_ n: Notification) { timer?.invalidate(); channelTimer?.invalidate(); activityTimer?.invalidate(); releaseAssertion() }
+    func applicationWillTerminate(_ n: Notification) { timer?.invalidate(); channelTimer?.invalidate(); activityTimer?.invalidate(); quotaTimer?.invalidate(); quotaPollTimer?.invalidate(); releaseAssertion() }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool { openPanel(); return true }
     private func rebuild() {
         let m = NSMenu()
@@ -3493,6 +3596,223 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let caveat = record.processCaveat.map { " · \($0)" } ?? ""
         return "\(prominentStamp(record.timestamp)) · \(record.label) · \(record.resultLabel) · \(duration)\(caveat) · \(record.cloudReceiptLabel)"
     }
+    private func quotaDisplay() -> String {
+        if quota.total == nil, let used = quota.used, !quota.plan.isEmpty { return "\(used) 次 · \(quota.plan.lowercased() == "pro" ? "Pro" : quota.plan) 无限制" }
+        guard let used = quota.used, let total = quota.total else { return quota.state == .connecting ? "正在连接…" : "暂无额度数据" }
+        return "\(used) / \(total) 次 · 剩余 \(quota.remaining ?? 0) 次"
+    }
+    private func ageQuota() {
+        if quotaIsStale(quota, now: Date()), quota.state == .fresh || quota.state == .unlimited { quota.state = .stale }
+    }
+    private func quotaStateText() -> String {
+        ageQuota()
+        let old = quotaIsStale(quota, now: Date()) ? " · 上次数据已过期" : ""
+        switch quota.state {
+        case .disconnected: return "未连接 · 连接后读取官方用量"
+        case .connecting: return "正在读取官方用量"
+        case .loginRequired: return "登录已失效 · 请在 Chrome 打开官方用量页重新登录" + old
+        case .browserTabMissing: return "请在 Chrome 保持官方用量页打开" + old
+        case .browserTabAmbiguous: return "有多个官方用量页 · 请将要读取的账户标签页切到 Chrome 最前方" + old
+        case .browserPermissionRequired: return "请允许 Chrome 的“来自 Apple Events 的 JavaScript”和 macOS 自动化权限" + old
+        case .unavailable: return (quota.used == nil ? "额度暂不可用 · 可稍后刷新" : "同步失败 · 显示上次成功数据") + old
+        case .fresh: return "当前周期：\(quota.month) · \(quota.plan)" + old
+        case .stale: return "数据已过期 · 保留上次成功读取（\(quota.month)）"
+        case .unlimited: return "当前周期：\(quota.month) · \(quota.plan) · 无限制" + old
+        }
+    }
+    private func renderQuota() {
+        ageQuota()
+        quotaValue?.stringValue = quotaDisplay()
+        quotaValue?.textColor = quotaIsStale(quota, now: Date()) ? .systemOrange : .labelColor
+        quotaStatus?.stringValue = quotaStateText()
+        quotaSynced?.stringValue = "最近成功同步：\(prominentStamp(quota.syncedAt))"
+        quotaButton?.title = quotaEnabled ? "打开额度账户" : "连接额度账户"
+        quotaButton?.isEnabled = !previewMode && quota.state != .connecting
+        quotaPauseButton?.isEnabled = !previewMode && quotaEnabled
+        if let progress = quotaProgress {
+            let finite = quota.total.flatMap { total in quota.used.map { (total, $0) } }
+            progress.isHidden = finite == nil
+            if let (total, used) = finite { progress.doubleValue = total == 0 ? 0 : min(1, Double(used) / Double(total)) }
+        }
+        if item != nil { render() }
+    }
+    private func quotaSection() -> NSView {
+        let connect = NSButton(title: quotaEnabled ? "打开额度账户" : "连接额度账户", target: self, action: #selector(connectQuota)); connect.bezelStyle = .rounded; connect.isEnabled = !previewMode
+        let refresh = NSButton(title: "刷新", target: self, action: #selector(manualQuotaRefresh)); refresh.bezelStyle = .rounded; refresh.isEnabled = !previewMode
+        let pause = NSButton(title: "暂停同步", target: self, action: #selector(pauseQuota)); pause.bezelStyle = .rounded; pause.isEnabled = !previewMode && quotaEnabled
+        let title = label("云端额度", size: 12, weight: .semibold, color: .secondaryLabelColor)
+        let actions = NSStackView(views: [title, NSView(), pause, refresh, connect]); actions.orientation = .horizontal; actions.alignment = .centerY; actions.spacing = 8
+        let value = label(quotaDisplay(), size: 17, weight: .semibold)
+        let progress = NSProgressIndicator(); progress.isIndeterminate = false; progress.minValue = 0; progress.maxValue = 1; progress.style = .bar; progress.heightAnchor.constraint(equalToConstant: 5).isActive = true
+        if let total = quota.total, let used = quota.used { progress.doubleValue = total == 0 ? 0 : min(1, Double(used) / Double(total)) } else { progress.isHidden = true }
+        let status = label(quotaStateText(), size: 12, color: .secondaryLabelColor)
+        let synced = label("最近成功同步：\(prominentStamp(quota.syncedAt))", size: 12, weight: .semibold)
+        synced.font = .monospacedDigitSystemFont(ofSize: 12.5, weight: .semibold)
+        if quotaIsStale(quota, now: Date()) { value.textColor = .systemOrange }
+        let stack = vertical(7)
+        [actions, value, progress, status, synced].forEach { stack.addArrangedSubview($0); $0.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true }
+        quotaButton = connect; quotaPauseButton = pause; quotaValue = value; quotaStatus = status; quotaSynced = synced; quotaProgress = progress
+        return card(stack, padding: 14)
+    }
+    private func clearQuota(_ state: UsageQuota.State) {
+        quota = UsageQuota(state: state)
+        renderQuota()
+    }
+    private func quotaPageURL() -> URL { URL(string: "https://mcp.desktopcommander.app/usage")! }
+    private func chromeApplicationURL() -> URL? {
+        if let found = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.google.Chrome") { return found }
+        let standard = URL(fileURLWithPath: "/Applications/Google Chrome.app")
+        return FileManager.default.fileExists(atPath: standard.path) ? standard : nil
+    }
+    @objc private func connectQuota() {
+        guard let browser = chromeApplicationURL() else {
+            quotaFailed(.unavailable); return
+        }
+        UserDefaults.standard.set(true, forKey: "quotaConnectionEnabled")
+        quota.state = .connecting; renderQuota()
+        NSWorkspace.shared.open([quotaPageURL()], withApplicationAt: browser, configuration: NSWorkspace.OpenConfiguration()) { _, error in
+            DispatchQueue.main.async {
+                if error != nil { self.quotaFailed(.unavailable); return }
+                Timer.scheduledTimer(withTimeInterval: 3, repeats: false) { _ in self.refreshQuota() }
+            }
+        }
+    }
+    @objc private func manualQuotaRefresh() {
+        guard quotaEnabled else { connectQuota(); return }
+        refreshQuota()
+    }
+    @objc private func pauseQuota() {
+        UserDefaults.standard.set(false, forKey: "quotaConnectionEnabled")
+        quotaPollTimer?.invalidate(); quotaPollTimer = nil
+        quotaRequestID = nil; quotaRequestInFlight = false; quotaPollBusy = false
+        clearQuota(.disconnected)
+    }
+    private func browserJavaScript(_ script: String, selectAccount: Bool = false, completion: @escaping (String?, Bool) -> Void) {
+        guard !NSRunningApplication.runningApplications(withBundleIdentifier: "com.google.Chrome").isEmpty else { completion("tab-missing", false); return }
+        guard let browser = chromeApplicationURL() else { completion(nil, false); return }
+        let action = selectAccount ? """
+            set candidateCount to 0
+            set candidateTab to missing value
+            repeat with browserWindow in every window
+              repeat with browserTab in every tab of browserWindow
+                if URL of browserTab is "https://mcp.desktopcommander.app/usage" then
+                  set candidateCount to candidateCount + 1
+                  set candidateTab to contents of browserTab
+                end if
+              end repeat
+            end repeat
+            if candidateCount is 0 then return "tab-missing"
+            if URL of active tab of front window is "https://mcp.desktopcommander.app/usage" then
+              set candidateTab to active tab of front window
+            else if candidateCount is greater than 1 then
+              return "tab-ambiguous"
+            end if
+            return execute candidateTab javascript \(appleScriptLiteral(script))
+            """ : """
+            set sawOfficialPage to false
+            repeat with browserWindow in every window
+              repeat with browserTab in every tab of browserWindow
+                if URL of browserTab is "https://mcp.desktopcommander.app/usage" then
+                  set sawOfficialPage to true
+                  set tabResult to execute browserTab javascript \(appleScriptLiteral(script))
+                  if tabResult is not "key-missing" then return tabResult
+                end if
+              end repeat
+            end repeat
+            if sawOfficialPage then return "key-missing"
+            return "tab-missing"
+            """
+        let source = """
+        if application \(appleScriptLiteral(browser.path)) is not running then return "tab-missing"
+        with timeout of 8 seconds
+          tell application \(appleScriptLiteral(browser.path))
+            \(action)
+          end tell
+        end timeout
+        """
+        DispatchQueue.global(qos: .utility).async {
+            var error: NSDictionary?
+            let value = NSAppleScript(source: source)?.executeAndReturnError(&error).stringValue
+            let message = error?["NSAppleScriptErrorMessage"] as? String ?? ""
+            let number = (error?["NSAppleScriptErrorNumber"] as? NSNumber)?.intValue
+            let permission = number == -1743 || message.localizedCaseInsensitiveContains("JavaScript") || message.localizedCaseInsensitiveContains("automation") || message.localizedCaseInsensitiveContains("permission")
+            DispatchQueue.main.async { completion(value, permission) }
+        }
+    }
+    private func quotaStartScript(_ key: String) -> String {
+        // ponytail: one transient page key per read; an official browser API would remove this bridge.
+        return #"""
+        (() => { if (location.origin !== "https://mcp.desktopcommander.app" || location.pathname !== "/usage") return "wrong-page";
+        const key = "\#(key)"; window[key] = "pending";
+        (async () => { const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), 12000);
+          try { const response = await fetch("https://auth.desktopcommander.app/auth/billing/usage", {credentials:"include", redirect:"error", signal:controller.signal});
+            if (response.status === 401 || response.status === 403) { window[key] = "login"; return; }
+            if (!response.ok || Number(response.headers.get("content-length") || 0) > 262144 || !response.body) { window[key] = "unavailable"; return; }
+            const reader = response.body.getReader(); let bytes = 0; const chunks = [];
+            while (true) { const part = await reader.read(); if (part.done) break; bytes += part.value.byteLength; if (bytes > 262144) { await reader.cancel(); window[key] = "unavailable"; return; } chunks.push(part.value); }
+            const raw = new Uint8Array(bytes); let offset = 0; for (const part of chunks) { raw.set(part, offset); offset += part.length; }
+            const data = JSON.parse(new TextDecoder().decode(raw)); const usage = data && data.usage;
+            if (!usage || !Number.isSafeInteger(usage.callsUsed) || usage.callsUsed < 0 || usage.callsUsed > 1000000000 || typeof usage.plan !== "string" || usage.plan.length > 64 || !["free","pro"].includes(usage.plan.toLowerCase()) || (usage.month !== undefined && (typeof usage.month !== "string" || !/^\d{4}-(0[1-9]|1[0-2])$/.test(usage.month))) || (usage.callsIncluded === null ? usage.plan.toLowerCase() !== "pro" : (!Number.isSafeInteger(usage.callsIncluded) || usage.callsIncluded <= 0 || usage.callsIncluded > 1000000000))) { window[key] = "unavailable"; return; }
+            window[key] = JSON.stringify({usage:{callsUsed:usage.callsUsed, callsIncluded:usage.callsIncluded, plan:usage.plan, month:usage.month}});
+          } catch (_) { window[key] = "unavailable"; } finally { clearTimeout(timer); }
+        })(); return "started"; })()
+        """#
+    }
+    @objc private func refreshQuota() {
+        guard !previewMode, quotaEnabled, !quotaRequestInFlight else { return }
+        quotaRequestInFlight = true
+        if quota.used == nil { quota.state = .connecting; renderQuota() }
+        let key = "__commanderGuardQuota_" + UUID().uuidString.replacingOccurrences(of: "-", with: "")
+        quotaRequestID = key
+        quotaDeadline = Date().addingTimeInterval(16)
+        browserJavaScript(quotaStartScript(key), selectAccount: true) { [self] value, permission in
+            guard self.quotaRequestID == key else { return }
+            if permission { self.finishQuota(key, state: .browserPermissionRequired); return }
+            guard value == "started" else {
+                let state: UsageQuota.State = value == "tab-missing" ? .browserTabMissing : value == "tab-ambiguous" ? .browserTabAmbiguous : .unavailable
+                self.finishQuota(key, state: state); return
+            }
+            self.quotaPollTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in self?.pollQuota(key) }
+            self.pollQuota(key)
+        }
+    }
+    private func pollQuota(_ key: String) {
+        guard quotaRequestID == key, !quotaPollBusy else { return }
+        if Date() > quotaDeadline { finishQuota(key, state: .unavailable); return }
+        quotaPollBusy = true
+        let script = #"(() => { if (location.origin !== "https://mcp.desktopcommander.app" || location.pathname !== "/usage") return "key-missing"; const key = "\#(key)"; if (!(key in window)) return "key-missing"; const result = window[key]; if (result !== "pending") delete window[key]; return result; })()"#
+        browserJavaScript(script) { value, permission in
+            guard self.quotaRequestID == key else { return }
+            self.quotaPollBusy = false
+            if permission { self.finishQuota(key, state: .browserPermissionRequired); return }
+            guard let value else { self.finishQuota(key, state: .unavailable); return }
+            if value == "pending" { return }
+            if value == "tab-missing" { self.finishQuota(key, state: .browserTabMissing); return }
+            if value == "key-missing" { self.finishQuota(key, state: .unavailable); return }
+            if value == "login" { self.finishQuota(key, state: .loginRequired); return }
+            guard value.utf8.count <= 8192, let data = value.data(using: .utf8), let validated = UsageQuota.parse(data) else { self.finishQuota(key, state: .unavailable); return }
+            self.quota = validated
+            self.finishQuota(key, state: nil)
+        }
+    }
+    private func finishQuota(_ key: String, state: UsageQuota.State?) {
+        guard quotaRequestID == key else { return }
+        quotaPollTimer?.invalidate(); quotaPollTimer = nil
+        quotaRequestInFlight = false; quotaPollBusy = false; quotaRequestID = nil
+        if let state {
+            if state == .loginRequired { quota = UsageQuota(state: .loginRequired) }
+            else { quota.state = state }
+            if state != .browserTabMissing && state != .browserTabAmbiguous && state != .browserPermissionRequired {
+                let script = #"(() => { if (location.origin !== "https://mcp.desktopcommander.app" || location.pathname !== "/usage" || !("\#(key)" in window)) return "key-missing"; delete window["\#(key)"]; return ""; })()"#
+                browserJavaScript(script) { _, _ in }
+            }
+        }
+        renderQuota()
+    }
+    private func quotaFailed(_ state: UsageQuota.State = .unavailable) {
+        quota.state = quota.used == nil ? state : .stale
+        renderQuota()
+    }
     private func middleTruncate(_ value: String, limit: Int) -> String {
         guard limit > 0 else { return "" }
         guard value.count > limit else { return value }
@@ -3505,6 +3825,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         return "\(prefix)…\(suffix)"
     }
     private func writeStatus() {
+        ageQuota()
         let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/CommanderGuard", isDirectory: true)
         do { try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true) }
         catch { fputs("CommanderGuard: unable to create status directory\n", stderr); return }
@@ -3519,6 +3840,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let diagnosis = currentDiagnosis()
         var object: [String: Any] = ["chatgpt": ["answer": chat.answer, "update_connection": chat.connection, "recent_issue": chat.history as Any? ?? NSNull(), "coverage": snapshot.timeline.coverage, "delivery_timeout_directly_observable": false, "limitation": chat.deliveryLimit], "service": snapshot.service, "cloud": snapshot.cloud, "last_seen": snapshot.lastSeen.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "checked_at": ISO8601DateFormatter.flex.string(from: snapshot.checked), "error_count": snapshot.errorCount, "paused": paused, "idle_prevention": assertion != 0, "message": snapshot.message, "channel": ["state": snapshot.channelState, "detail": snapshot.channelDetail, "consecutive_no_live": snapshot.channelFailures, "checked_at": snapshot.channelChecked.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "auto_recovery_enabled": recoveryLedger.autoRecoveryEnabled, "last_recovery_attempt": recoveryLedger.lastAttempt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "last_ping_at": lastPingAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "last_ping_result": lastPingResult, "check_deferred_reason": deferredReason, "recovery_status": recoveryAvailability(), "last_recovery_result": lastRecoveryOutcome as Any? ?? NSNull()], "menu": ["menubar_title": item.button?.title ?? "", "menubar_has_icon": item.button?.image != nil, "connection": summaryLines[0].title, "channel": summaryLines[0].title, "tool_execution": summaryLines[1].title, "action": summaryLines[2].title, "recovery": summaryLines[3].title, "chatgpt": summaryLines[4].title, "execution_step_rows": rows, "execution_steps": safeSteps, "tool_call_elapsed_seconds": callElapsed as Any? ?? NSNull(), "tool_call_state": currentState, "recent_actions": snapshot.activity.recent], "activity": ["state": snapshot.activity.state, "tool": snapshot.activity.tool, "active_count": snapshot.activity.activeCount, "observed_at": snapshot.activity.observed.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "recent": snapshot.activity.recent, "error": snapshot.activity.error, "coverage_gap": snapshot.activity.coverageGap, "gap_reason": snapshot.activity.gapReason, "gap_first_at": snapshot.activity.gapFirstAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "gap_last_at": snapshot.activity.gapLastAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "backlog_bytes": snapshot.activity.backlogBytes, "catching_up": snapshot.activity.catchingUp, "pending_line": snapshot.activity.pendingLine, "idle_proven": snapshot.activity.idleProven], "timeline": ["coverage": snapshot.timeline.coverage, "commander_errors_this_run": snapshot.timeline.commanderErrors, "conversation_labels_verified_at": snapshot.timeline.conversationLabelsVerifiedAt as Any? ?? NSNull(), "last_chatgpt_app_event": lastAppEvent, "events": timelineRows]]
         object["tool_execution"] = ["state": snapshot.toolExecutionState, "detail": snapshot.toolExecutionDetail, "checked_at": snapshot.toolExecutionChecked.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "fresh": toolExecutionFresh(snapshot, now: Date()), "evidence_ttl_seconds": Int(toolExecutionEvidenceTTL), "probe_deferred_reason": toolProbeDeferredReason]
+        object["usage_quota"] = ["state": quota.state.rawValue, "used": quota.used as Any? ?? NSNull(), "total": quota.total as Any? ?? NSNull(), "remaining": quota.remaining as Any? ?? NSNull(), "plan": quota.plan.isEmpty ? NSNull() : quota.plan as Any, "month": quota.month.isEmpty ? NSNull() : quota.month as Any, "last_successful_sync": quota.syncedAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull()]
         object["channel_incident"] = [
             "active": channelIncident.activeCategory != nil,
             "category": channelIncident.activeCategory?.rawValue as Any? ?? NSNull(),
@@ -3667,6 +3989,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         panelScroll = scroll; layout.addArrangedSubview(scroll)
         scroll.widthAnchor.constraint(equalTo: layout.widthAnchor, constant: -56).isActive = true
         panelWindow = window
+        renderQuota()
         renderPanelPage()
     }
     private func stamp(_ date: Date?) -> String { date.map { DateFormatter.localizedString(from: $0, dateStyle: .medium, timeStyle: .medium) } ?? "暂无" }
@@ -3832,6 +4155,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             }
             setSections([
                 section("当前状态", rows: [("状态", diagnosis.title), ("建议", diagnosis.nextAction)]),
+                quotaSection(),
                 section("当前任务", rows: activityRows)
             ])
             return
@@ -4089,6 +4413,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
     private func loadPreviewSnapshot() {
         let now = Date(), uptime = ProcessInfo.processInfo.systemUptime
+        quota = UsageQuota(state: .fresh, used: 42, total: 100, plan: "free", month: "2026-10", syncedAt: now.addingTimeInterval(-35))
         snapshot.service = "运行中"; snapshot.cloud = "已连接"
         snapshot.channelState = "通道畅通"; snapshot.channelDetail = "最近一次检查通过 · 示例"
         snapshot.channelChecked = now.addingTimeInterval(-38)
@@ -4131,7 +4456,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }
         panelPage = 0; renderPanel(); root.layoutSubtreeIfNeeded(); scroll.layoutSubtreeIfNeeded()
         verify(panelChat?.stringValue == "当前连接正常", "Historical ChatGPT issues must not replace the current healthy state")
-        verify(panelSectionCount == 2, "Overview must stay focused on status and current task")
+        verify(panelSectionCount == 3, "Overview must show status, current task, and compact quota")
+        verify(quotaProgress?.isHidden == false && quotaSynced?.stringValue.range(of: #"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}"#, options: .regularExpression) != nil, "Quota card must show finite progress and prominent last successful sync")
         if let overviewRoot = scroll.documentView as? TopAlignedPanelDocumentView,
            let overviewStack = overviewRoot.subviews.first as? NSStackView {
             verify(overviewStack.frame.minY <= 2, "Overview content must start at the top without a blank band")
@@ -4154,24 +4480,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         verify(tableScroll.frame.width >= scroll.contentView.bounds.width * 0.95, "Operation table must use the available page width (table \(Int(tableScroll.frame.width)), page \(Int(scroll.contentView.bounds.width)))")
         verify((table.tableColumns.first?.width ?? 0) >= tableScroll.contentView.bounds.width * 0.85, "Operation column must expand with the page")
         verify(panelHeroes?.isHidden == true && panelControlCard?.isHidden == true, "Records page must prioritize records over repeated status controls")
-        precondition(recordSteps.count == 4, "Record page must expose all source rows")
+        verify(recordSteps.count == 4, "Record page must expose all source rows")
         recordFilter?.selectItem(at: 1); renderLogPage()
-        precondition(recordSteps.count == 1 && recordSteps[0].id == "preview-2", "Ongoing filter must match only ongoing work")
+        verify(recordSteps.count == 1 && recordSteps[0].id == "preview-2", "Ongoing filter must match only ongoing work")
         recordFilter?.selectItem(at: 2); renderLogPage()
-        precondition(recordSteps.count == 1 && recordSteps[0].id == "preview-4", "Issue filter must include failed and unconfirmed work")
+        verify(recordSteps.count == 1 && recordSteps[0].id == "preview-4", "Issue filter must include failed and unconfirmed work")
         recordSearch?.stringValue = "error.log"; renderLogPage()
-        precondition(recordSteps.count == 1 && recordSteps[0].detail.contains("error.log"), "Search must match sanitized paths")
+        verify(recordSteps.count == 1 && recordSteps[0].detail.contains("error.log"), "Search must match sanitized paths")
         recordSearch?.stringValue = "会话"; recordFilter?.selectItem(at: 0); renderLogPage()
-        precondition(recordSteps.count == 2 && recordSteps.allSatisfy { $0.sessionKey != nil }, "Session search must match attributed rows only")
+        verify(recordSteps.count == 2 && recordSteps.allSatisfy { $0.sessionKey != nil }, "Session search must match attributed rows only")
         recordSearch?.stringValue = ""; renderLogPage()
         guard let selected = recordSteps.firstIndex(where: { $0.id == "preview-2" }) else { preconditionFailure("Filtered record rows are missing") }
         table.selectRowIndexes(IndexSet(integer: selected), byExtendingSelection: false)
-        precondition(recordDetail?.stringValue.contains("swift test --filter ConnectionTests") == true && recordDetail?.stringValue.contains("归属：会话 ") == true, "Selecting a row must reveal safe command and anonymized session attribution")
+        verify(recordDetail?.stringValue.contains("swift test --filter ConnectionTests") == true && recordDetail?.stringValue.contains("归属：会话 ") == true, "Selecting a row must reveal safe command and anonymized session attribution")
         let selectedID = selectedRecordID
         renderPanel()
-        precondition(selectedRecordID == selectedID && recordDetail?.stringValue.contains("swift test --filter ConnectionTests") == true, "Selected record detail must survive refresh")
-        precondition(item.button?.image?.isTemplate == true && item.button?.title.contains("通道可回应") == true && item.button?.title.contains("DC ") == false, "Menu bar must show an icon and scoped live status")
-        precondition(panelHeading?.isHidden == true && panelHeroes?.isHidden == true && panelControlCard?.isHidden == true, "Records page must remain visually focused")
+        verify(selectedRecordID == selectedID && recordDetail?.stringValue.contains("swift test --filter ConnectionTests") == true, "Selected record detail must survive refresh")
+        verify(item.button?.image?.isTemplate == true && item.button?.title.contains("通道可回应") == true && item.button?.title.contains("DC ") == false, "Menu bar must show an icon and scoped live status")
+        verify(panelHeading?.isHidden == true && panelHeroes?.isHidden == true && panelControlCard?.isHidden == true, "Records page must remain visually focused")
         print("CommanderGuard UI check passed")
     }
 }

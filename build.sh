@@ -17,6 +17,7 @@ cat > "$OUT/CommanderGuard.app/Contents/Info.plist" <<'PLIST'
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>LSUIElement</key><true/>
 <key>NSHighResolutionCapable</key><true/>
+<key>NSAppleEventsUsageDescription</key><string>读取你在 Google Chrome 官方用量页中的额度数值；不会读取密码或登录令牌。</string>
 </dict></plist>
 PLIST
 codesign --force --sign - "$OUT/CommanderGuard.app"

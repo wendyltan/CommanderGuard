@@ -4,428 +4,215 @@
 
 <h1 align="center">CommanderGuard</h1>
 
-<p align="center">
-  macOS 上用于观察 <strong>Remote Desktop Commander ↔ 本机工具执行 ↔ ChatGPT App</strong> 的轻量守护与诊断工具。
-</p>
+<p align="center">macOS 菜单栏工具，检查 Desktop Commander 的命令连接、观察本机执行记录，并在符合安全条件时尝试恢复断链。</p>
 
-CommanderGuard 关注的是 **命令链路和 ChatGPT App 自身的可观察状态**。它不会把“设备在线”“ping 成功”“本机命令已返回”混成同一件事，而是把链路拆成三层分别判断：
+<p align="center">中文 · <a href="README.en.md">English</a></p>
 
-| 层级 | CommanderGuard 判断什么 | 主要证据 |
-|---|---|---|
-| **消息通道** | Remote Desktop Commander 的远端消息是否还能到达这台 Mac | 针对当前设备、请求编号匹配的 MCP `ping` / `pong` |
-| **工具执行** | 本机工具调用是否真的能执行并返回 | 近期真实成功调用，或满足安全条件时的只读 `list_sessions` 探针 |
-| **ChatGPT 回答** | 本机 ChatGPT App 最近是否出现回答恢复、断流或重连异常 | App 的固定结构化日志事件 |
+远端显示设备在线，却调用不了工具？CommanderGuard 在本机分别检查消息通道和工具执行，让你看到故障发生在哪一层。它也能观察 ChatGPT App 的部分连接事件，并在概览里显示 Desktop Commander 云端 tool calls 用量。
 
-> **重要：** 某一层正常，不代表其他层也正常。 `ping` 成功只能证明消息通道可回应；它不能证明本机工具一定执行成功，也不能证明 ChatGPT 的原回答流已经恢复。
+本项目面向已经使用 [Remote Desktop Commander](https://github.com/desktop-commander/remote-desktop-commander) 的 macOS 用户。应用界面目前为中文。自动恢复依赖指定的本机服务与日志布局，安装前请看下方兼容条件。
 
-### 产品边界
+## 能做什么
 
-CommanderGuard **不负责代理、隧道、节点或网络策略**。这类问题属于独立的网络诊断工具，不应通过读取另一个 App 的私有状态文件来耦合进 CommanderGuard。即使 ChatGPT 与 Commander 在相近时间同时异常，本项目也只报告“可能受共同环境影响”，不会据此认定代理、隧道或网络是根因。
+| 功能 | 你能看到或操作什么 |
+|---|---|
+| 实时状态 | 菜单栏图标及文字显示通道状态；主面板分别显示消息通道、工具执行和 ChatGPT 回答状态 |
+| 链路检查 | 用 MCP `ping` 检查当前设备能否回应；满足安全条件时，用只读 `list_sessions` 检查本机工具执行 |
+| 自动恢复 | 多次明确断链后，检查任务、日志、进程和冷却条件，再决定是否重启受管理的 Commander 服务 |
+| 操作记录 | 最近最多 100 次本机调用，支持搜索、筛选和脱敏详情；上游提供可靠字段时显示匿名会话归属 |
+| 云端用量 | 通过 Chrome 官方用量页同步已用、总量、剩余量、进度和最近成功同步时间 |
+| ChatGPT 观察 | 从本机日志识别部分断流、续传和更新连接事件，区分当前状态与历史异常 |
+| 保持唤醒 | Commander 服务运行时，可阻止系统因闲置而休眠 |
 
-它同样不会读取聊天正文、自动重发消息、重试业务任务，或把未知状态当作“可以安全重启”。
-
-> **上游跟踪：ChatGPT 会话归属**
->
-> CommanderGuard 已兼容 OpenAI 的 `openai/session` 和建议的 `origin_context_id`，但 Remote Desktop Commander 当前尚未把稳定会话字段透传到配对设备。进展可直接跟踪 [Remote Desktop Commander #12 — Preserve stable ChatGPT conversation identity in remote tool-call metadata](https://github.com/desktop-commander/remote-desktop-commander/issues/12)。
-
-后续功能、优先级和验收条件见 [TODO.md](TODO.md)。待办里未完成的项目不属于当前能力。
-
----
+某一层正常，只能证明这一层的检查通过。设备登记在线、`ping` 成功、本机工具返回，以及 ChatGPT 回答完整结束，需要各自的证据。Guard 不会自动重发聊天消息或重试业务任务。
 
 ## 快速开始
 
-### 1. 前置条件
+### 1. 检查运行条件
 
-先安装并登录 [Remote Desktop Commander](https://github.com/desktop-commander/remote-desktop-commander)，并确认它已经在本机运行。
+你需要 macOS、可用的 Swift 编译器，以及已经安装、登录并配对的 Remote Desktop Commander。构建使用系统的 AppKit 和 IOKit，无需额外的 Swift 包依赖；如果缺少编译器，请先安装 Xcode Command Line Tools。
 
-### 2. 构建、测试并安装
+当前版本按以下布局读取本机服务。它还没有提供自定义路径或服务名设置：
 
-在项目目录执行：
+| 项目 | 当前读取的位置 |
+|---|---|
+| 登录信息 | `~/.desktop-commander-device/device.json` |
+| 受管理的 LaunchAgent | `com.wuwendi.remote-desktop-commander` |
+| Commander 日志 | `~/Library/Logs/RemoteDesktopCommander/stdout.log`、`stderr.log` |
+| Commander 程序 | `~/.local/share/remote-desktop-commander/node_modules/@wonderwhy-er/desktop-commander/dist/index.js` |
+| ChatGPT App 日志 | `~/Library/Logs/com.openai.codex` |
+
+如果你使用其他启动方式，Guard 可能无法识别服务或确认空闲，自动恢复也可能不可用。它不会自动把你的 Commander 改成这套布局。
+
+### 2. 从源码构建并运行
+
+下载或克隆本仓库，在项目目录执行：
 
 ```bash
 ./build.sh
 ./build/CommanderGuard.app/Contents/MacOS/CommanderGuard --self-test
+```
+
+构建完成后，在 Finder 打开 `build/CommanderGuard.app`。应用入口在菜单栏，点击图标打开主面板。源码构建使用本地临时签名，没有配置 Developer ID 公证。
+
+首次运行且没有旧配置时，“自动恢复命令连接”默认开启。如果你只想观察和诊断，请在主面板关闭它。“保持电脑唤醒”是独立开关。
+
+### 3. 检查一次链路
+
+在主面板点击“检查链路”。Guard 先检查消息通道，通道回应且本机安全条件允许时，再检查工具执行。启动后的常规检查有约 90 秒宽限；已经观察到持续通道异常时，会提前安排只读复查。
+
+如果工具检查被延后，面板会说明原因。先看是否仍有任务运行、日志是否完整，不要把“未确认”当作空闲。
+
+### 可选：使用现有安装脚本
+
+**`install.sh` 目前依赖 `/Volumes/ExtSSD/Projects/CommanderGuard`，并要求 `/Volumes/ExtSSD/Projects` 已存在。其他目录的用户请先使用上面的源码运行方式。**
+
+适配这套目录布局后执行：
+
+```bash
 ./install.sh
 ```
 
-安装脚本会：
+脚本会构建应用，安装到 `~/Applications/CommanderGuard.app`，创建桌面入口和登录自启项，并重新启动 CommanderGuard。安装步骤本身不会重启或修改 Remote Desktop Commander；启动后的自动恢复行为由 Guard 开关和安全条件决定。该登录自启项会在 Guard 异常退出后尝试重启，正常退出不会触发保活。
 
-- 构建并签名 CommanderGuard；
-- 安装到 `~/Applications/CommanderGuard.app`；
-- 创建桌面入口与登录自启项；
-- 只重新启动 **CommanderGuard** 本身。
+## 日常使用
 
-它**不会**重新登录、重启或修改已经运行的 Desktop Commander 服务。
+主面板有三个页面，支持调整窗口大小和系统浅色、深色外观。
 
-> 当前安装脚本使用固定项目路径：`/Volumes/ExtSSD/Projects/CommanderGuard`。
-
-首次安装且没有旧设置文件时，“自动恢复命令连接”默认开启。它和“保持电脑唤醒”是两个互相独立的开关。
-
----
-
-## 主界面
-
-点击菜单栏图标，或再次打开桌面入口，会进入同一个主面板。
-
-概览和连接状态页顶部显示三张状态卡：
-
-- 消息通道
-- 工具执行
-- ChatGPT 回答
-
-操作记录页会隐藏这些重复状态控件，把空间留给记录本身。
-
-主面板分为三个页面：
-
-### 概览
-
-只回答两个问题：
-
-- **当前状态**：当前最重要的状态，以及是否需要你处理；
-- **当前任务**：有没有本机工具正在执行，以及必要时提示为什么 Guard 暂时不能判断空闲。
-
-这里不再重复连接历史、自动恢复细节或事件列表。
-
-### 操作记录
-
-显示最近最多 100 次本机工具调用。记录表会使用完整可用宽度，点击一条记录后查看脱敏后的时间、状态、耗时、操作详情和匿名会话归属（如果上游提供可靠字段）。
-
-支持按命令、工具、路径和会话搜索，并提供“全部 / 进行中 / 异常与未确认”三种筛选。ChatGPT App 事件不再混在这个页面里。
-
-### 连接状态
-
-只显示用户需要判断的连接信息：
-
-- 当前连接处理状态；
-- 自动恢复当前是否可用，以及为什么会暂缓；
-- 最近一次连接问题何时发生、是否已经恢复。
-
-如果当前没有连接问题，就不会额外堆叠日志来源、诊断依据或事件列表。
-
----
-
-## 状态栏含义
-
-| 标记 | 含义 |
+| 页面 | 适合查看的内容 |
 |---|---|
-| `●` | 消息通道近期已明确回应 |
-| `!` | 服务未运行，或通道已明确报错 |
-| `?` | 尚未确认、结果已过期，或当前证据不足 |
+| 概览 | 当前最需要处理的状态、本机任务、用量；主要开关和“检查链路”入口 |
+| 操作记录 | 最近调用列表；按命令、工具、路径或会话搜索，筛选“全部 / 进行中 / 异常与未确认”，点击记录查看详情 |
+| 连接状态 | 当前连接处理情况、自动恢复为什么暂缓，以及最近异常和恢复时间 |
 
-“未观察到新调用”只表示当前可见日志里没有新调用；如果日志存在缺口，CommanderGuard 不会把它当成“已经确认空闲”。
+菜单栏会持续更新状态。内部标记 `●` 表示消息通道近期明确回应，`!` 表示服务未运行或通道明确报错，`?` 表示尚未确认、证据过期或不足。
 
----
+### 连接云端用量
 
-## 消息通道与工具执行为什么要分开
+这是 Desktop Commander 云端 tool calls 用量，与 ChatGPT 的订阅额度无关。该功能可选，目前只支持 Google Chrome。
 
-在没有已观察故障时，CommanderGuard 启动约 90 秒后才进入常规定期 MCP `ping`；这是启动宽限，不是故障解释。若日志已经观察到持续通道异常，故障驱动的只读复查会绕过这段常规启动等待，并按退避节奏执行。
+1. 在“概览”点击“连接额度账户”，在打开的官方用量页完成登录。可以沿用 Chrome 中的 Google 登录。
+2. 在 macOS 自动化提示中，允许 CommanderGuard 控制 Google Chrome。
+3. 在 Chrome 的“视图 → 开发者”菜单开启“允许来自 Apple Events 的 JavaScript”（英文菜单为 View → Developer → Allow JavaScript from Apple Events）。
+4. 回到 Guard 点击“刷新”，确认出现用量和最近成功同步时间。
 
-只有同时满足以下条件，才会把消息通道标记为可回应：
+保持官方用量标签页打开即可，后台标签页也可以。启用后每 10 分钟同步一次，普通刷新不会反复打开或切到浏览器。关闭 Chrome 或标签页后，同步会停止取得新数据，Guard 会提示页面缺失。若有多个官方用量页，请把要读取的账户标签页切到 Chrome 最前方。
 
-- 响应属于当前设备；
-- 请求编号匹配；
-- 收到对应 `pong`。
+“暂停同步”会关闭后续同步，不会退出浏览器账户。Pro 无限额度不显示有限进度条；临时失败保留并标记上次数据，超过 15 分钟的数据标为过期，登录失效会清除旧数值。
 
-这个 `ping` 由 Commander 设备端直接返回，**不会经过真实本机工具执行**。
+Guard 通过官方页面的只读接口取得校验后的额度字段，不导出 Cookie、密码、令牌或邮箱。这是网页当前使用的接口，后续网站改版可能影响同步。
 
-因此，工具执行有自己独立的 120 秒证据有效期：
+## 遇到异常时
 
-1. 优先复用最近一次明确成功的真实工具调用；
-2. 如果证据过期，且本机确认空闲、日志完整、消息通道可回应，才发送固定的只读 `list_sessions` 探针；
-3. 探针正文会被丢弃，只保留“已验证 / 失败 / 未知”、检查时间和必要错误类别。
+### 控制台在线，工具却调用失败
 
-工具检查失败本身不会增加自动重启条件。
+控制台在线通常反映设备登记或心跳。先点“检查链路”，看当前设备的 `ping` 是否回应，再看工具执行是否通过。`ping` 由设备端直接返回，不经过本机工具执行。
 
----
+工具执行优先使用近期明确成功的真实调用；证据超过 120 秒，且通道可回应、日志完整、本机确认空闲时，才发送只读 `list_sessions`。探针结果正文会被丢弃。工具探针失败本身不会触发自动重启。
 
-## 持续通道异常如何处置
+### “本机日志覆盖有缺口，无法安全确认空闲”
 
-CommanderGuard 不再把所有断链都压成同一个“通道错误”。它会把可安全识别的信号归为固定、脱敏的类别，并把**当前健康状态**与**最近故障记录**分开显示。
+这表示 Guard 看不到完整的调用过程，例如日志被轮换、截断、丢失、读取失败，或尚未读完。它无法排除仍有任务运行，因此暂缓恢复。这个提示本身不证明 Commander 已经断链，也不证明任务已经结束。
 
-| 观察到的信号 | Guard 的处理 | 会不会因此重启本机 Commander |
-|---|---|---|
-| `IncreaseConnectionPool` | 显示 **“云端实时服务连接池异常”**；立即进入有限频率的只读复查，随后按 10 / 20 / 40 / 80 / 120 秒退避；本次故障只记录一次容量告警 | **不会**。这是云端 Realtime 容量类异常，本机重启不能修复 |
-| 明确返回“设备没有活动连接” | 记为明确设备断链；累计达到 3 次后才进入既有的安全恢复判断 | 只有任务、日志、进程树、云端待执行调用和冷却条件全部允许时才可能重启 |
-| 网络或服务结果未知 | 保存为“未知”，继续有限频率复查 | **不会**。未知既不等同于断链，也不会抹掉此前已确认的断链历史 |
-| 普通通道错误 / 关闭 / 订阅超时 | 记为持续通道异常并安排只读复查 | 不单凭这些日志重启；仍需明确设备断链证据 |
+### “云端实时服务连接池异常”
 
-Supabase 对 `IncreaseConnectionPool` 的说明见 [Realtime Error Codes](https://supabase.com/docs/guides/realtime/error_codes) 与 [Realtime Settings](https://supabase.com/docs/guides/realtime/settings)：该错误表示 Realtime 使用的数据库连接池不足。CommanderGuard 能做的是**识别、提示、退避复查并记录恢复经过**，不能从本机修复云端连接池。
+Guard 在日志里识别到了 `IncreaseConnectionPool`。这类云端容量异常会阻止本机自动重启，并触发有限频率的只读复查，间隔按 10 / 20 / 40 / 80 / 120 秒退避。
 
-每次通道探测、结果类别、连续明确断链计数、恢复判断、暂缓原因和恢复结果都会写入受限大小的脱敏决策日志。日志只保存固定类别与时间，不保存 MCP 原始响应、凭据、命令正文或工具结果。
+请结合最近一次检查结果和时间判断当前状态。旧的容量告警或控制台在线记录，都不能单独确认当前命令通道是否恢复。Guard 可以记录故障和复查经过，无法从本机扩容或修复云端连接池。相关说明见 [Realtime Error Codes](https://supabase.com/docs/guides/realtime/error_codes) 和 [Realtime Settings](https://supabase.com/docs/guides/realtime/settings)。
 
----
+### ChatGPT 显示 “Connection interrupted” 或 “Message delivery timed out”
 
-## 自动恢复：什么时候会重启 Commander
+Guard 能观察本机日志中的部分回答恢复、刷新失败和更新连接事件，但当前日志没有每次屏幕超时提示对应的专属最终事件。因此，它可能没有识别到你看到的提示，也无法保证判断原回答是否完整恢复。
 
-CommanderGuard 的自动恢复设计原则是：**宁可暂缓，也不要在任务仍可能运行时误重启。**
+更新连接重建只证明该连接重建；“恢复完成”也只适用于对应恢复路径。Guard 不会控制 ChatGPT 的原回答流、自动续传、重发消息、重启 ChatGPT 或切换网络。技术复核见 [CHAT-LIVENESS-REVIEW.md](CHAT-LIVENESS-REVIEW.md)。
 
-只有累计收到 **3 次明确的“设备没有活动连接”**，才会进入自动恢复判断。中间出现“网络或服务未知”不会把这些明确断链证据清零；明确健康的 `ping` 才会清零计数。
+## 自动恢复的条件
 
-以下情况不会直接触发重启：
+Guard 累计收到 3 次明确的“设备没有活动连接”后，才进入恢复判断。中间的未知结果不会清零这些断链证据，明确健康的 `ping` 会清零。
 
-- 普通超时；
-- 网络或服务状态未知；
-- 登录失效；
-- 无法识别的响应；
-- `IncreaseConnectionPool` 等已识别的云端容量异常；
-- 工具探针失败；
-- 日志不完整；
-- 当前仍有业务调用；
-- 自动恢复已关闭；
-- 处于冷却期。
+重启前必须开启自动恢复，并同时确认：
 
-真正重启前还会确认：
-
+- 本机调用已结束，日志覆盖完整且可读；
+- Commander 进程树符合预期，没有额外子进程；
 - 云端没有待执行或执行中的调用；
-- 本机日志没有未结束或状态不明的调用；
-- Commander 进程树没有额外子进程；
-- 日志覆盖足够完整；
-- 五分钟冷却条件允许。
+- 距离上次恢复尝试已满足五分钟冷却条件。
 
-重启后，只有同时满足：
+超时、登录失效、无法识别的响应、工具探针失败和云端容量异常，都不会单独触发重启。重启后，只有服务进程 PID 已变化且新服务的 `ping` 成功，才报告恢复成功。这个结果不代表原业务任务已继续完成。
 
-1. Desktop Commander 服务 PID 已变化；
-2. 新服务的 `ping` 成功；
+这些检查仍不能保证覆盖所有独立后台任务。需要人工控制服务时，可以关闭自动恢复。
 
-才会报告“恢复成功”。
+## 数据与隐私
 
-自动恢复**不会**：
+Guard 只读现有登录信息和日志，不写入或刷新 Commander 登录凭据。设备登记、待执行调用和固定探针查询使用已有授权；额度同步单独通过 Chrome 官方用量页进行。
 
-- 重放命令；
-- 重新提交图片生成；
-- 自动发送聊天消息；
-- 自动继续未完成的远端任务。
+操作记录包含脱敏后的命令摘要、路径、时间和状态。常见凭据与内联脚本会被隐藏，但自定义秘密格式仍可能无法识别。不要在命令行中直接放置敏感值，分享记录前也应检查内容。
 
-这些保护能减少误伤，但不能保证识别所有独立运行的后台任务。
+Guard 不读取聊天正文。探针和工具结果正文、原始错误响应、登录令牌、原始会话标识，以及额度账户的 Cookie、密码、令牌、邮箱和原始响应，不会写入它的状态或决策日志。
 
----
+<details>
+<summary>本机数据文件与会话归属</summary>
 
-## 操作记录与会话归属
-
-CommanderGuard 会从当前服务时期的日志重建调用状态，并保留脱敏后的调用摘要。
-
-历史重建记录会明确标注时间或耗时是否未知；日志轮换、截断、丢失或读取失败也会单独记录，不会因为“安静了一段时间”就假定任务完成。
-
-### ChatGPT 会话归属
-
-CommanderGuard **只接受上游明确提供的稳定会话字段**，不会靠时间或窗口位置猜测。
-
-当前支持：
-
-- OpenAI 官方 `_meta["openai/session"]`
-- Remote Desktop Commander issue #12 建议的 `origin_context_id`
-
-收到原始值后会立即做 SHA-256，只保存和展示短匿名指纹，例如：
-
-```text
-会话 A1B2C3D4E5
-```
-
-以下信息**不会**被当作会话归属依据：
-
-- `origin_instance`
-- 调用时间接近
-- 当前前台聊天
-- 终端进程
-
-如果两个稳定字段互相冲突，记录会显示“归属冲突”；如果没有稳定字段，则显示“归属未确认”。
-
-> 当前 Remote Desktop Commander 0.2.51 的云端调用 metadata 仍未透传这两个稳定字段，所以真实调用通常仍显示“归属未确认”。
-
-详细复核见 [CHAT-COMMANDER-ATTRIBUTION-REVIEW.md](CHAT-COMMANDER-ATTRIBUTION-REVIEW.md)。
-
-### 结构化工具历史
-
-CommanderGuard 还会只读：
-
-```text
-~/.claude-server-commander/tool-history.jsonl
-```
-
-它只提取：
-
-- 工具名；
-- 实际时间；
-- 耗时；
-- 已返回 / 返回错误 / 未知。
-
-参数正文和结果正文不会进入 CommanderGuard 的 UI 或状态文件。
-
-由于这个历史格式没有可靠调用编号，CommanderGuard 不会按时间把它和 stdout 记录、ChatGPT 会话强行合并，也不会单独把它当成“当前空闲”的证明。
-
----
-
-## ChatGPT App 监控
-
-CommanderGuard 会只读观察当前本机 ChatGPT App 的固定结构化事件，包括：
-
-- 回答恢复尝试；
-- 恢复流不可用；
-- 恢复完成；
-- 恢复检查失败；
-- 对话状态刷新失败；
-- 更新连接关闭、失败、重连、重连耗尽与重新建立。
-
-启动时会分批读取最近的 App 日志，并从自己的脱敏时间线恢复最近异常。
-
-界面会把 **当前 ChatGPT 状态** 和 **最近一次历史回答异常** 分开：顶部状态卡只表示当前是否正常；历史异常保留在“连接状态”页。如果后续连接已经恢复，CommanderGuard 会明确显示“当前连接正常”，同时保留“原中断回答是否完整恢复无法从日志确认”的历史说明，而不会让旧异常永久占据当前状态。
-
-这里有几个重要边界：
-
-- “恢复完成”只表示对应恢复路径成功，不代表其他异常也已恢复；
-- 更新连接重新建立，不代表原回答已经恢复；
-- `Connection interrupted` 表示响应中断后进入轮询等待；
-- `Message delivery timed out` 表示这段轮询等待超时，不能据此判断用户消息是否已经发出；
-- 当前日志没有每次屏幕 `Message delivery timed out` 提示对应的专属最终事件。
-
-CommanderGuard 不会：
-
-- 读取或保存聊天正文；
-- 自动发送消息；
-- 自动重试任务；
-- 重启 ChatGPT；
-- 切换网络。
-
-详细复核见 [CHAT-LIVENESS-REVIEW.md](CHAT-LIVENESS-REVIEW.md)。
-
----
-
-## 隐私与安全边界
-
-CommanderGuard 的原则是：**尽量保存状态，不保存内容。**
-
-本机状态位于：
-
-```text
-~/Library/Application Support/CommanderGuard/
-```
-
-主要文件：
+状态文件位于 `~/Library/Application Support/CommanderGuard/`：
 
 | 文件 | 内容 |
 |---|---|
-| `status.json` | 当前服务、通道、工具执行、调用与脱敏故障处置状态 |
-| `timeline.jsonl` | 脱敏事件时间线，最多 1 MiB，并保留一个轮替副本 |
-| `channel-incident.json` | 当前 / 最近通道故障类别、首次与最近时间、退避状态和恢复时间 |
-| `channel-decisions.jsonl` | 通道探测与恢复决策历史，最多 512 KiB，并保留一个轮替副本 |
-| `channel-recovery.json` | 自动恢复开关与最近尝试时间，不含登录凭据 |
+| `status.json` | 服务、通道、工具执行、调用状态和可选额度摘要 |
+| `timeline.jsonl` | 脱敏事件，最多 1 MiB，保留一个轮替副本 |
+| `channel-incident.json` | 当前及最近通道故障类别、时间、退避和恢复状态 |
+| `channel-decisions.jsonl` | 探测与恢复决策，最多 512 KiB，保留一个轮替副本 |
+| `channel-recovery.json` | 自动恢复开关和最近尝试时间，不含凭据 |
 
-CommanderGuard 会读取已有本机登录信息，用于查询设备登记、待执行调用和发送固定 `ping`，但不会写入或刷新登录凭据。
+会话归属只接受上游明确提供的 `_meta["openai/session"]` 或 `origin_context_id`，原值经 SHA-256 转为短匿名指纹。缺少字段显示“归属未确认”，字段冲突显示“归属冲突”。时间接近、前台聊天、终端进程和 `origin_instance` 都不作为归属依据。
 
-以下内容不会写入 CommanderGuard 的状态、时间线或通道决策日志：
+当前配对链路尚缺稳定会话字段透传，实际调用可能仍无法区分 ChatGPT 会话。进展见 [Remote Desktop Commander #12](https://github.com/desktop-commander/remote-desktop-commander/issues/12) 和 [CHAT-COMMANDER-ATTRIBUTION-REVIEW.md](CHAT-COMMANDER-ATTRIBUTION-REVIEW.md)。
 
-- 探针正文和 MCP 原始响应；
-- Commander 原始错误详情；
-- 登录令牌；
-- 原始 ChatGPT 会话标识；
-- 命令正文与工具结果正文。
+Guard 也会读取 `~/.claude-server-commander/tool-history.jsonl`，只提取工具名、实际时间、耗时和返回状态，丢弃参数及结果正文。该格式没有可靠调用编号，所以不会按时间与其他记录强行合并，也不会单独用它证明当前空闲。
 
-命令预览会隐藏常见凭据及内联脚本，但自定义秘密格式仍不应该直接放进命令行。
+历史重建中缺失的时间和耗时会标为未知。本机调用返回不证明云端已收到结果，也不证明整轮 ChatGPT 任务完成。
 
----
+</details>
 
-## 手动检查与开发命令
+## 手动检查与开发
 
-### 离线自检
+以下命令在项目目录运行。两个探针使用真实云端连接，但不会启动 Guard 的自动恢复。`--probe-tool` 会发送只读工具调用。
 
-不会启动 Guard，也不会操作 Commander 服务：
+```bash
+./build/CommanderGuard.app/Contents/MacOS/CommanderGuard --probe-channel
+./build/CommanderGuard.app/Contents/MacOS/CommanderGuard --probe-tool
+```
+
+离线自检不会启动守护或操作 Commander 服务：
 
 ```bash
 ./build/CommanderGuard.app/Contents/MacOS/CommanderGuard --self-test
 ```
 
-### 离线 UI 预览
-
-使用固定示例数据，不启动监控或恢复，也不写状态：
+UI 预览使用固定示例，不启动监控、恢复或额度请求，也不写入状态：
 
 ```bash
 ./build/CommanderGuard.app/Contents/MacOS/CommanderGuard --preview-ui
-```
-
-检查常规 / 最小尺寸及浅色 / 深色布局：
-
-```bash
 ./build/CommanderGuard.app/Contents/MacOS/CommanderGuard --preview-ui --verify-ui
 ./build/CommanderGuard.app/Contents/MacOS/CommanderGuard --preview-ui --preview-dark --verify-ui
 ```
 
-### 单独检查两层链路
-
-只检查消息通道：
-
-```bash
-./build/CommanderGuard.app/Contents/MacOS/CommanderGuard --probe-channel
-```
-
-只检查真实本机工具执行：
-
-```bash
-./build/CommanderGuard.app/Contents/MacOS/CommanderGuard --probe-tool
-```
-
-这两个探针都不会启动自动恢复。
-
----
-
-## 当前已知限制
-
-- Remote Desktop Commander 当前没有把稳定 ChatGPT session metadata 透传到配对设备，因此会话归属通常仍是“未确认”；见 [上游 issue #12](https://github.com/desktop-commander/remote-desktop-commander/issues/12)。
-- 本机工具调用返回，不代表云端一定已经收到结果，也不代表整轮 ChatGPT 任务已经完成。
-- `ping` 和更新连接恢复都不能单独证明原回答流已经恢复。
-- CommanderGuard 只能根据可观察证据避免误重启，不能保证识别所有独立后台任务。
-- `IncreaseConnectionPool` 这类云端 Realtime 容量异常只能由 Guard 识别、退避复查和提示；本机 Guard 不能扩容或修复 Supabase / Remote Desktop Commander 的云端连接池。
-- ChatGPT App 当前没有经验证的、供第三方 Guard 控制原回答流的受支持接口。
-- 安装脚本目前仍依赖固定项目路径。
-
----
-
-## 项目文档
-
-| 文档 | 用途 |
-|---|---|
-| [TODO.md](TODO.md) | 当前优先级、验收条件和实施进度 |
-| [CHAT-COMMANDER-ATTRIBUTION-REVIEW.md](CHAT-COMMANDER-ATTRIBUTION-REVIEW.md) | ChatGPT 会话归属、`openai/session` 与 RDC metadata 缺口 |
-| [CHAT-LIVENESS-REVIEW.md](CHAT-LIVENESS-REVIEW.md) | ChatGPT App 回答流、续传与保活能力复核 |
-| [DIAGNOSIS.md](DIAGNOSIS.md) | ChatGPT App / Commander 历史超时诊断 |
-| [RESEARCH.md](RESEARCH.md) | 长任务、超时与相关公开方案调研 |
-
----
-
-## UI 与实现
-
-CommanderGuard 使用原生 AppKit，支持：
-
-- 系统浅色 / 深色外观；
-- 可调整窗口尺寸；
-- 菜单栏实时状态；
-- 固定示例 UI 预览与布局自检。
-
-界面分层参考：
-
-- [Little Snitch](https://help.obdev.at/littlesnitch6/lsm-overview) 的概览、列表和详细信息结构；
-- [Stats](https://github.com/exelban/stats) 的菜单栏监测用途。
-
-应用图标位于：
-
-```text
-Assets/AppIcon.png
-Assets/AppIcon.icns
-```
-
-菜单栏使用同一语义的原生单色盾牌 / 连接标识。
-
----
+实现使用原生 AppKit。应用图标为 `Assets/AppIcon.png` 和 `Assets/AppIcon.icns`，菜单栏使用单色盾牌与连接标识。界面结构参考 [Little Snitch](https://help.obdev.at/littlesnitch6/lsm-overview) 和 [Stats](https://github.com/exelban/stats)。
 
 ## 卸载
+
+通过安装脚本安装的版本，可在项目目录执行：
 
 ```bash
 ./uninstall.sh
 ```
 
-卸载脚本会移除：
+它会移除 Guard 应用、桌面入口和登录启动项，保留项目源码、状态和日志。只从 `build/CommanderGuard.app` 运行的用户，退出后删除构建产物即可。
 
-- CommanderGuard 应用；
-- 桌面入口；
-- 登录启动项。
+## 项目文档
 
-项目源码和 CommanderGuard 状态文件会保留。
+- [TODO.md](TODO.md)：功能优先级和验收条件。未完成项目不属于当前能力。
+- [CHAT-COMMANDER-ATTRIBUTION-REVIEW.md](CHAT-COMMANDER-ATTRIBUTION-REVIEW.md)：会话归属与上游字段缺口。
+- [CHAT-LIVENESS-REVIEW.md](CHAT-LIVENESS-REVIEW.md)：ChatGPT 回答流与保活能力复核。
+- [DIAGNOSIS.md](DIAGNOSIS.md)：历史超时诊断。
+- [RESEARCH.md](RESEARCH.md)：长任务、超时及公开方案调研。
+
+这些详细文档目前主要为中文。报告问题时，请提供 macOS 与 Commander 版本、运行方式、故障时间，以及脱敏后的面板状态；不要提交登录信息或完整私有日志。
