@@ -89,20 +89,19 @@ The menu bar keeps updating. The internal marker `●` means the message channel
 
 ### Connect cloud usage
 
-This shows Desktop Commander cloud tool calls usage, separate from your ChatGPT subscription limits. It is optional and currently requires Google Chrome.
+This shows Desktop Commander cloud tool calls usage, separate from your ChatGPT subscription limits. It is optional and requires Google Chrome to be installed.
 
-1. Click “连接额度账户” (connect usage account) in Overview and sign in on the official page that opens. You can use your existing Google sign-in in Chrome.
-2. Allow CommanderGuard to control Google Chrome when macOS requests Automation permission.
-3. In Chrome, enable View → Developer → Allow JavaScript from Apple Events (Chinese: “视图 → 开发者 → 允许来自 Apple Events 的 JavaScript”).
-4. Return to Guard and click “刷新” (refresh). Check that usage and a last successful sync time appear.
+1. Click “连接额度账户” (connect usage account) in Overview and sign in on the official site in Guard's dedicated browser window. Google sign-in is supported.
+2. Close the dedicated window after signing in, return to Guard, and click “刷新” (refresh). Your everyday Chrome windows can stay open or be quit.
+3. Choose manual only or 1, 2, 5, 10, 30, or 60 minutes under “后台自动同步” (background sync). The default is five minutes. The choice survives Guard relaunches; changing it does not immediately send a request.
 
-You can close the usage page after signing in. Once enabled, usage syncs every 2 minutes; manual refresh shows progress and failure reasons. Chrome must already be running with a regular window. Guard reuses a unique existing usage page, or creates a temporary background tab in the current Chrome window, reads usage, and closes only its own tab while preserving your active tab. It does not launch a Chrome you have quit. If several official usage tabs are open, make the account you want to read the active tab in the front Chrome window.
+Automatic reads use Chrome Headless, without visible windows or changes to your everyday browser tabs or foreground app. Only clicking the sign-in button opens a dedicated login window. A failed automatic read never opens a login window on its own.
 
-Without an existing usage page, the read uses the account in the current Chrome window, rather than a permanently bound account. With no existing usage page, a front incognito window prevents a new read; ambiguous page selection also pauses the read with guidance to select a regular window or account.
+The dedicated browser has its own sign-in profile. It cannot reuse your everyday Chrome Google session, so upgrading requires signing in once in the dedicated window. Guard does not copy cookies or account data from your everyday browser. Chrome retains authentication in its dedicated profile; Guard receives only validated usage numbers, plan, and month.
 
-“暂停同步” (pause sync) stops further syncing without signing you out of Chrome. An unlimited Pro plan has no finite progress bar. Temporary failures retain and label the last successful values; data older than 15 minutes is marked stale, and an expired login clears old values.
+“暂停同步” (pause sync) stops future requests and cancels an active usage read without signing out. Unlimited Pro plans have no finite progress bar. Temporary failures retain the last successful values and actual sync time. The stale threshold follows the selected interval, with a minimum of fifteen minutes. Expired authentication requires signing in again.
 
-Guard obtains validated usage fields through the official page's read-only interface. It does not export cookies, passwords, tokens, or email addresses. This is the interface currently used by the website, so website changes may break syncing.
+The usage endpoint is the read-only interface currently used by the official website, rather than a guaranteed public API. Website changes may break syncing. See the [official Chrome Headless guide](https://developer.chrome.com/docs/automation-and-testing/headless) for its window-free mode.
 
 ## Troubleshooting
 
@@ -151,7 +150,7 @@ With “防止闲置睡眠（Guard）” enabled, Guard requests that macOS prev
 
 ## Data and privacy
 
-Guard reads existing credentials and logs without writing or refreshing Commander credentials. Device registration, pending-call checks, and fixed probes use the existing authorization; usage sync separately uses the official page in Chrome.
+Guard reads existing credentials and logs without writing or refreshing Commander credentials. Device registration, pending-call checks, and fixed probes use the existing authorization; usage sync uses a dedicated Chrome profile and headless browser without controlling everyday Chrome windows.
 
 Activity records include redacted command summaries, paths, times, and states. Common credentials and inline scripts are hidden, but custom secret formats may not be recognized. Avoid putting sensitive values directly in commands and review records before sharing them.
 
@@ -193,6 +192,12 @@ The offline self-test does not start the guard or operate the Commander service:
 
 ```bash
 ./build/CommanderGuard.app/Contents/MacOS/CommanderGuard --self-test
+```
+
+The headless check starts Chrome twice with blank pages in a temporary profile and checks for leftover locks and changes to the foreground app. It does not access an account or verify real usage:
+
+```bash
+./build/CommanderGuard.app/Contents/MacOS/CommanderGuard --probe-headless
 ```
 
 UI previews use fixed sample data. They do not start monitoring, recovery, or usage requests, and do not write state:

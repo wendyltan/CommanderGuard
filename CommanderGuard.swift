@@ -5,9 +5,10 @@ import Foundation
 import Darwin
 import CoreFoundation
 import CryptoKit
+import CoreGraphics
 
 struct UsageQuota {
-    enum State: String { case disconnected, connecting, refreshing, loginRequired, browserTabMissing, browserTabAmbiguous, browserPermissionRequired, unavailable, fresh, stale, unlimited }
+    enum State: String { case disconnected, connecting, refreshing, loginRequired, unavailable, fresh, stale, unlimited }
     var state: State = .disconnected
     var used: Int?
     var total: Int?
@@ -55,35 +56,479 @@ func trustedQuotaURL(_ url: URL?) -> Bool {
     return true
 }
 
-func appleScriptLiteral(_ value: String) -> String {
-    "\"" + value.replacingOccurrences(of: "\\", with: "\\\\")
-        .replacingOccurrences(of: "\"", with: "\\\"")
-        .replacingOccurrences(of: "\n", with: " ")
-        .replacingOccurrences(of: "\r", with: " ") + "\""
+let quotaRefreshOptions = [0, 60, 120, 300, 600, 1800, 3600]
+let quotaDefaultRefreshSeconds = 300
+
+func sanitizedQuotaRefreshSeconds(_ seconds: Int?) -> Int {
+    guard let seconds, quotaRefreshOptions.contains(seconds) else { return quotaDefaultRefreshSeconds }
+    return seconds
 }
 
-let quotaRefreshInterval: TimeInterval = 120
-let quotaStaleInterval: TimeInterval = 900
-
-func quotaIsStale(_ quota: UsageQuota, now: Date) -> Bool {
-    quota.used != nil && quota.syncedAt.map { now.timeIntervalSince($0) > quotaStaleInterval } == true
+func quotaStaleInterval(for refreshSeconds: Int) -> TimeInterval {
+    max(900, Double(refreshSeconds) * 2 + 60)
 }
 
-func quotaCreatedWindowIDs(_ value: String?, marker: String) -> (window: String, tab: String)? {
-    guard let value else { return nil }
-    let fields = value.split(separator: ":", omittingEmptySubsequences: false)
-    guard fields.count == 4, fields[0] == "owned", String(fields[3]) == marker, !fields[1].isEmpty, !fields[2].isEmpty,
-          fields[1].utf8.allSatisfy({ $0 >= 48 && $0 <= 57 }),
-          fields[2].utf8.allSatisfy({ $0 >= 48 && $0 <= 57 }) else { return nil }
-    return (String(fields[1]), String(fields[2]))
+func quotaIsStale(_ quota: UsageQuota, now: Date, refreshSeconds: Int = quotaDefaultRefreshSeconds) -> Bool {
+    quota.used != nil && quota.syncedAt.map { now.timeIntervalSince($0) > quotaStaleInterval(for: refreshSeconds) } == true
 }
 
-func quotaOwnedWindowCondition(id: String) -> String {
-    "id of browserWindow is \(appleScriptLiteral(id))"
-}
+/// Uses only CommanderGuard's private Chrome profile; never attaches to another browser.
+final class HeadlessQuotaBrowser {
+    enum Outcome {
+        case success(UsageQuota), loginRequired, loginOpen, unavailable(String), cancelled
+    }
+    enum Failure: Error, LocalizedError {
+        case unavailable, profile, busy, timeout, cancelled, protocolError
+        var errorDescription: String? {
+            switch self {
+            case .profile: return "专用浏览器资料目录不可用"
+            case .busy: return "请先关闭专用登录浏览器"
+            case .timeout: return "额度读取超时"
+            case .cancelled: return "额度读取已取消"
+            default: return "专用浏览器暂时无法读取额度"
+            }
+        }
+    }
+    private let stateLock = NSLock()
+    private let worker = DispatchQueue(label: "CommanderGuard.QuotaBrowser", qos: .utility)
+    private var reading = false
+    private var cancelled = false
+    private var loginProcess: Process?
+    private var loginLockFD: Int32 = -1
+    private var sawLoginWindow = false
+    private var missingLoginWindowSamples = 0
+    var onLoginClosed: (() -> Void)?
+    private static let pageURL = "https://mcp.desktopcommander.app/usage"
+    private static var profileURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/CommanderGuard/QuotaBrowser", isDirectory: true)
+    }
 
-func quotaOwnedTabCondition(id: String, marker: String) -> String {
-    "id of browserTab is \(appleScriptLiteral(id)) and URL of browserTab is \(appleScriptLiteral("https://mcp.desktopcommander.app/usage#\(marker)"))"
+    func read(chromeExecutable: URL, completion: @escaping (Outcome) -> Void) {
+        stateLock.lock()
+        if loginProcess != nil {
+            stateLock.unlock(); DispatchQueue.main.async { completion(.loginOpen) }; return
+        }
+        if reading {
+            stateLock.unlock(); DispatchQueue.main.async { completion(.unavailable("额度读取正在进行")) }; return
+        }
+        reading = true; cancelled = false
+        stateLock.unlock()
+        worker.async { [self] in
+            let outcome: Outcome
+            do {
+                if isCancelled() { throw Failure.cancelled }
+                let executable = try Self.validateExecutable(chromeExecutable)
+                let profile = try Self.prepareProfile()
+                let lockFD = try Self.acquireProfile(profile)
+                defer { flock(lockFD, LOCK_UN); close(lockFD) }
+                if try Self.hasBrowserLock(profile) { outcome = .loginOpen }
+                else if !Self.loginRequested(profile) { outcome = .loginRequired }
+                else {
+                    if isCancelled() { throw Failure.cancelled }
+                    let session = try PipeBrowser(executable: executable, profile: profile, cancelled: { [self] in isCancelled() })
+                    defer { session.finish() }
+                    let result = try session.fetchQuota()
+                    if result == "login" { outcome = .loginRequired }
+                    else if let bytes = result.data(using: .utf8), let quota = UsageQuota.parse(bytes) { outcome = .success(quota) }
+                    else if result == "timeout" { outcome = .unavailable("官方额度服务读取超时") }
+                    else if result == "network" { outcome = .unavailable("无法连接官方额度服务") }
+                    else if result.range(of: #"^http-[1-5][0-9]{2}$"#, options: .regularExpression) != nil {
+                        outcome = .unavailable("官方额度服务返回 HTTP \(result.suffix(3))")
+                    } else { outcome = .unavailable("官方额度响应暂时不可用") }
+                }
+            } catch let error as Failure {
+                switch error {
+                case .cancelled: outcome = .cancelled
+                case .busy: outcome = .loginOpen
+                default: outcome = .unavailable(error.localizedDescription)
+                }
+            } catch { outcome = .unavailable("专用浏览器暂时无法读取额度") }
+            stateLock.lock()
+            let wasCancelled = cancelled
+            reading = false
+            stateLock.unlock()
+            DispatchQueue.main.async { completion(wasCancelled ? .cancelled : outcome) }
+        }
+    }
+
+    func cancel() {
+        stateLock.lock(); if reading { cancelled = true }; stateLock.unlock()
+    }
+    private func isCancelled() -> Bool {
+        stateLock.lock(); defer { stateLock.unlock() }; return cancelled
+    }
+
+    /// Explicit user action only. Returns false when the dedicated login browser is already open.
+    @discardableResult func openLogin(chromeExecutable: URL) throws -> Bool {
+        stateLock.lock(); defer { stateLock.unlock() }
+        if loginProcess != nil { return false }
+        guard !reading else { throw Failure.busy }
+        let executable = try Self.validateExecutable(chromeExecutable)
+        let profile = try Self.prepareProfile()
+        let fd = try Self.acquireProfile(profile)
+        var keepLock = false
+        defer { if !keepLock { flock(fd, LOCK_UN); close(fd) } }
+        if try Self.hasBrowserLock(profile) { return false }
+        let process = Process()
+        process.executableURL = executable
+        process.arguments = Self.arguments(profile: profile, headless: false)
+        process.environment = Self.childEnvironment
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        process.terminationHandler = { [weak self] owned in
+            guard let self else { return }
+            self.stateLock.lock(); defer { self.stateLock.unlock() }
+            if self.loginProcess === owned {
+                self.loginProcess = nil
+                self.sawLoginWindow = false
+                self.missingLoginWindowSamples = 0
+                DispatchQueue.main.async { [weak self] in self?.onLoginClosed?() }
+                if self.loginLockFD >= 0 { flock(self.loginLockFD, LOCK_UN); close(self.loginLockFD); self.loginLockFD = -1 }
+            }
+        }
+        // Store readiness before launch, so a marker failure cannot leave an untracked browser.
+        try Self.markLoginRequested(profile)
+        try process.run()
+        loginProcess = process; loginLockFD = fd; keepLock = true
+        DispatchQueue.main.async { [weak self] in self?.monitorLoginWindow() }
+        return true
+    }
+
+    private func monitorLoginWindow() {
+        stateLock.lock()
+        guard let process = loginProcess else { stateLock.unlock(); return }
+        let pid = process.processIdentifier
+        let windows = CGWindowListCopyWindowInfo([.optionAll, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]]
+        var closeOwnedProcess = false
+        if let windows {
+            // Only owner PID and window layer are inspected; minimized/OAuth windows count too.
+            let hasWindow = windows.contains { ($0[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == pid && ($0[kCGWindowLayer as String] as? NSNumber)?.intValue == 0 }
+            if hasWindow { sawLoginWindow = true; missingLoginWindowSamples = 0 }
+            else if sawLoginWindow && process.isRunning {
+                missingLoginWindowSamples += 1
+                closeOwnedProcess = missingLoginWindowSamples >= 3
+            }
+        } else { missingLoginWindowSamples = 0 }
+        stateLock.unlock()
+        if closeOwnedProcess { process.terminate() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.monitorLoginWindow() }
+    }
+
+    private static var childEnvironment: [String: String] {
+        ["HOME": FileManager.default.homeDirectoryForCurrentUser.path, "PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "TMPDIR": NSTemporaryDirectory(), "LANG": "en_US.UTF-8"]
+    }
+    private static func arguments(profile: URL, headless: Bool) -> [String] {
+        let shared = ["--user-data-dir=\(profile.path)", "--no-first-run", "--no-default-browser-check"]
+        return shared + (headless
+            ? ["--headless=new", "--remote-debugging-pipe", "--disable-background-networking", "about:blank"]
+            : ["--app=\(pageURL)"])
+    }
+    private static func validateExecutable(_ url: URL) throws -> URL {
+        let allowed = ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                       FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Applications/Google Chrome.app/Contents/MacOS/Google Chrome").path]
+        guard url.isFileURL, allowed.contains(url.path), url.standardizedFileURL.path == url.path else { throw Failure.unavailable }
+        var info = stat()
+        guard lstat(url.path, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG,
+              info.st_uid == 0 || info.st_uid == geteuid(), info.st_mode & 0o002 == 0,
+              access(url.path, X_OK) == 0 else { throw Failure.unavailable }
+        return url
+    }
+    private static func prepareProfile() throws -> URL {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        var current = home
+        let parts = ["Library", "Application Support", "CommanderGuard", "QuotaBrowser"]
+        for part in [""] + parts {
+            if !part.isEmpty { current.appendPathComponent(part, isDirectory: true) }
+            var info = stat()
+            if lstat(current.path, &info) != 0 {
+                guard errno == ENOENT, !part.isEmpty, mkdir(current.path, 0o700) == 0, lstat(current.path, &info) == 0 else { throw Failure.profile }
+            }
+            try validateDirectory(current, privateMode: part == "QuotaBrowser")
+        }
+        guard current.path == profileURL.path else { throw Failure.profile }
+        return current
+    }
+    private static func validateDirectory(_ url: URL, privateMode: Bool) throws {
+        var info = stat()
+        guard lstat(url.path, &info) == 0, (info.st_mode & S_IFMT) == S_IFDIR,
+              info.st_uid == geteuid(), info.st_mode & (privateMode ? 0o077 : 0o022) == 0 else { throw Failure.profile }
+    }
+    private static func acquireProfile(_ profile: URL) throws -> Int32 {
+        let fd = open(profile.appendingPathComponent(".commander-guard.lock").path, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard fd >= 0 else { throw Failure.profile }
+        var info = stat()
+        guard fstat(fd, &info) == 0, info.st_uid == geteuid(), (info.st_mode & S_IFMT) == S_IFREG,
+              info.st_mode & 0o077 == 0, info.st_nlink == 1 else { close(fd); throw Failure.profile }
+        guard flock(fd, LOCK_EX | LOCK_NB) == 0 else { close(fd); throw Failure.busy }
+        return fd
+    }
+    private static func hasBrowserLock(_ profile: URL) throws -> Bool {
+        var info = stat()
+        // Fail closed even for an abandoned Chrome SingletonLock; never remove another process's lock.
+        if lstat(profile.appendingPathComponent("SingletonLock").path, &info) == 0 { return true }
+        guard errno == ENOENT else { throw Failure.profile }
+        return false
+    }
+    private static func loginRequested(_ profile: URL) -> Bool {
+        let fd = open(profile.appendingPathComponent(".login-requested").path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        guard fd >= 0 else { return false }; defer { close(fd) }
+        var info = stat()
+        return fstat(fd, &info) == 0 && (info.st_mode & S_IFMT) == S_IFREG && info.st_uid == geteuid() && info.st_mode & 0o077 == 0 && info.st_size == 0 && info.st_nlink == 1
+    }
+    private static func markLoginRequested(_ profile: URL) throws {
+        let fd = open(profile.appendingPathComponent(".login-requested").path, O_WRONLY | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard fd >= 0 else { throw Failure.profile }; defer { close(fd) }
+        var info = stat()
+        guard fstat(fd, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG, info.st_uid == geteuid(), info.st_mode & 0o077 == 0, info.st_size == 0, info.st_nlink == 1 else { throw Failure.profile }
+    }
+
+    private final class PipeBrowser {
+        private var pid: pid_t = 0
+        private var writeFD: Int32 = -1
+        private var readFD: Int32 = -1
+        private var buffer = Data()
+        private var received = 0
+        private var sequence = 0
+        private let deadline = ProcessInfo.processInfo.systemUptime + 31.8
+        private let cancelled: () -> Bool
+        private var finished = false
+        init(executable: URL, profile: URL, cancelled: @escaping () -> Bool) throws {
+            self.cancelled = cancelled
+            var commands: [Int32] = [0, 0], replies: [Int32] = [0, 0]
+            guard pipe(&commands) == 0 else { throw Failure.unavailable }
+            guard pipe(&replies) == 0 else { close(commands[0]); close(commands[1]); throw Failure.unavailable }
+            var originals = commands + replies
+            var high: [Int32] = []
+            defer { for fd in originals + high { close(fd) } }
+            // Move every source above 4 before dup2; source/target collisions must never close a pipe.
+            for fd in originals {
+                let duplicate = fcntl(fd, F_DUPFD_CLOEXEC, 10)
+                guard duplicate >= 0 else { throw Failure.unavailable }
+                high.append(duplicate)
+            }
+            for fd in originals { close(fd) }; originals.removeAll()
+            guard fcntl(high[1], F_SETFL, O_NONBLOCK) == 0, fcntl(high[2], F_SETFL, O_NONBLOCK) == 0,
+                  fcntl(high[1], F_SETNOSIGPIPE, 1) == 0 else { throw Failure.unavailable }
+            var actions: posix_spawn_file_actions_t?
+            var attributes: posix_spawnattr_t?
+            guard posix_spawn_file_actions_init(&actions) == 0 else { throw Failure.unavailable }
+            defer { posix_spawn_file_actions_destroy(&actions) }
+            guard posix_spawnattr_init(&attributes) == 0 else { throw Failure.unavailable }
+            defer { posix_spawnattr_destroy(&attributes) }
+            guard posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_CLOEXEC_DEFAULT)) == 0,
+                  posix_spawn_file_actions_adddup2(&actions, high[0], 3) == 0,
+                  posix_spawn_file_actions_adddup2(&actions, high[3], 4) == 0 else { throw Failure.unavailable }
+            for target: Int32 in [0, 1, 2] {
+                guard posix_spawn_file_actions_addopen(&actions, target, "/dev/null", O_RDWR, 0) == 0 else { throw Failure.unavailable }
+            }
+            let argv = ([executable.path] + HeadlessQuotaBrowser.arguments(profile: profile, headless: true)).map { strdup($0) }
+            defer { for pointer in argv { free(pointer) } }
+            var terminatedArgv = argv + [nil]
+            let environment = HeadlessQuotaBrowser.childEnvironment.map { strdup("\($0.key)=\($0.value)") }
+            defer { for pointer in environment { free(pointer) } }
+            var terminatedEnvironment = environment + [nil]
+            let status = terminatedArgv.withUnsafeMutableBufferPointer { argv in
+                terminatedEnvironment.withUnsafeMutableBufferPointer { env in
+                    posix_spawn(&pid, executable.path, &actions, &attributes, argv.baseAddress!, env.baseAddress!)
+                }
+            }
+            guard status == 0 else { pid = 0; throw Failure.unavailable }
+            writeFD = high[1]; readFD = high[2]
+            high = [high[0], high[3]]
+        }
+        deinit { finish() }
+        func probe() throws {
+            let result = try request("Target.createTarget", ["url": "about:blank"])
+            guard let id = result["targetId"] as? String else { throw Failure.protocolError }
+            let attached = try request("Target.attachToTarget", ["targetId": id, "flatten": true])
+            guard let session = attached["sessionId"] as? String else { throw Failure.protocolError }
+            let evaluated = try request("Runtime.evaluate", ["expression": "1 + 1", "returnByValue": true], session: session)
+            guard (evaluated["result"] as? [String: Any])?["value"] as? Int == 2 else { throw Failure.protocolError }
+        }
+        func fetchQuota() throws -> String {
+            let target = try request("Target.createTarget", ["url": "about:blank"])
+            guard let targetID = target["targetId"] as? String else { throw Failure.protocolError }
+            let attached = try request("Target.attachToTarget", ["targetId": targetID, "flatten": true])
+            guard let session = attached["sessionId"] as? String else { throw Failure.protocolError }
+            let navigation = try request("Page.navigate", ["url": HeadlessQuotaBrowser.pageURL], session: session)
+            guard navigation["errorText"] == nil else { throw Failure.unavailable }
+            while true {
+                let response = try request("Runtime.evaluate", ["expression": "document.readyState === 'loading' || location.href === 'about:blank' ? 'pending' : (location.origin === 'https://mcp.desktopcommander.app' && location.pathname === '/usage' ? 'ready' : 'login')", "returnByValue": true], session: session)
+                if (response["result"] as? [String: Any])?["value"] as? String == "ready" { break }
+                if let text = (response["result"] as? [String: Any])?["value"] as? String, text == "login" { return "login" }
+                try check(until: deadline)
+                Thread.sleep(forTimeInterval: 0.1)
+            }
+            let result = try request("Runtime.evaluate", ["expression": HeadlessQuotaBrowser.usageScript, "awaitPromise": true, "returnByValue": true], session: session, timeout: 14)
+            guard result["exceptionDetails"] == nil, let value = (result["result"] as? [String: Any])?["value"] as? String, value.utf8.count <= 8192 else { throw Failure.protocolError }
+            return value
+        }
+        private func check(until limit: TimeInterval) throws {
+            if cancelled() { throw Failure.cancelled }
+            if ProcessInfo.processInfo.systemUptime >= min(limit, deadline) { throw Failure.timeout }
+        }
+        private func ready(_ fd: Int32, events: Int16, until limit: TimeInterval) throws {
+            while true {
+                try check(until: limit)
+                var descriptor = pollfd(fd: fd, events: events, revents: 0)
+                let result = poll(&descriptor, 1, 100)
+                if result < 0 { if errno == EINTR { continue }; throw Failure.unavailable }
+                if result == 0 { continue }
+                if descriptor.revents & events != 0 { return }
+                if descriptor.revents & Int16(POLLERR | POLLHUP | POLLNVAL) != 0 { throw Failure.unavailable }
+            }
+        }
+        private func request(_ method: String, _ params: [String: Any] = [:], session: String? = nil, timeout: TimeInterval = 5) throws -> [String: Any] {
+            guard ["Target.createTarget", "Target.attachToTarget", "Page.navigate", "Runtime.evaluate"].contains(method) else { throw Failure.protocolError }
+            sequence += 1
+            var object: [String: Any] = ["id": sequence, "method": method, "params": params]
+            if let session { object["sessionId"] = session }
+            var data = try JSONSerialization.data(withJSONObject: object); data.append(0)
+            let limit = min(deadline, ProcessInfo.processInfo.systemUptime + timeout)
+            var offset = 0
+            try data.withUnsafeBytes { bytes in
+                while offset < data.count {
+                    try ready(writeFD, events: Int16(POLLOUT), until: limit)
+                    let count = Darwin.write(writeFD, bytes.baseAddress!.advanced(by: offset), data.count - offset)
+                    if count < 0 { if errno == EINTR || errno == EAGAIN { continue }; throw Failure.unavailable }
+                    guard count > 0 else { throw Failure.unavailable }; offset += count
+                }
+            }
+            while true {
+                try check(until: limit)
+                if let frame = try HeadlessQuotaBrowser.popFrame(&buffer) {
+                    guard let reply = try JSONSerialization.jsonObject(with: frame) as? [String: Any] else { throw Failure.protocolError }
+                    if (reply["id"] as? Int) == sequence {
+                        guard reply["error"] == nil, let result = reply["result"] as? [String: Any] else { throw Failure.protocolError }
+                        return result
+                    }
+                    continue
+                }
+                try ready(readFD, events: Int16(POLLIN), until: limit)
+                var chunk = [UInt8](repeating: 0, count: 8192)
+                let count = Darwin.read(readFD, &chunk, chunk.count)
+                if count < 0 { if errno == EINTR || errno == EAGAIN { continue }; throw Failure.unavailable }
+                guard count > 0 else { throw Failure.unavailable }
+                received += count
+                guard received <= 4_194_304 else { throw Failure.protocolError }
+                buffer.append(contentsOf: chunk.prefix(count))
+            }
+        }
+        func finish() {
+            guard !finished else { return }; finished = true
+            guard pid > 0 else { return }
+            // The close command is fixed and best-effort; cleanup never waits for a remote reply.
+            if writeFD >= 0 {
+                let closeMessage = Data("{\"id\":2147483647,\"method\":\"Browser.close\"}\u{0}".utf8)
+                closeMessage.withUnsafeBytes { bytes in _ = Darwin.write(writeFD, bytes.baseAddress, bytes.count) }
+            }
+            var status: Int32 = 0
+            var reaped = false
+            for phase in 0..<3 {
+                let end = ProcessInfo.processInfo.systemUptime + (phase == 0 ? 2 : 0.4)
+                while ProcessInfo.processInfo.systemUptime < end {
+                    let result = waitpid(pid, &status, WNOHANG)
+                    if result == pid || (result < 0 && errno == ECHILD) { reaped = true; break }
+                    // Drain bounded chunks while Chrome exits, so its reply pipe cannot hold shutdown open.
+                    if readFD >= 0 { var bytes = [UInt8](repeating: 0, count: 8192); _ = Darwin.read(readFD, &bytes, bytes.count) }
+                    Thread.sleep(forTimeInterval: 0.02)
+                }
+                if reaped { break }
+                if phase == 0 { _ = kill(pid, SIGTERM) }
+                if phase == 1 { _ = kill(pid, SIGKILL) }
+            }
+            if !reaped {
+                _ = kill(pid, SIGKILL)
+                // Preserve the wall-clock bound even if the kernel delays reaping a killed child.
+                let ownedPID = pid
+                DispatchQueue.global(qos: .utility).async {
+                    var exitStatus: Int32 = 0
+                    while waitpid(ownedPID, &exitStatus, 0) < 0 && errno == EINTR {}
+                }
+            }
+            if writeFD >= 0 { close(writeFD); writeFD = -1 }
+            if readFD >= 0 { close(readFD); readFD = -1 }; pid = 0
+        }
+    }
+
+    private static func popFrame(_ buffer: inout Data) throws -> Data? {
+        if let zero = buffer.firstIndex(of: 0) {
+            guard zero - buffer.startIndex <= 262144, zero != buffer.startIndex else { throw Failure.protocolError }
+            let frame = Data(buffer[..<zero]); buffer.removeSubrange(...zero); return frame
+        }
+        guard buffer.count <= 262144 else { throw Failure.protocolError }; return nil
+    }
+    private static let usageScript = #"""
+    (async () => {
+      if (location.origin !== "https://mcp.desktopcommander.app" || location.pathname !== "/usage") return "login";
+      const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), 12000);
+      try {
+        const response = await fetch("https://auth.desktopcommander.app/auth/billing/usage", {credentials:"include",redirect:"error",signal:controller.signal});
+        if (response.status === 401 || response.status === 403) return "login";
+        if (!response.ok) return "http-" + response.status;
+        if (Number(response.headers.get("content-length") || 0) > 262144 || !response.body) return "invalid-response";
+        const reader = response.body.getReader(); const chunks = []; let bytes = 0;
+        while (true) { const part = await reader.read(); if (part.done) break; bytes += part.value.byteLength; if (bytes > 262144) { await reader.cancel(); return "invalid-response"; } chunks.push(part.value); }
+        const raw = new Uint8Array(bytes); let offset = 0; for (const part of chunks) { raw.set(part, offset); offset += part.length; }
+        let data; try { data = JSON.parse(new TextDecoder().decode(raw)); } catch (_) { return "invalid-response"; } const usage = data && data.usage;
+        if (!usage || !Number.isSafeInteger(usage.callsUsed) || usage.callsUsed < 0 || usage.callsUsed > 1000000000 || typeof usage.plan !== "string" || usage.plan.length > 64 || !["free","pro"].includes(usage.plan.toLowerCase()) || (usage.month != null && (typeof usage.month !== "string" || !/^\d{4}-(0[1-9]|1[0-2])$/.test(usage.month))) || (usage.callsIncluded === null ? usage.plan.toLowerCase() !== "pro" : (!Number.isSafeInteger(usage.callsIncluded) || usage.callsIncluded <= 0 || usage.callsIncluded > 1000000000))) return "invalid-response";
+        return JSON.stringify({usage:{callsUsed:usage.callsUsed,callsIncluded:usage.callsIncluded,plan:usage.plan,month:usage.month}});
+      } catch (_) { return controller.signal.aborted ? "timeout" : "network"; } finally { clearTimeout(timer); }
+    })()
+    """#
+
+    /// Optional diagnostic: only about:blank, no official endpoint or page/account inspection.
+    static func runHeadlessProbe(chromeExecutable: URL) throws {
+        let executable = try validateExecutable(chromeExecutable)
+        let profile = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true).appendingPathComponent("CommanderGuard-headless-probe-\(UUID().uuidString)", isDirectory: true)
+        guard mkdir(profile.path, 0o700) == 0 else { throw Failure.profile }
+        defer { try? FileManager.default.removeItem(at: profile) }
+        try validateDirectory(profile, privateMode: true)
+        let fd = try acquireProfile(profile)
+        defer { flock(fd, LOCK_UN); close(fd) }
+        for _ in 0..<2 {
+            let browser = try PipeBrowser(executable: executable, profile: profile, cancelled: { false })
+            do { try browser.probe() } catch { browser.finish(); throw error }
+            browser.finish()
+            guard !(try hasBrowserLock(profile)) else { throw Failure.profile }
+        }
+    }
+
+    static func runOfflineChecks() throws {
+        var buffer = Data("{\"id\":1}\u{0}{\"id\":2}".utf8)
+        let first = try popFrame(&buffer); precondition(first == Data("{\"id\":1}".utf8))
+        let partial = try popFrame(&buffer); precondition(partial == nil)
+        buffer.append(0)
+        let second = try popFrame(&buffer); precondition(second == Data("{\"id\":2}".utf8))
+        for bad in [Data([0]), Data(repeating: 65, count: 262145)] {
+            var bytes = bad
+            do { _ = try popFrame(&bytes); preconditionFailure("invalid frame accepted") } catch Failure.protocolError {}
+        }
+        let scratch = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("CommanderGuard-quota-check-\(UUID().uuidString)")
+        guard mkdir(scratch.path, 0o700) == 0 else { throw Failure.profile }
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        try validateDirectory(scratch, privateMode: true)
+        let firstLock = try acquireProfile(scratch)
+        do { let extra = try acquireProfile(scratch); close(extra); preconditionFailure("concurrent profile lock accepted") } catch Failure.busy {}
+        flock(firstLock, LOCK_UN); close(firstLock)
+        let nextLock = try acquireProfile(scratch); flock(nextLock, LOCK_UN); close(nextLock)
+        let link = scratch.appendingPathComponent("linked-profile")
+        guard symlink(scratch.path, link.path) == 0 else { throw Failure.profile }
+        do { try validateDirectory(link, privateMode: true); preconditionFailure("symlink profile accepted") } catch Failure.profile {}
+        let publicDirectory = scratch.appendingPathComponent("public-profile")
+        guard mkdir(publicDirectory.path, 0o755) == 0 else { throw Failure.profile }
+        do { try validateDirectory(publicDirectory, privateMode: true); preconditionFailure("public profile accepted") } catch Failure.profile {}
+        let headless = arguments(profile: profileURL, headless: true)
+        let visible = arguments(profile: profileURL, headless: false)
+        precondition(headless.contains("--headless=new") && headless.contains("--remote-debugging-pipe"))
+        precondition(!headless.contains(where: { $0.contains("remote-debugging-port") }))
+        precondition(!visible.contains(where: { $0.contains("remote-debugging") || $0.contains("headless") }))
+        precondition(headless[0] == "--user-data-dir=\(profileURL.path)" && visible.last == "--app=\(pageURL)")
+        for invalid in [URL(string: "https://example.com/chrome")!, URL(fileURLWithPath: "/usr/bin/true")] {
+            do { _ = try validateExecutable(invalid); preconditionFailure("unapproved executable accepted") } catch Failure.unavailable {}
+        }
+    }
 }
 
 struct Snapshot {
@@ -2336,16 +2781,11 @@ func selfTest() {
     precondition(quota(["plan": "free", "callsUsed": 1, "callsIncluded": 10, "month": 202610]) == nil)
     precondition(UsageQuota.parse(Data(repeating: 65, count: 8193), now: now) == nil)
     precondition(UsageQuota(state: .loginRequired).used == nil && UsageQuota(state: .loginRequired).total == nil)
-    precondition(quotaRefreshInterval == 120 && quotaStaleInterval == 900 && UsageQuota.State.refreshing.rawValue == "refreshing")
+    precondition(quotaRefreshOptions == [0, 60, 120, 300, 600, 1800, 3600] && quotaRefreshOptions.allSatisfy { sanitizedQuotaRefreshSeconds($0) == $0 } && sanitizedQuotaRefreshSeconds(nil) == 300 && sanitizedQuotaRefreshSeconds(121) == 300)
+    precondition(quotaStaleInterval(for: 0) == 900 && quotaStaleInterval(for: 300) == 900 && quotaStaleInterval(for: 600) == 1260 && UsageQuota.State.refreshing.rawValue == "refreshing")
     precondition(quotaIsStale(freeQuota!, now: now.addingTimeInterval(901)) && !quotaIsStale(freeQuota!, now: now.addingTimeInterval(899)))
-    let createdWindow = quotaCreatedWindowIDs("owned:52:71:random-marker", marker: "random-marker")
-    precondition(createdWindow?.window == "52" && createdWindow?.tab == "71")
-    precondition(quotaCreatedWindowIDs("owned:52:71:other-marker", marker: "random-marker") == nil)
-    precondition(quotaCreatedWindowIDs("owned:x:71:random-marker", marker: "random-marker") == nil)
-    precondition(quotaCreatedWindowIDs("owned:52::random-marker", marker: "random-marker") == nil)
-    let ownerGuard = quotaOwnedWindowCondition(id: "52")
-    let tabGuard = quotaOwnedTabCondition(id: "71", marker: "random-marker")
-    precondition(ownerGuard.contains("id of browserWindow") && tabGuard.contains("id of browserTab") && tabGuard.contains("/usage#random-marker"))
+    precondition(!quotaIsStale(freeQuota!, now: now.addingTimeInterval(1260), refreshSeconds: 600) && quotaIsStale(freeQuota!, now: now.addingTimeInterval(1261), refreshSeconds: 600))
+    try! HeadlessQuotaBrowser.runOfflineChecks()
     precondition(trustedQuotaURL(URL(string: "https://mcp.desktopcommander.app/usage")))
     precondition(!trustedQuotaURL(URL(string: "https://auth.desktopcommander.app/auth")))
     precondition(!trustedQuotaURL(URL(string: "https://mcp.desktopcommander.app/usage/extra")))
@@ -2353,7 +2793,6 @@ func selfTest() {
     precondition(!trustedQuotaURL(URL(string: "https://example.com/usage")))
     precondition(!trustedQuotaURL(URL(string: "https://user@mcp.desktopcommander.app/usage")))
     precondition(!trustedQuotaURL(URL(string: "https://mcp.desktopcommander.app:444/usage")))
-    precondition(appleScriptLiteral("a\"b\\c\n") == "\"a\\\"b\\\\c \"")
     let fresh = now.addingTimeInterval(-300)
     let device = "00000000-0000-4000-8000-000000000001"
     func probeKind(_ value: ChannelProbeResult) -> Int {
@@ -3047,7 +3486,7 @@ final class TopAlignedPanelDocumentView: NSView {
     override var isFlipped: Bool { true }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTableViewDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTableViewDelegate, NSMenuDelegate {
     private var item: NSStatusItem!
     private var timer: Timer?
     private var channelTimer: Timer?
@@ -3117,14 +3556,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private var activityTimer: Timer?
     private var quotaTimer: Timer?
     private var quota = UsageQuota()
-    private var quotaPollTimer: Timer?
-    private var quotaOwnedWindowID: String?
-    private var quotaOwnedTabID: String?
-    private var quotaOwnedMarker: String?
+    private let quotaBrowser = HeadlessQuotaBrowser()
     private var quotaFailureReason: String?
-    private var quotaRequestID: String?
-    private var quotaPollBusy = false
-    private var quotaDeadline = Date.distantPast
     private var quotaButton: NSButton?
     private var quotaPauseButton: NSButton?
     private var quotaValue: NSTextField?
@@ -3132,10 +3565,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private var quotaSynced: NSTextField?
     private var quotaProgress: NSProgressIndicator?
     private var quotaRefreshButton: NSButton?
+    private var quotaIntervalPicker: NSPopUpButton?
+    private var quotaIntervalMenuOpen = false
+    private var quotaRefreshAfterLogin = false
     private var quotaRequestInFlight = false
     private var quotaCancelRequested = false
     private var quotaTerminateWhenIdle = false
     private var quotaEnabled: Bool { UserDefaults.standard.bool(forKey: "quotaConnectionEnabled") }
+    private var quotaRefreshSeconds: Int { sanitizedQuotaRefreshSeconds(UserDefaults.standard.object(forKey: "quotaRefreshSeconds") as? Int) }
 
     init(previewMode: Bool = false) { self.previewMode = previewMode; super.init() }
 
@@ -3156,8 +3593,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }
         DistributedNotificationCenter.default().addObserver(self, selector: #selector(openPanel), name: NSNotification.Name("com.wuwendi.commander-guard.open-panel"), object: nil)
         poll()
-        if quotaEnabled { refreshQuota() }
-        quotaTimer = Timer.scheduledTimer(withTimeInterval: quotaRefreshInterval, repeats: true) { _ in self.refreshQuota() }
+        quotaBrowser.onLoginClosed = { [weak self] in
+            guard let self, self.quotaEnabled, !self.quotaTerminateWhenIdle else { return }
+            if self.quotaRequestInFlight { self.quotaRefreshAfterLogin = true; return }
+            self.quota.state = .loginRequired
+            self.refreshQuota()
+        }
+        UserDefaults.standard.set(quotaRefreshSeconds, forKey: "quotaRefreshSeconds")
+        if quotaEnabled && quotaRefreshSeconds > 0 { refreshQuota() }
+        resetQuotaTimer()
         timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { _ in self.poll() }
         channelTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { _ in self.pollChannel(); self.pollToolExecution() }
         activityTimer = Timer(timeInterval: 1, repeats: true) { _ in self.pollActivity() }
@@ -3165,11 +3609,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         pollActivity()
     }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard quotaRequestInFlight else { closeOwnedQuotaWindow(wait: true); return .terminateNow }
-        quotaTerminateWhenIdle = true
+        guard quotaRequestInFlight else { return .terminateNow }
+        quotaTerminateWhenIdle = true; quotaBrowser.cancel()
         return .terminateLater
     }
-    func applicationWillTerminate(_ n: Notification) { timer?.invalidate(); channelTimer?.invalidate(); activityTimer?.invalidate(); quotaTimer?.invalidate(); quotaPollTimer?.invalidate(); closeOwnedQuotaWindow(wait: true); releaseAssertion() }
+    func applicationWillTerminate(_ n: Notification) { timer?.invalidate(); channelTimer?.invalidate(); activityTimer?.invalidate(); quotaTimer?.invalidate(); quotaBrowser.cancel(); releaseAssertion() }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool { openPanel(); return true }
     private func rebuild() {
         let m = NSMenu()
@@ -3675,35 +4119,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         return "\(used) / \(total) 次 · 剩余 \(quota.remaining ?? 0) 次"
     }
     private func ageQuota() {
-        if quotaIsStale(quota, now: Date()), quota.state == .fresh || quota.state == .unlimited { quota.state = .stale }
+        if quotaIsStale(quota, now: Date(), refreshSeconds: quotaRefreshSeconds), quota.state == .fresh || quota.state == .unlimited { quota.state = .stale }
     }
     private func quotaStateText() -> String {
         ageQuota()
-        let old = quotaIsStale(quota, now: Date()) ? " · 上次数据已过期" : ""
+        let old = quotaIsStale(quota, now: Date(), refreshSeconds: quotaRefreshSeconds) ? " · 上次数据已过期" : ""
         switch quota.state {
         case .disconnected: return "未连接 · 连接后读取官方用量"
-        case .connecting: return "正在连接官方用量页"
+        case .connecting: return "请在专用浏览器登录，完成后关闭该窗口"
         case .refreshing: return "正在刷新额度" + (quota.used == nil ? "" : " · 保留上次成功数据") + old
-        case .loginRequired: return "登录已失效 · 请在 Chrome 打开官方用量页重新登录" + old
-        case .browserTabMissing: return (quotaFailureReason ?? "Chrome 未运行或用量页不可用") + old
-        case .browserTabAmbiguous: return "有多个官方用量页 · 请将要读取的账户标签页切到 Chrome 最前方" + old
-        case .browserPermissionRequired: return "请允许 Chrome 的“来自 Apple Events 的 JavaScript”和 macOS 自动化权限" + old
+        case .loginRequired: return "专用浏览器需要登录 · 点击“连接额度账户”或“打开登录窗口”" + old
         case .unavailable: return (quotaFailureReason.map { "同步失败：\($0)" } ?? "额度暂不可用") + (quota.used == nil ? " · 可稍后刷新" : " · 保留上次成功数据") + old
-        case .fresh: return "当前 Chrome 账户 · 当前周期：\(quota.month) · \(quota.plan)" + old
+        case .fresh: return "独立额度账户 · 后台无头同步 · 当前周期：\(quota.month) · \(quota.plan)" + old
         case .stale: return "数据已过期 · 保留上次成功读取（\(quota.month)）" + (quotaFailureReason.map { " · \($0)" } ?? "")
-        case .unlimited: return "当前 Chrome 账户 · 当前周期：\(quota.month) · \(quota.plan) · 无限制" + old
+        case .unlimited: return "独立额度账户 · 后台无头同步 · 当前周期：\(quota.month) · \(quota.plan) · 无限制" + old
         }
     }
     private func renderQuota() {
         ageQuota()
         quotaValue?.stringValue = quotaDisplay()
-        quotaValue?.textColor = quotaIsStale(quota, now: Date()) ? .systemOrange : .labelColor
+        quotaValue?.textColor = quotaIsStale(quota, now: Date(), refreshSeconds: quotaRefreshSeconds) ? .systemOrange : .labelColor
         quotaStatus?.stringValue = quotaStateText()
         quotaSynced?.stringValue = "最近成功同步：\(prominentStamp(quota.syncedAt))"
-        quotaButton?.title = quotaEnabled ? "打开额度账户" : "连接额度账户"
-        quotaButton?.isEnabled = !previewMode && !quotaRequestInFlight && quota.state != .connecting && quota.state != .refreshing
-        quotaRefreshButton?.isEnabled = !previewMode && !quotaRequestInFlight && quota.state != .connecting && quota.state != .refreshing
+        quotaButton?.title = quotaEnabled ? "打开登录窗口" : "连接额度账户"
+        quotaButton?.isEnabled = !previewMode && !quotaRequestInFlight && quota.state != .refreshing
+        quotaRefreshButton?.isEnabled = !previewMode && !quotaRequestInFlight && quota.state != .refreshing
         quotaPauseButton?.isEnabled = !previewMode && quotaEnabled
+        if !quotaIntervalMenuOpen { quotaIntervalPicker?.selectItem(at: quotaRefreshOptions.firstIndex(of: quotaRefreshSeconds) ?? 3) }
         if let progress = quotaProgress {
             let finite = quota.total.flatMap { total in quota.used.map { (total, $0) } }
             progress.isHidden = finite == nil
@@ -3712,21 +4154,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         if item != nil { render() }
     }
     private func quotaSection() -> NSView {
-        let connect = NSButton(title: quotaEnabled ? "打开额度账户" : "连接额度账户", target: self, action: #selector(connectQuota)); connect.bezelStyle = .rounded; connect.isEnabled = !previewMode && !quotaRequestInFlight && quota.state != .connecting && quota.state != .refreshing
-        let refresh = NSButton(title: "刷新", target: self, action: #selector(manualQuotaRefresh)); refresh.bezelStyle = .rounded; refresh.isEnabled = !previewMode && !quotaRequestInFlight && quota.state != .connecting && quota.state != .refreshing
+        let connect = NSButton(title: quotaEnabled ? "打开登录窗口" : "连接额度账户", target: self, action: #selector(connectQuota)); connect.bezelStyle = .rounded; connect.isEnabled = !previewMode && !quotaRequestInFlight && quota.state != .refreshing
+        let refresh = NSButton(title: "刷新", target: self, action: #selector(manualQuotaRefresh)); refresh.bezelStyle = .rounded; refresh.isEnabled = !previewMode && !quotaRequestInFlight && quota.state != .refreshing
         let pause = NSButton(title: "暂停同步", target: self, action: #selector(pauseQuota)); pause.bezelStyle = .rounded; pause.isEnabled = !previewMode && quotaEnabled
+        let intervalLabel = label("后台自动同步", size: 12, color: .secondaryLabelColor)
+        let interval = NSPopUpButton()
+        interval.addItems(withTitles: ["手动", "每分钟", "每 2 分钟", "每 5 分钟", "每 10 分钟", "每 30 分钟", "每小时"])
+        interval.selectItem(at: quotaRefreshOptions.firstIndex(of: quotaRefreshSeconds) ?? 3)
+        interval.target = self; interval.action = #selector(quotaRefreshIntervalChanged(_:)); interval.isEnabled = !previewMode
+        interval.menu?.delegate = self
+        interval.widthAnchor.constraint(equalToConstant: 112).isActive = true
         let title = label("云端额度", size: 12, weight: .semibold, color: .secondaryLabelColor)
         let actions = NSStackView(views: [title, NSView(), pause, refresh, connect]); actions.orientation = .horizontal; actions.alignment = .centerY; actions.spacing = 8
+        let intervalRow = NSStackView(views: [intervalLabel, interval, NSView()]); intervalRow.orientation = .horizontal; intervalRow.alignment = .centerY; intervalRow.spacing = 8
         let value = label(quotaDisplay(), size: 17, weight: .semibold)
         let progress = NSProgressIndicator(); progress.isIndeterminate = false; progress.minValue = 0; progress.maxValue = 1; progress.style = .bar; progress.heightAnchor.constraint(equalToConstant: 5).isActive = true
         if let total = quota.total, let used = quota.used { progress.doubleValue = total == 0 ? 0 : min(1, Double(used) / Double(total)) } else { progress.isHidden = true }
         let status = label(quotaStateText(), size: 12, color: .secondaryLabelColor)
         let synced = label("最近成功同步：\(prominentStamp(quota.syncedAt))", size: 12, weight: .semibold)
         synced.font = .monospacedDigitSystemFont(ofSize: 12.5, weight: .semibold)
-        if quotaIsStale(quota, now: Date()) { value.textColor = .systemOrange }
+        if quotaIsStale(quota, now: Date(), refreshSeconds: quotaRefreshSeconds) { value.textColor = .systemOrange }
         let stack = vertical(7)
-        [actions, value, progress, status, synced].forEach { stack.addArrangedSubview($0); $0.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true }
-        quotaButton = connect; quotaPauseButton = pause; quotaRefreshButton = refresh; quotaValue = value; quotaStatus = status; quotaSynced = synced; quotaProgress = progress
+        [actions, intervalRow, value, progress, status, synced].forEach { stack.addArrangedSubview($0); $0.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true }
+        quotaButton = connect; quotaPauseButton = pause; quotaRefreshButton = refresh; quotaIntervalPicker = interval; quotaValue = value; quotaStatus = status; quotaSynced = synced; quotaProgress = progress
         return card(stack, padding: 14)
     }
     private func clearQuota(_ state: UsageQuota.State) {
@@ -3734,25 +4184,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         quota = UsageQuota(state: state)
         renderQuota()
     }
-    private func quotaPageURL() -> URL { URL(string: "https://mcp.desktopcommander.app/usage")! }
-    private func chromeApplicationURL() -> URL? {
-        if let found = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.google.Chrome") { return found }
-        let standard = URL(fileURLWithPath: "/Applications/Google Chrome.app")
-        return FileManager.default.fileExists(atPath: standard.path) ? standard : nil
+    func menuWillOpen(_ menu: NSMenu) {
+        if menu === quotaIntervalPicker?.menu { quotaIntervalMenuOpen = true }
+    }
+    func menuDidClose(_ menu: NSMenu) {
+        if menu === quotaIntervalPicker?.menu { quotaIntervalMenuOpen = false }
+    }
+    @objc private func quotaRefreshIntervalChanged(_ sender: NSPopUpButton) {
+        let index = sender.indexOfSelectedItem
+        guard quotaRefreshOptions.indices.contains(index) else { return }
+        UserDefaults.standard.set(quotaRefreshOptions[index], forKey: "quotaRefreshSeconds")
+        resetQuotaTimer()
+        renderQuota()
+    }
+    private func resetQuotaTimer() {
+        quotaTimer?.invalidate(); quotaTimer = nil
+        guard !previewMode, quotaEnabled, quotaRefreshSeconds > 0 else { return }
+        quotaTimer = Timer.scheduledTimer(withTimeInterval: TimeInterval(quotaRefreshSeconds), repeats: true) { _ in self.refreshQuota() }
+    }
+    private func chromeExecutableURL() -> URL? {
+        let candidates = [URL(fileURLWithPath: "/Applications/Google Chrome.app"), FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Applications/Google Chrome.app")]
+        return candidates.first(where: { Bundle(url: $0)?.bundleIdentifier == "com.google.Chrome" })?.appendingPathComponent("Contents/MacOS/Google Chrome")
     }
     @objc private func connectQuota() {
-        guard !previewMode, !quotaRequestInFlight, !quotaTerminateWhenIdle, quota.state != .connecting else { return }
-        guard let browser = chromeApplicationURL() else {
-            quotaFailed(.unavailable); return
-        }
-        UserDefaults.standard.set(true, forKey: "quotaConnectionEnabled")
-        quotaFailureReason = nil
-        quota.state = .connecting; renderQuota()
-        NSWorkspace.shared.open([quotaPageURL()], withApplicationAt: browser, configuration: NSWorkspace.OpenConfiguration()) { _, error in
-            DispatchQueue.main.async {
-                if error != nil { self.quotaFailed(.unavailable); return }
-                Timer.scheduledTimer(withTimeInterval: 3, repeats: false) { _ in self.refreshQuota() }
-            }
+        guard !previewMode, !quotaRequestInFlight, !quotaTerminateWhenIdle else { return }
+        guard let executable = chromeExecutableURL() else { quotaFailureReason = "未找到 Google Chrome，请先安装"; quota.state = .unavailable; renderQuota(); return }
+        do {
+            _ = try quotaBrowser.openLogin(chromeExecutable: executable)
+            UserDefaults.standard.set(true, forKey: "quotaConnectionEnabled")
+            quotaFailureReason = nil; quota.state = .connecting
+            resetQuotaTimer(); renderQuota()
+        } catch {
+            quotaFailureReason = (error as? HeadlessQuotaBrowser.Failure)?.errorDescription ?? "专用登录窗口无法打开"
+            quota.state = .unavailable; renderQuota()
         }
     }
     @objc private func manualQuotaRefresh() {
@@ -3761,311 +4225,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
     @objc private func pauseQuota() {
         UserDefaults.standard.set(false, forKey: "quotaConnectionEnabled")
+        resetQuotaTimer()
         quotaCancelRequested = quotaRequestInFlight
-        if !quotaRequestInFlight {
-            quotaPollTimer?.invalidate(); quotaPollTimer = nil
-            quotaRequestID = nil; quotaPollBusy = false
-        }
-        closeOwnedQuotaWindow()
-        quotaFailureReason = nil
-        if quotaCancelRequested { quota.state = .disconnected; renderQuota() }
-        else { clearQuota(.disconnected) }
-    }
-    private func browserJavaScript(_ script: String, selectAccount: Bool = false, ownedWindowID: String? = nil, ownedTabID: String? = nil, marker: String? = nil, waitForReady: Bool = false, completion: @escaping (String?, Bool) -> Void) {
-        guard !NSRunningApplication.runningApplications(withBundleIdentifier: "com.google.Chrome").isEmpty else { completion("tab-missing", false); return }
-        guard let browser = chromeApplicationURL() else { completion(nil, false); return }
-        let action: String
-        if let ownedWindowID, let ownedTabID, let marker {
-            let executeOwned = "return execute browserTab javascript \(appleScriptLiteral(script))"
-            action = waitForReady ? """
-            repeat 20 times
-              repeat with browserWindow in every window
-                if \(quotaOwnedWindowCondition(id: ownedWindowID)) then
-                  set foundOwnedTab to false
-                  repeat with browserTab in every tab of browserWindow
-                    if id of browserTab is \(appleScriptLiteral(ownedTabID)) then
-                      set foundOwnedTab to true
-                      if URL of browserTab is not \(appleScriptLiteral("https://mcp.desktopcommander.app/usage#\(marker)")) then return "owned-page-missing"
-                      try
-                        set readyState to execute browserTab javascript \(appleScriptLiteral("location.href === \"https://mcp.desktopcommander.app/usage#\(marker)\" ? document.readyState : \"loading\""))
-                        if readyState is "complete" then \(executeOwned)
-                      on error errorMessage number errorNumber
-                        if errorNumber is -1743 or errorNumber is -2740 or errorMessage contains "JavaScript" then return "javascript-permission"
-                        return "page-error"
-                      end try
-                    end if
-                  end repeat
-                  if not foundOwnedTab then return "owned-page-missing"
-                end if
-              end repeat
-              delay 0.25
-            end repeat
-            return "page-timeout"
-            """ : """
-            repeat with browserWindow in every window
-              if \(quotaOwnedWindowCondition(id: ownedWindowID)) then
-                repeat with browserTab in every tab of browserWindow
-                  if \(quotaOwnedTabCondition(id: ownedTabID, marker: marker)) then \(executeOwned)
-                end repeat
-                return "owned-page-missing"
-              end if
-            end repeat
-            return "owned-page-missing"
-            """
-        } else if selectAccount {
-            action = """
-            set candidateCount to 0
-            set candidateTab to missing value
-            repeat with browserWindow in every window
-              repeat with browserTab in every tab of browserWindow
-                if URL of browserTab is "https://mcp.desktopcommander.app/usage" then
-                  set candidateCount to candidateCount + 1
-                  set candidateTab to contents of browserTab
-                end if
-              end repeat
-            end repeat
-            if candidateCount is 0 then
-              if (count of windows) is 0 then return "no-regular-window"
-              set candidateWindow to front window
-              if mode of candidateWindow is not "normal" then return "no-regular-window"
-              set candidateWindowID to id of candidateWindow
-              set originalActiveTabID to id of active tab of candidateWindow
-              set candidateTabID to ""
-              set marker to \(appleScriptLiteral(marker ?? ""))
-              set ownedURL to "https://mcp.desktopcommander.app/usage#" & marker
-              try
-                set candidateTab to make new tab at end of tabs of candidateWindow with properties {URL:ownedURL}
-                set candidateTabID to id of candidateTab
-                set activeIndex to 0
-                set originalActiveIndex to 0
-                repeat with browserTab in every tab of candidateWindow
-                  set activeIndex to activeIndex + 1
-                  if id of browserTab is originalActiveTabID then set originalActiveIndex to activeIndex
-                end repeat
-                if originalActiveIndex > 0 and id of active tab of candidateWindow is candidateTabID then set active tab index of candidateWindow to originalActiveIndex
-                return "owned:" & candidateWindowID & ":" & candidateTabID & ":" & marker
-              on error errorMessage number errorNumber
-                try
-                  set activeIndex to 0
-                  set originalActiveIndex to 0
-                  repeat with browserTab in every tab of candidateWindow
-                    set activeIndex to activeIndex + 1
-                    if id of browserTab is originalActiveTabID then set originalActiveIndex to activeIndex
-                  end repeat
-                  if originalActiveIndex > 0 and id of active tab of candidateWindow is candidateTabID then set active tab index of candidateWindow to originalActiveIndex
-                  repeat with browserTab in every tab of candidateWindow
-                    if id of browserTab is candidateTabID and URL of browserTab is ownedURL then close browserTab
-                  end repeat
-                end try
-                if errorNumber is -1743 or errorNumber is -2740 or errorMessage contains "JavaScript" then return "javascript-permission"
-                return "creation-failed"
-              end try
-            else
-              if URL of active tab of front window is "https://mcp.desktopcommander.app/usage" then
-                set candidateTab to active tab of front window
-              else if candidateCount is greater than 1 then
-                return "tab-ambiguous"
-              end if
-              return execute candidateTab javascript \(appleScriptLiteral(script))
-            end if
-            """
-        } else {
-            action = """
-            set sawOfficialPage to false
-            repeat with browserWindow in every window
-              repeat with browserTab in every tab of browserWindow
-                if URL of browserTab is "https://mcp.desktopcommander.app/usage" then
-                  set sawOfficialPage to true
-                  set tabResult to execute browserTab javascript \(appleScriptLiteral(script))
-                  if tabResult is not "key-missing" then return tabResult
-                end if
-              end repeat
-            end repeat
-            if sawOfficialPage then return "key-missing"
-            return "tab-missing"
-            """
-        }
-        let source = """
-        if application \(appleScriptLiteral(browser.path)) is not running then return "tab-missing"
-        with timeout of 12 seconds
-          tell application \(appleScriptLiteral(browser.path))
-            \(action)
-          end tell
-        end timeout
-        """
-        DispatchQueue.global(qos: .utility).async {
-            var error: NSDictionary?
-            let value = NSAppleScript(source: source)?.executeAndReturnError(&error).stringValue
-            let message = error?["NSAppleScriptErrorMessage"] as? String ?? ""
-            let number = (error?["NSAppleScriptErrorNumber"] as? NSNumber)?.intValue
-            let permission = number == -1743 || message.localizedCaseInsensitiveContains("JavaScript") || message.localizedCaseInsensitiveContains("automation") || message.localizedCaseInsensitiveContains("permission")
-            DispatchQueue.main.async { completion(value, permission) }
-        }
-    }
-    private func quotaStartScript(_ key: String, marker: String? = nil) -> String {
-        // ponytail: one transient page key per read; an official browser API would remove this bridge.
-        return #"""
-        (() => { if (location.origin !== "https://mcp.desktopcommander.app" || location.pathname !== "/usage" || ("\#(marker ?? "")" && location.hash !== "#\#(marker ?? "")")) return "wrong-page";
-        const key = "\#(key)"; window[key] = "pending";
-        (async () => { const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), 12000);
-          try { const response = await fetch("https://auth.desktopcommander.app/auth/billing/usage", {credentials:"include", redirect:"error", signal:controller.signal});
-            if (response.status === 401 || response.status === 403) { window[key] = "login"; return; }
-            if (!response.ok) { window[key] = "http-" + response.status; return; }
-            if (Number(response.headers.get("content-length") || 0) > 262144 || !response.body) { window[key] = "invalid-response"; return; }
-            const reader = response.body.getReader(); let bytes = 0; const chunks = [];
-            while (true) { const part = await reader.read(); if (part.done) break; bytes += part.value.byteLength; if (bytes > 262144) { await reader.cancel(); window[key] = "invalid-response"; return; } chunks.push(part.value); }
-            const raw = new Uint8Array(bytes); let offset = 0; for (const part of chunks) { raw.set(part, offset); offset += part.length; }
-            let data; try { data = JSON.parse(new TextDecoder().decode(raw)); } catch (_) { window[key] = "invalid-response"; return; }
-            const usage = data && data.usage;
-            if (!usage || !Number.isSafeInteger(usage.callsUsed) || usage.callsUsed < 0 || usage.callsUsed > 1000000000 || typeof usage.plan !== "string" || usage.plan.length > 64 || !["free","pro"].includes(usage.plan.toLowerCase()) || (usage.month !== undefined && (typeof usage.month !== "string" || !/^\d{4}-(0[1-9]|1[0-2])$/.test(usage.month))) || (usage.callsIncluded === null ? usage.plan.toLowerCase() !== "pro" : (!Number.isSafeInteger(usage.callsIncluded) || usage.callsIncluded <= 0 || usage.callsIncluded > 1000000000))) { window[key] = "invalid-response"; return; }
-            window[key] = JSON.stringify({usage:{callsUsed:usage.callsUsed, callsIncluded:usage.callsIncluded, plan:usage.plan, month:usage.month}});
-          } catch (_) { window[key] = controller.signal.aborted ? "timeout" : "network"; } finally { clearTimeout(timer); }
-        })(); return "started"; })()
-        """#
-    }
-    private func closeQuotaWindow(id: String, tabID: String, marker: String, wait: Bool = false) {
-        guard !NSRunningApplication.runningApplications(withBundleIdentifier: "com.google.Chrome").isEmpty else { return }
-        guard let browser = chromeApplicationURL() else { return }
-        let source = """
-        with timeout of 3 seconds
-          if application \(appleScriptLiteral(browser.path)) is not running then return
-          tell application \(appleScriptLiteral(browser.path))
-            repeat with browserWindow in every window
-              if \(quotaOwnedWindowCondition(id: id)) then
-                repeat with browserTab in every tab of browserWindow
-                  if \(quotaOwnedTabCondition(id: tabID, marker: marker)) then close browserTab
-                end repeat
-                exit repeat
-              end if
-            end repeat
-          end tell
-        end timeout
-        """
-        let close = {
-            var error: NSDictionary?
-            _ = NSAppleScript(source: source)?.executeAndReturnError(&error)
-        }
-        if wait { close() } else { DispatchQueue.global(qos: .utility).async(execute: close) }
-    }
-    private func closeOwnedQuotaWindow(wait: Bool = true) {
-        guard let id = quotaOwnedWindowID, let tabID = quotaOwnedTabID, let marker = quotaOwnedMarker else { return }
-        quotaOwnedWindowID = nil; quotaOwnedTabID = nil; quotaOwnedMarker = nil
-        closeQuotaWindow(id: id, tabID: tabID, marker: marker, wait: wait)
-    }
-    private func finishDeferredTermination() {
-        guard quotaTerminateWhenIdle, !quotaRequestInFlight else { return }
-        quotaTerminateWhenIdle = false
-        closeOwnedQuotaWindow(wait: true)
-        NSApp.reply(toApplicationShouldTerminate: true)
+        quotaBrowser.cancel()
+        clearQuota(.disconnected)
     }
     @objc private func refreshQuota() {
         guard !previewMode, quotaEnabled, !quotaRequestInFlight, !quotaTerminateWhenIdle else { return }
+        guard let executable = chromeExecutableURL() else { quotaFailureReason = "未找到 Google Chrome，请先安装"; quota.state = .unavailable; renderQuota(); return }
         quotaRequestInFlight = true
-        closeOwnedQuotaWindow()
-        quota.state = .refreshing; renderQuota()
-        let key = "__commanderGuardQuota_" + UUID().uuidString.replacingOccurrences(of: "-", with: "")
-        quotaRequestID = key
-        quotaDeadline = Date().addingTimeInterval(25)
-        browserJavaScript(quotaStartScript(key), selectAccount: true, marker: key) { [self] value, permission in
-            if self.quotaRequestID != key {
-                if let value, value.utf8.count <= 8192, let ownedIDs = quotaCreatedWindowIDs(value, marker: key) {
-                    self.closeQuotaWindow(id: ownedIDs.window, tabID: ownedIDs.tab, marker: key)
+        quotaFailureReason = nil; quota.state = .refreshing; renderQuota()
+        quotaBrowser.read(chromeExecutable: executable) { [weak self] result in
+            guard let self else { return }
+            self.quotaRequestInFlight = false
+            if self.quotaCancelRequested || self.quotaTerminateWhenIdle || !self.quotaEnabled {
+                self.clearQuota(.disconnected)
+            } else {
+                switch result {
+                case .success(let value): self.quota = value; self.quotaFailureReason = nil
+                case .loginRequired: self.quota = UsageQuota(state: .loginRequired); self.quotaFailureReason = nil
+                case .loginOpen: self.quota.state = .connecting; self.quotaFailureReason = nil
+                case .unavailable(let reason): self.quota.state = .unavailable; self.quotaFailureReason = reason
+                case .cancelled: self.quota.state = .disconnected; self.quotaFailureReason = nil
                 }
-                return
+                self.renderQuota()
             }
-            if permission || value == "javascript-permission" { self.finishQuota(key, state: self.quotaCancelRequested || self.quotaTerminateWhenIdle ? .disconnected : .browserPermissionRequired); return }
-            guard let value, value.utf8.count <= 8192 else { self.finishQuota(key, state: self.quotaCancelRequested || self.quotaTerminateWhenIdle ? .disconnected : .unavailable, reason: "Chrome 返回了无效结果"); return }
-            if let ownedIDs = quotaCreatedWindowIDs(value, marker: key) {
-                self.quotaOwnedWindowID = ownedIDs.window; self.quotaOwnedTabID = ownedIDs.tab; self.quotaOwnedMarker = key
-                if self.quotaCancelRequested || self.quotaTerminateWhenIdle { self.finishQuota(key, state: .disconnected); return }
-                self.browserJavaScript(self.quotaStartScript(key, marker: key), ownedWindowID: ownedIDs.window, ownedTabID: ownedIDs.tab, marker: key, waitForReady: true) { result, permission in
-                    guard self.quotaRequestID == key else { return }
-                    if self.quotaCancelRequested || self.quotaTerminateWhenIdle { self.finishQuota(key, state: .disconnected); return }
-                    if permission { self.finishQuota(key, state: .browserPermissionRequired); return }
-                    guard let result, result.utf8.count <= 8192 else { self.finishQuota(key, state: .unavailable, reason: "Chrome 返回了无效结果"); return }
-                    if result == "javascript-permission" { self.finishQuota(key, state: .browserPermissionRequired); return }
-                    guard result == "started" else {
-                        let reason = result == "page-timeout" ? "官方用量页加载超时" : result == "owned-page-missing" ? "临时用量页已关闭" : "官方用量页无法读取"
-                        self.finishQuota(key, state: .unavailable, reason: reason); return
-                    }
-                    self.startQuotaPolling(key)
-                }
-                return
-            }
-            if self.quotaCancelRequested || self.quotaTerminateWhenIdle { self.finishQuota(key, state: .disconnected); return }
-            guard value == "started" else {
-                let state: UsageQuota.State = value == "tab-missing" ? .browserTabMissing : value == "tab-ambiguous" ? .browserTabAmbiguous : .unavailable
-                let reason = value == "no-regular-window" ? "当前 Chrome 窗口不是普通窗口，未创建页面" : value == "creation-failed" ? "临时用量页创建失败" : nil
-                self.finishQuota(key, state: state, reason: reason); return
-            }
-            self.startQuotaPolling(key)
-        }
-    }
-    private func startQuotaPolling(_ key: String) {
-        quotaPollTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in self?.pollQuota(key) }
-        pollQuota(key)
-    }
-    private func pollQuota(_ key: String) {
-        guard quotaRequestID == key else { return }
-        if quotaCancelRequested || quotaTerminateWhenIdle {
-            if !quotaPollBusy { finishQuota(key, state: .disconnected) }
-            return
-        }
-        guard !quotaPollBusy else { return }
-        if Date() > quotaDeadline { finishQuota(key, state: .unavailable, reason: "额度请求超时"); return }
-        quotaPollBusy = true
-        let script = #"(() => { if (location.origin !== "https://mcp.desktopcommander.app" || location.pathname !== "/usage") return "key-missing"; const key = "\#(key)"; if (!(key in window)) return "key-missing"; const result = window[key]; if (result !== "pending") delete window[key]; return result; })()"#
-        browserJavaScript(script, ownedWindowID: self.quotaOwnedWindowID, ownedTabID: self.quotaOwnedTabID, marker: self.quotaOwnedMarker) { value, permission in
-            guard self.quotaRequestID == key else { return }
-            self.quotaPollBusy = false
-            if self.quotaCancelRequested || self.quotaTerminateWhenIdle { self.finishQuota(key, state: .disconnected); return }
-            if permission { self.finishQuota(key, state: .browserPermissionRequired); return }
-            guard let value, value.utf8.count <= 8192 else { self.finishQuota(key, state: .unavailable, reason: "未能读取 Chrome 页面"); return }
-            if value == "pending" { return }
-            if value == "tab-missing" || value == "owned-page-missing" { self.finishQuota(key, state: .browserTabMissing, reason: "Chrome 中的用量页已关闭"); return }
-            if value == "key-missing" { self.finishQuota(key, state: .unavailable, reason: "用量页脚本状态已丢失"); return }
-            if value == "login" { self.finishQuota(key, state: .loginRequired); return }
-            if value == "timeout" { self.finishQuota(key, state: .unavailable, reason: "额度请求超时"); return }
-            if value == "network" { self.finishQuota(key, state: .unavailable, reason: "额度服务连接失败"); return }
-            if value == "invalid-response" { self.finishQuota(key, state: .unavailable, reason: "额度服务返回的数据无效"); return }
-            if value.range(of: #"^http-[1-5][0-9]{2}$"#, options: .regularExpression) != nil { self.finishQuota(key, state: .unavailable, reason: "额度服务 HTTP \(value.dropFirst(5))"); return }
-            guard let data = value.data(using: .utf8), let validated = UsageQuota.parse(data) else { self.finishQuota(key, state: .unavailable, reason: "额度服务返回的数据无效"); return }
-            self.quota = validated
-            self.finishQuota(key, state: nil)
-        }
-    }
-    private func finishQuota(_ key: String, state: UsageQuota.State?, reason: String? = nil) {
-        guard quotaRequestID == key else { return }
-        quotaPollTimer?.invalidate(); quotaPollTimer = nil
-        quotaRequestInFlight = false; quotaPollBusy = false; quotaRequestID = nil
-        quotaCancelRequested = false
-        quotaFailureReason = state == nil || state == .disconnected ? nil : reason ?? quotaFailureLabel(state!)
-        if let state {
-            if state == .loginRequired { quota = UsageQuota(state: .loginRequired) }
-            else if state == .disconnected { quota = UsageQuota(state: .disconnected) }
-            else { quota.state = state }
-            if state != .browserTabMissing && state != .browserTabAmbiguous && state != .browserPermissionRequired {
-                let script = #"(() => { if (location.origin !== "https://mcp.desktopcommander.app" || location.pathname !== "/usage" || !("\#(key)" in window)) return "key-missing"; delete window["\#(key)"]; return ""; })()"#
-                browserJavaScript(script) { _, _ in }
+            self.quotaCancelRequested = false
+            if self.quotaTerminateWhenIdle {
+                self.quotaTerminateWhenIdle = false
+                NSApp.reply(toApplicationShouldTerminate: true)
+            } else if self.quotaRefreshAfterLogin {
+                self.quotaRefreshAfterLogin = false
+                if self.quotaEnabled { self.refreshQuota() }
             }
         }
-        closeOwnedQuotaWindow(wait: true)
-        renderQuota()
-        finishDeferredTermination()
-    }
-    private func quotaFailureLabel(_ state: UsageQuota.State) -> String {
-        switch state {
-        case .browserTabMissing: return "未找到官方用量页"
-        case .browserTabAmbiguous: return "检测到多个用量页，未选择账户"
-        case .browserPermissionRequired: return "Chrome 自动化权限未开启"
-        case .loginRequired: return "官方用量页需要重新登录"
-        default: return "暂时无法读取"
-        }
-    }
-    private func quotaFailed(_ state: UsageQuota.State = .unavailable) {
-        quotaFailureReason = "无法打开 Chrome"
-        quota.state = quota.used == nil ? state : .stale
-        renderQuota()
     }
     private func middleTruncate(_ value: String, limit: Int) -> String {
         guard limit > 0 else { return "" }
@@ -4094,7 +4287,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let diagnosis = currentDiagnosis()
         var object: [String: Any] = ["chatgpt": ["answer": chat.answer, "update_connection": chat.connection, "recent_issue": chat.history as Any? ?? NSNull(), "coverage": snapshot.timeline.coverage, "delivery_timeout_directly_observable": false, "limitation": chat.deliveryLimit], "service": snapshot.service, "cloud": snapshot.cloud, "last_seen": snapshot.lastSeen.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "checked_at": ISO8601DateFormatter.flex.string(from: snapshot.checked), "error_count": snapshot.errorCount, "paused": paused, "idle_prevention": assertion != 0, "message": snapshot.message, "channel": ["state": snapshot.channelState, "detail": snapshot.channelDetail, "consecutive_no_live": snapshot.channelFailures, "checked_at": snapshot.channelChecked.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "auto_recovery_enabled": recoveryLedger.autoRecoveryEnabled, "last_recovery_attempt": recoveryLedger.lastAttempt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "last_ping_at": lastPingAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "last_ping_result": lastPingResult, "check_deferred_reason": deferredReason, "recovery_status": recoveryAvailability(), "last_recovery_result": lastRecoveryOutcome as Any? ?? NSNull()], "menu": ["menubar_title": item.button?.title ?? "", "menubar_has_icon": item.button?.image != nil, "connection": summaryLines[0].title, "channel": summaryLines[0].title, "tool_execution": summaryLines[1].title, "action": summaryLines[2].title, "recovery": summaryLines[3].title, "chatgpt": summaryLines[4].title, "execution_step_rows": rows, "execution_steps": safeSteps, "tool_call_elapsed_seconds": callElapsed as Any? ?? NSNull(), "tool_call_state": currentState, "recent_actions": snapshot.activity.recent], "activity": ["state": snapshot.activity.state, "tool": CommanderActivity.safeToolIdentifier(snapshot.activity.tool), "active_count": snapshot.activity.activeCount, "observed_at": snapshot.activity.observed.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "recent": snapshot.activity.recent, "error": snapshot.activity.error, "coverage_gap": snapshot.activity.coverageGap, "gap_reason": snapshot.activity.gapReason, "gap_first_at": snapshot.activity.gapFirstAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "gap_last_at": snapshot.activity.gapLastAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "backlog_bytes": snapshot.activity.backlogBytes, "catching_up": snapshot.activity.catchingUp, "pending_line": snapshot.activity.pendingLine, "idle_proven": snapshot.activity.idleProven], "timeline": ["coverage": snapshot.timeline.coverage, "commander_errors_this_run": snapshot.timeline.commanderErrors, "conversation_labels_verified_at": snapshot.timeline.conversationLabelsVerifiedAt as Any? ?? NSNull(), "last_chatgpt_app_event": lastAppEvent, "events": timelineRows]]
         object["tool_execution"] = ["state": snapshot.toolExecutionState, "detail": snapshot.toolExecutionDetail, "checked_at": snapshot.toolExecutionChecked.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "fresh": toolExecutionFresh(snapshot, now: Date()), "evidence_ttl_seconds": Int(toolExecutionEvidenceTTL), "probe_deferred_reason": toolProbeDeferredReason]
-        object["usage_quota"] = ["state": quota.state.rawValue, "used": quota.used as Any? ?? NSNull(), "total": quota.total as Any? ?? NSNull(), "remaining": quota.remaining as Any? ?? NSNull(), "plan": quota.plan.isEmpty ? NSNull() : quota.plan as Any, "month": quota.month.isEmpty ? NSNull() : quota.month as Any, "last_successful_sync": quota.syncedAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "last_error": quotaFailureReason as Any? ?? NSNull()]
+        object["usage_quota"] = ["state": quota.state.rawValue, "used": quota.used as Any? ?? NSNull(), "total": quota.total as Any? ?? NSNull(), "remaining": quota.remaining as Any? ?? NSNull(), "plan": quota.plan.isEmpty ? NSNull() : quota.plan as Any, "month": quota.month.isEmpty ? NSNull() : quota.month as Any, "last_successful_sync": quota.syncedAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "last_error": quotaFailureReason as Any? ?? NSNull(), "refresh_interval_seconds": quotaRefreshSeconds, "backend": "chrome_headless_private_profile"]
         object["channel_incident"] = [
             "active": channelIncident.activeCategory != nil,
             "category": channelIncident.activeCategory?.rawValue as Any? ?? NSNull(),
@@ -4386,7 +4579,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         scroll.reflectScrolledClipView(scroll.contentView)
     }
     private func renderPanelPage() {
-        guard panelWindow != nil else { return }
+        guard panelWindow != nil, !quotaIntervalMenuOpen else { return }
         let recordsPage = panelPage == 1
         panelHeading?.isHidden = panelPage != 0
         panelHeroes?.isHidden = panelPage != 0
@@ -4683,6 +4876,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         verify(panelControlCard?.isHidden == false && panelRecoveryToggle?.title == "自动恢复本机 Commander" && panelRecoveryToggle?.toolTip?.contains("不会重试原任务") == true, "Recovery control must explain its local-only action and safeguards")
         verify(panelWakeToggle?.title == "防止闲置睡眠（Guard）" && panelWakeToggle?.toolTip?.contains("其他程序仍可能保持唤醒") == true && panelWakeStatus?.stringValue.contains("保持唤醒：") == true, "Wake control must describe its actual assertion and limits")
         verify(quotaProgress?.isHidden == false && quotaSynced?.stringValue.range(of: #"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}"#, options: .regularExpression) != nil, "Quota card must show finite progress and prominent last successful sync")
+        if let menu = quotaIntervalPicker?.menu {
+            let savedDocument = panelScroll?.documentView
+            menuWillOpen(menu); renderPanelPage()
+            verify(quotaIntervalMenuOpen && panelScroll?.documentView === savedDocument, "Live updates must preserve an open quota frequency menu")
+            menuDidClose(menu)
+            verify(!quotaIntervalMenuOpen, "Closing the frequency menu must resume panel updates")
+        }
+        verify(quotaIntervalPicker?.numberOfItems == quotaRefreshOptions.count && quotaIntervalPicker?.indexOfSelectedItem == (quotaRefreshOptions.firstIndex(of: quotaRefreshSeconds) ?? 3), "Quota card must show the configured background sync interval")
         if let overviewRoot = scroll.documentView as? TopAlignedPanelDocumentView,
            let overviewStack = overviewRoot.subviews.first as? NSStackView {
             verify(overviewStack.frame.minY <= 2, "Overview content must start at the top without a blank band")
@@ -4748,6 +4949,15 @@ else if CommandLine.arguments.contains("--preview-ui") {
     app.setActivationPolicy(.regular)
     let delegate = AppDelegate(previewMode: true); app.delegate = delegate
     withExtendedLifetime(delegate) { app.run() }
+}
+else if CommandLine.arguments.contains("--probe-headless") {
+    do {
+        let originalFront = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        try HeadlessQuotaBrowser.runHeadlessProbe(chromeExecutable: URL(fileURLWithPath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"))
+        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == originalFront else { fputs("Headless probe changed foreground app\n", stderr); exit(2) }
+        print("CommanderGuard headless pipe check passed; foreground app unchanged")
+        exit(0)
+    } catch { fputs("CommanderGuard headless check failed: \(error.localizedDescription)\n", stderr); exit(2) }
 }
 else if CommandLine.arguments.contains("--probe-channel") {
     MCPChannelProbe().run { result in
