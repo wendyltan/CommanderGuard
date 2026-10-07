@@ -8,7 +8,7 @@
 
 <p align="center"><a href="README.md">中文</a> · English</p>
 
-Your device shows as online, but remote tools fail to run. CommanderGuard checks the message channel and local tool execution separately, helping you locate the failure. It also observes some ChatGPT App connection events and can show your Desktop Commander cloud tool calls usage.
+Your device shows as online, but remote tools fail to run. CommanderGuard observes the message channel and local tool execution separately. Active cloud probes are OFF by default to avoid continuously sending potentially metered tool requests while idle. It also observes some ChatGPT App connection events and can show your Desktop Commander cloud tool calls usage.
 
 This project is for macOS users who already use [Remote Desktop Commander](https://github.com/desktop-commander/remote-desktop-commander). The app UI is currently in Chinese. Automatic recovery depends on a specific local service and log layout; check the compatibility requirements below before installing.
 
@@ -17,7 +17,7 @@ This project is for macOS users who already use [Remote Desktop Commander](https
 | Feature | What you can see or do |
 |---|---|
 | Live status | Menu bar icon and text show channel status; the panel tracks the message channel, tool execution, and ChatGPT answer state separately |
-| Connection checks | MCP `ping` checks whether your device responds; a read-only `list_sessions` probe checks local tool execution when safety conditions permit |
+| Optional active probes | OFF by default; device `ping` and safe, read-only `list_sessions` share a persistent limit of 6 attempts per rolling 24 hours |
 | Automatic recovery | After repeated explicit disconnects, checks tasks, logs, processes, and cooldown before deciding whether to restart the managed Commander service |
 | Activity records | Up to 100 recent local calls, with search, filters, redacted details, and anonymous session attribution when reliable upstream metadata exists |
 | Cloud usage | Uses the official usage page in Chrome to display used, included, and remaining calls, progress, and the last successful sync time |
@@ -55,13 +55,15 @@ Download or clone this repository, then run these commands in the project direct
 
 Open `build/CommanderGuard.app` in Finder after the build completes. Click its menu bar icon to open the panel. The source build is ad hoc signed locally; Developer ID notarization is not configured.
 
-On a first run without an existing configuration, “自动恢复本机 Commander” (automatically recover local Commander) is enabled by default. Turn it off in the panel if you only want observation and diagnosis. “防止闲置睡眠（Guard）” (prevent idle sleep) is a separate toggle.
+“云端主动探测（可能消耗额度）” (active cloud probes, may use quota) defaults to OFF, including upgrades. The automatic-recovery permission defaults to ON for a new configuration, but recovery is paused while active probes are OFF. The panel shows the reason. Preventing idle sleep is independent and does not require probes.
 
-### 3. Check the connection
+### 3. Decide whether to enable active probes
 
-Click “检查链路” (check connection) in the panel. Guard checks the message channel first, then checks tool execution if the channel responds and local safety conditions permit. Routine checks have a startup grace period of about 90 seconds; an observed persistent channel fault schedules read-only rechecks sooner.
+By default, Guard observes local logs, real calls and device registration without sending MCP tool probes. To test device responsiveness, enable active probes and click “手动 ping（1次）” (one manual ping). The button sends one request. A device ping does not prove local tool execution works.
 
-The panel explains why a tool check is deferred. Check for running tasks and incomplete logs before treating an unconfirmed state as idle.
+Automatic, manual, command-line and post-recovery probes share **6 total attempts per rolling 24 hours**. Failed or timed-out requests count too. Relaunching Guard or toggling the setting does not reset the stored budget. Routine ping and tool checks each have a minimum ten-minute interval; incident backoff still obeys the shared cap. Usage-account reads do not consume this probe budget.
+
+OFF blocks new `tools/call` requests and pauses automatic recovery. Submitted requests cannot be recalled. An exhausted budget, corrupt ledger, backwards clock or failed safe write also blocks probes. Logs, device-registration reads, ChatGPT observation, usage sync and idle-sleep prevention continue. An unconfirmed state is not evidence of health or idleness.
 
 ### Optional: use the existing installer
 
@@ -81,7 +83,7 @@ The panel has three pages, a resizable window, and support for system light and 
 
 | Page | What to look for |
 |---|---|
-| 概览 (Overview) | The status needing attention, local task activity, usage, main toggles, and the connection-check button |
+| 概览 (Overview) | The status needing attention, local task activity, usage, main toggles, probe budget, and the one-ping button |
 | 操作记录 (Activity) | Hides `ping` checks by default; search commands, tools, paths, or known sessions, and select a row for its tool name, details, time and duration; choose “全部（含连接检查）” to include checks |
 | 故障与恢复 (Incidents and recovery) | Recent incidents, probes, recovery times and results, without repeating Overview status cards or controls |
 
@@ -92,7 +94,7 @@ The menu bar keeps updating. The internal marker `●` means the message channel
 This shows Desktop Commander cloud tool calls usage, separate from your ChatGPT subscription limits. It is optional and requires Google Chrome to be installed.
 
 1. Click “连接额度账户” (connect usage account) in Overview and sign in on the official site in Guard's dedicated browser window. Google sign-in is supported.
-2. Close the dedicated window after signing in, return to Guard, and click “刷新” (refresh). Your everyday Chrome windows can stay open or be quit.
+2. After signing in, return to Guard and click “完成登录并同步” (finish sign-in and sync), which closes only the dedicated browser process Guard launched and reads usage in the background. You may also close the window and click Refresh. Everyday Chrome is unaffected. Guard will not force-close an unowned browser holding the profile.
 3. Choose manual only or 1, 2, 5, 10, 30, or 60 minutes under “后台自动同步” (background sync). The default is five minutes. The choice survives Guard relaunches; changing it does not immediately send a request.
 
 Automatic reads use Chrome Headless, without visible windows or changes to your everyday browser tabs or foreground app. Only clicking the sign-in button opens a dedicated login window. A failed automatic read never opens a login window on its own.
@@ -107,9 +109,9 @@ The usage endpoint is the read-only interface currently used by the official web
 
 ### The console says online, but tools fail
 
-An online console entry generally reflects device registration or a heartbeat. Click the connection-check button to test your device's `ping` response, then inspect tool execution. The device answers `ping` directly, without running a local tool.
+An online console entry generally reflects registration or a heartbeat. Inspect local errors and recent real calls first. If needed, enable active probes and send one manual ping within the budget. The device answers `ping` directly, without running a local tool.
 
-Tool execution prefers a recent, explicitly successful real call. Once that evidence is older than 120 seconds, Guard sends read-only `list_sessions` only if the channel responds, logs are complete, and the device is confirmed idle. Probe response bodies are discarded. A failed tool probe does not itself trigger a restart.
+Tool execution prefers a recent, explicitly successful real call. Once that evidence is older than 120 seconds, Guard sends read-only `list_sessions` only if active probes are enabled, budget remains, the channel recently responded, logs are complete and the device is confirmed idle. Probe response bodies are discarded. A failed tool probe does not itself trigger a restart.
 
 ### Guard cannot safely confirm that the device is idle
 
@@ -117,7 +119,7 @@ The message “本机日志覆盖有缺口，无法安全确认空闲” means G
 
 ### Cloud Realtime connection pool error
 
-“云端实时服务连接池异常” means Guard observed `IncreaseConnectionPool` in the logs. This cloud capacity category suppresses local automatic restarts and schedules read-only rechecks with 10 / 20 / 40 / 80 / 120-second backoff.
+“云端实时服务连接池异常” means Guard observed `IncreaseConnectionPool` in the logs. This cloud capacity category suppresses local automatic restarts. When probes are enabled and budget remains, read-only rechecks use 10 / 20 / 40 / 80 / 120-second backoff. OFF or the shared six-attempt cap stops further probes.
 
 Use the latest check result and timestamp to assess the current state. An old capacity warning or an online console entry cannot establish whether the command channel has recovered. Guard records the incident and rechecks, but cannot expand or repair the cloud connection pool. See [Realtime Error Codes](https://supabase.com/docs/guides/realtime/error_codes) and [Realtime Settings](https://supabase.com/docs/guides/realtime/settings).
 
@@ -128,6 +130,8 @@ Guard can observe some answer-resume, refresh-failure, and update-connection eve
 An update connection reopening establishes only that connection's recovery; a resume-completed event applies to its corresponding recovery path. Guard cannot control or resume the original ChatGPT answer stream, resend messages, restart ChatGPT, or switch networks. See [CHAT-LIVENESS-REVIEW.md](CHAT-LIVENESS-REVIEW.md) for the technical review in Chinese.
 
 ## When automatic recovery runs
+
+Both active probes and automatic recovery must be enabled, with probe budget remaining. Turning probes OFF preserves the saved recovery permission but pauses new recovery attempts; the panel explains why.
 
 Guard starts evaluating recovery after automatic probes accumulate three explicit “device has no live connection” results. Unknown results between them do not clear that evidence; a confirmed healthy `ping` does.
 
@@ -168,6 +172,7 @@ State files live in `~/Library/Application Support/CommanderGuard/`:
 | `channel-incident.json` | Current and recent channel categories, timestamps, backoff, and recovery state |
 | `channel-decisions.jsonl` | Probe and recovery decisions, capped at 512 KiB with one rotated copy |
 | `channel-recovery.json` | Recovery toggle and last attempt time, without credentials |
+| `active-probe-budget.json` | Probe permission and rolling request timestamps, without credentials; relaunches do not reset it |
 
 Session attribution accepts only upstream `_meta["openai/session"]` or `origin_context_id`. Raw identifiers are SHA-256 hashed into short anonymous fingerprints. Missing fields produce no attribution label; conflicting fields still show “归属冲突” (attribution conflict). Timing, the foreground chat, terminal processes, and `origin_instance` are not attribution evidence.
 
@@ -181,11 +186,17 @@ Missing times and durations in reconstructed history are marked unknown. A retur
 
 ## Manual checks and development
 
-Run these commands in the project directory. Both probes use the real cloud connection without starting Guard's automatic recovery. `--probe-tool` sends a read-only tool call.
+Run these commands in the project directory. Both probes obey the same switch and shared limit; OFF means no cloud request. When enabled, they use the real connection and may consume quota, without starting automatic recovery. `--probe-tool` sends a read-only tool call.
 
 ```bash
 ./build/CommanderGuard.app/Contents/MacOS/CommanderGuard --probe-channel
 ./build/CommanderGuard.app/Contents/MacOS/CommanderGuard --probe-tool
+```
+
+Read the switch and budget without loading credentials or sending requests:
+
+```bash
+./build/CommanderGuard.app/Contents/MacOS/CommanderGuard --active-probe-status
 ```
 
 The offline self-test does not start the guard or operate the Commander service:
@@ -223,6 +234,7 @@ It removes the Guard app, desktop shortcut, and login LaunchAgent, preserving pr
 ## Project documentation
 
 - [TODO.md](TODO.md): priorities and acceptance criteria. Unfinished items are not current capabilities.
+- [PROBE-QUOTA-REVIEW.md](PROBE-QUOTA-REVIEW.md): probe cadence, measured usage comparisons and alternatives; unproven billing assumptions are marked as such.
 - [CHAT-COMMANDER-ATTRIBUTION-REVIEW.md](CHAT-COMMANDER-ATTRIBUTION-REVIEW.md): session attribution and upstream metadata gaps.
 - [CHAT-LIVENESS-REVIEW.md](CHAT-LIVENESS-REVIEW.md): ChatGPT answer streams and connection keepalive review.
 - [DIAGNOSIS.md](DIAGNOSIS.md): historical timeout diagnosis.

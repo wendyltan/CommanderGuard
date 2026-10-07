@@ -184,7 +184,10 @@ final class HeadlessQuotaBrowser {
                 self.sawLoginWindow = false
                 self.missingLoginWindowSamples = 0
                 DispatchQueue.main.async { [weak self] in self?.onLoginClosed?() }
-                if self.loginLockFD >= 0 { flock(self.loginLockFD, LOCK_UN); close(self.loginLockFD); self.loginLockFD = -1 }
+                if self.loginLockFD >= 0 {
+                    Self.clearExitedOwnedBrowserLock(profile, pid: owned.processIdentifier)
+                    flock(self.loginLockFD, LOCK_UN); close(self.loginLockFD); self.loginLockFD = -1
+                }
             }
         }
         // Store readiness before launch, so a marker failure cannot leave an untracked browser.
@@ -193,6 +196,17 @@ final class HeadlessQuotaBrowser {
         loginProcess = process; loginLockFD = fd; keepLock = true
         DispatchQueue.main.async { [weak self] in self?.monitorLoginWindow() }
         return true
+    }
+
+    var hasOwnedLogin: Bool {
+        stateLock.lock(); defer { stateLock.unlock() }; return loginProcess != nil
+    }
+    /// Explicit completion button: terminate only the login child this instance launched.
+    @discardableResult func finishOwnedLogin() -> Bool {
+        stateLock.lock(); defer { stateLock.unlock() }
+        guard let process = loginProcess else { return false }
+        if process.isRunning { process.terminate() }
+        return true // onLoginClosed reads usage after the owned child has exited and released its lock.
     }
 
     private func monitorLoginWindow() {
@@ -270,6 +284,21 @@ final class HeadlessQuotaBrowser {
         guard errno == ENOENT else { throw Failure.profile }
         return false
     }
+    /// Called only for the recorded login child after termination, while its profile flock is held.
+    private static func clearExitedOwnedBrowserLock(_ profile: URL, pid: pid_t) {
+        guard pid > 0, kill(pid, 0) == -1, errno == ESRCH else { return }
+        let lock = profile.appendingPathComponent("SingletonLock")
+        var first = stat(), current = stat()
+        guard lstat(lock.path, &first) == 0, (first.st_mode & S_IFMT) == S_IFLNK, first.st_uid == geteuid(),
+              let target = try? FileManager.default.destinationOfSymbolicLink(atPath: lock.path),
+              target.split(separator: "-").last == Substring(String(pid)),
+              lstat(lock.path, &current) == 0, current.st_dev == first.st_dev, current.st_ino == first.st_ino,
+              current.st_mode == first.st_mode, current.st_uid == first.st_uid,
+              current.st_mtimespec.tv_sec == first.st_mtimespec.tv_sec, current.st_mtimespec.tv_nsec == first.st_mtimespec.tv_nsec,
+              (try? FileManager.default.destinationOfSymbolicLink(atPath: lock.path)) == target else { return }
+        _ = unlink(lock.path)
+    }
+
     private static func loginRequested(_ profile: URL) -> Bool {
         let fd = open(profile.appendingPathComponent(".login-requested").path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
         guard fd >= 0 else { return false }; defer { close(fd) }
@@ -519,6 +548,32 @@ final class HeadlessQuotaBrowser {
         let publicDirectory = scratch.appendingPathComponent("public-profile")
         guard mkdir(publicDirectory.path, 0o755) == 0 else { throw Failure.profile }
         do { try validateDirectory(publicDirectory, privateMode: true); preconditionFailure("public profile accepted") } catch Failure.profile {}
+        let login = HeadlessQuotaBrowser()
+        precondition(!login.hasOwnedLogin && !login.finishOwnedLogin())
+        let ownedLogin = Process(); ownedLogin.executableURL = URL(fileURLWithPath: "/bin/sleep"); ownedLogin.arguments = ["30"]
+        try ownedLogin.run()
+        login.loginProcess = ownedLogin
+        precondition(login.hasOwnedLogin && login.finishOwnedLogin())
+        ownedLogin.waitUntilExit(); login.loginProcess = nil
+        precondition(!login.hasOwnedLogin && !login.finishOwnedLogin())
+        let browserLock = scratch.appendingPathComponent("SingletonLock")
+        let child = Process(); child.executableURL = URL(fileURLWithPath: "/usr/bin/true")
+        try child.run(); child.waitUntilExit()
+        let exitedPID = child.processIdentifier
+        guard kill(exitedPID, 0) == -1, errno == ESRCH else { throw Failure.unavailable }
+        guard symlink("owned-host-\(exitedPID)", browserLock.path) == 0 else { throw Failure.profile }
+        clearExitedOwnedBrowserLock(scratch, pid: getpid())
+        let runningLockPreserved = try hasBrowserLock(scratch); precondition(runningLockPreserved, "running or mismatched PID lock must be preserved")
+        clearExitedOwnedBrowserLock(scratch, pid: exitedPID)
+        let ownedLockCleared = !(try hasBrowserLock(scratch)); precondition(ownedLockCleared, "known exited child lock must be cleared")
+        guard symlink("unknown-host-999999", browserLock.path) == 0 else { throw Failure.profile }
+        clearExitedOwnedBrowserLock(scratch, pid: exitedPID)
+        let unknownLockPreserved = try hasBrowserLock(scratch); precondition(unknownLockPreserved, "unknown PID lock must be preserved")
+        guard unlink(browserLock.path) == 0 else { throw Failure.profile }
+        try Data().write(to: browserLock)
+        clearExitedOwnedBrowserLock(scratch, pid: exitedPID)
+        let fileLockPreserved = try hasBrowserLock(scratch); precondition(fileLockPreserved, "non-symlink lock must be preserved")
+        guard unlink(browserLock.path) == 0 else { throw Failure.profile }
         let headless = arguments(profile: profileURL, headless: true)
         let visible = arguments(profile: profileURL, headless: false)
         precondition(headless.contains("--headless=new") && headless.contains("--remote-debugging-pipe"))
@@ -2413,7 +2468,7 @@ struct ChannelWatchdogState {
     var detail = "等待 Commander 与日志完成启动"
     var recovering = false
 
-    func isDue(now: Date) -> Bool { now.timeIntervalSince(startedAt) >= 90 && now.timeIntervalSince(lastProbe) >= 30 && !recovering }
+    func isDue(now: Date) -> Bool { now.timeIntervalSince(startedAt) >= 90 && now.timeIntervalSince(lastProbe) >= 600 && !recovering }
     mutating func observed(_ result: ChannelProbeResult, now: Date) {
         switch result {
         case .healthy:
@@ -2459,6 +2514,128 @@ struct ChannelRecoveryLedger: Codable {
     }
 }
 
+/// Shared by every Guard tools/call path, including command-line and recovery probes.
+/// Reserve before submission: failures/timeouts still consume a slot; denied requests do not.
+final class ActiveProbeBudget {
+    static let limit = 6
+    static let window: TimeInterval = 24 * 60 * 60
+    static let shared = ActiveProbeBudget(directory: FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/CommanderGuard"))
+    struct State: Codable {
+        var version = 1
+        var enabled = false
+        var attempts: [Double] = []
+    }
+    struct Status {
+        let enabled: Bool
+        let used: Int
+        let error: String?
+        var blockReason: String? { error ?? (!enabled ? "云端主动探测已关闭" : (used >= ActiveProbeBudget.limit ? "最近24小时主动探测已达6次上限" : nil)) }
+        var display: String { "最近24小时主动探测 \(error == nil ? String(used) : "未知")/6" + (error.map { " · \($0)" } ?? "") }
+    }
+    private let directory: URL
+    private let localLock = NSLock()
+    init(directory: URL) { self.directory = directory }
+
+    func status(now: Date = Date()) -> Status {
+        do {
+            let fd = try openDirectory(createIfMissing: false); defer { close(fd) }
+            // Atomic replacement gives readers a complete snapshot; admission reloads under the lock.
+            let state = try load(fd, now: now)
+            return Status(enabled: state.enabled, used: state.attempts.count, error: nil)
+        } catch Failure.missingDirectory { return Status(enabled: false, used: 0, error: nil) }
+        catch { return Status(enabled: false, used: 0, error: "探测预算记录不可用；已暂停") }
+    }
+    func setEnabled(_ enabled: Bool, now: Date = Date()) -> Bool {
+        do { return try locked { fd in var state = try load(fd, now: now); state.enabled = enabled; try save(state, fd); return true } }
+        catch { return false }
+    }
+    /// Keep the cross-process lock until the request is submitted, so OFF cannot race admission.
+    func submit(now: Date = Date(), _ request: () -> Void) -> String? {
+        do {
+            return try locked { fd in
+                var state = try load(fd, now: now)
+                let status = Status(enabled: state.enabled, used: state.attempts.count, error: nil)
+                if let reason = status.blockReason { return reason }
+                state.attempts.append(now.timeIntervalSince1970)
+                try save(state, fd)
+                request()
+                return nil
+            }
+        } catch { return "探测预算无法安全保存；未发送请求" }
+    }
+    private enum Failure: Error { case unsafeStorage, missingDirectory }
+    private func locked<T>(_ body: (Int32) throws -> T) throws -> T {
+        localLock.lock(); defer { localLock.unlock() }
+        let fd = try openDirectory(); defer { close(fd) }
+        let lock = openat(fd, "active-probe.lock", O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard lock >= 0 else { throw Failure.unsafeStorage }
+        defer { close(lock) }
+        guard safeFile(lock), flock(lock, LOCK_EX) == 0 else { throw Failure.unsafeStorage }
+        defer { flock(lock, LOCK_UN) }
+        return try body(fd)
+    }
+    /// Walk with file descriptors: reject symlinks even in ancestors and never follow a replaced path.
+    private func openDirectory(createIfMissing: Bool = true) throws -> Int32 {
+        guard directory.isFileURL, directory.path.hasPrefix("/"), !directory.pathComponents.contains(".."), !directory.pathComponents.contains(".") else { throw Failure.unsafeStorage }
+        var fd = open("/", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard fd >= 0 else { throw Failure.unsafeStorage }
+        do {
+            let parts = directory.path.split(separator: "/").map(String.init)
+            for (index, part) in parts.enumerated() {
+                var next = openat(fd, part, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+                if next < 0 && errno == ENOENT {
+                    guard createIfMissing else { throw Failure.missingDirectory }
+                    guard mkdirat(fd, part, 0o700) == 0 || errno == EEXIST else { throw Failure.unsafeStorage }
+                    next = openat(fd, part, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+                }
+                guard next >= 0 else { throw Failure.unsafeStorage }
+                var info = stat()
+                guard fstat(next, &info) == 0,
+                      info.st_uid == 0 || info.st_uid == geteuid(),
+                      info.st_mode & 0o022 == 0 || (info.st_uid == 0 && info.st_mode & S_ISVTX != 0 && index < parts.count - 1),
+                      index < parts.count - 1 || info.st_uid == geteuid() else { close(next); throw Failure.unsafeStorage }
+                close(fd); fd = next
+            }
+            return fd
+        } catch { close(fd); throw error }
+    }
+    private func safeFile(_ fd: Int32) -> Bool {
+        var info = stat()
+        return fstat(fd, &info) == 0 && info.st_mode & S_IFMT == S_IFREG && info.st_uid == geteuid() && info.st_mode & 0o077 == 0 && info.st_nlink == 1
+    }
+    private func load(_ directoryFD: Int32, now: Date) throws -> State {
+        let fd = openat(directoryFD, "active-probe-budget.json", O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        if fd < 0 && errno == ENOENT { return State() }
+        guard fd >= 0 else { throw Failure.unsafeStorage }
+        defer { close(fd) }
+        guard safeFile(fd) else { throw Failure.unsafeStorage }
+        var bytes = [UInt8](repeating: 0, count: 4097)
+        let count = read(fd, &bytes, bytes.count)
+        guard count > 0, count <= 4096,
+              var state = try? JSONDecoder().decode(State.self, from: Data(bytes.prefix(count))),
+              state.version == 1, state.attempts.count <= Self.limit,
+              now.timeIntervalSince1970.isFinite,
+              state.attempts.allSatisfy({ $0.isFinite && $0 >= 0 && $0 <= now.timeIntervalSince1970 }) else { throw Failure.unsafeStorage }
+        state.attempts.removeAll { now.timeIntervalSince1970 - $0 >= Self.window }
+        return state
+    }
+    private func save(_ state: State, _ directoryFD: Int32) throws {
+        // Never overwrite an unsafe ledger, including a dangling symlink.
+        let existing = openat(directoryFD, "active-probe-budget.json", O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        if existing >= 0 { defer { close(existing) }; guard safeFile(existing) else { throw Failure.unsafeStorage } }
+        else if errno != ENOENT { throw Failure.unsafeStorage }
+        let name = ".active-probe-" + UUID().uuidString
+        let fd = openat(directoryFD, name, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard fd >= 0 else { throw Failure.unsafeStorage }
+        defer { close(fd); unlinkat(directoryFD, name, 0) }
+        let data = try JSONEncoder().encode(state)
+        let written = data.withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }
+        guard written == data.count, fsync(fd) == 0,
+              renameat(directoryFD, name, directoryFD, "active-probe-budget.json") == 0,
+              fsync(directoryFD) == 0 else { throw Failure.unsafeStorage }
+    }
+}
+
 /// Makes one bounded, read-only MCP ping. Credentials are loaded for each request and never surfaced.
 final class MCPChannelProbe: NSObject, URLSessionDataDelegate, URLSessionTaskDelegate {
     private static let endpoint = URL(string: "https://mcp.desktopcommander.app/mcp")!
@@ -2470,8 +2647,9 @@ final class MCPChannelProbe: NSObject, URLSessionDataDelegate, URLSessionTaskDel
     private var requestID = UUID().uuidString
     private var deviceID = ""
 
-    func run(_ done: @escaping (ChannelProbeResult) -> Void) {
+    func run(budget: ActiveProbeBudget = .shared, _ done: @escaping (ChannelProbeResult) -> Void) {
         completion = done
+        if let reason = budget.status().blockReason { finish(.unknown(reason)); return }
         let file = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".desktop-commander-device/device.json")
         guard let data = try? Data(contentsOf: file), let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
               let id = root["deviceId"] as? String, CloudState.validDeviceID(id),
@@ -2489,7 +2667,7 @@ final class MCPChannelProbe: NSObject, URLSessionDataDelegate, URLSessionTaskDel
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = 8; configuration.timeoutIntervalForResource = 10
         session = URLSession(configuration: configuration, delegate: self, delegateQueue: OperationQueue())
-        session.dataTask(with: request).resume()
+        if let reason = budget.submit({ session.dataTask(with: request).resume() }) { finish(.unknown(reason)) }
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) { completionHandler(nil) }
@@ -2568,8 +2746,9 @@ final class MCPToolExecutionProbe: NSObject, URLSessionDataDelegate, URLSessionT
     private var requestID = UUID().uuidString
     private var deviceID = ""
 
-    func run(_ done: @escaping (ToolExecutionProbeResult) -> Void) {
+    func run(budget: ActiveProbeBudget = .shared, _ done: @escaping (ToolExecutionProbeResult) -> Void) {
         completion = done
+        if let reason = budget.status().blockReason { finish(.unknown(reason)); return }
         let file = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".desktop-commander-device/device.json")
         guard let data = try? Data(contentsOf: file), let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
               let id = root["deviceId"] as? String, CloudState.validDeviceID(id),
@@ -2587,7 +2766,7 @@ final class MCPToolExecutionProbe: NSObject, URLSessionDataDelegate, URLSessionT
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = 8; configuration.timeoutIntervalForResource = 10
         session = URLSession(configuration: configuration, delegate: self, delegateQueue: OperationQueue())
-        session.dataTask(with: request).resume()
+        if let reason = budget.submit({ session.dataTask(with: request).resume() }) { finish(.unknown(reason)) }
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) { completionHandler(nil) }
@@ -2761,6 +2940,65 @@ private func selfTestSessionAttributionReader(dir: URL, now: Date) {
     precondition(oversizedReader.summary.activeCount == 0 && !oversizedReader.summary.coverageGap && activitySafeForRecovery(oversizedReader.summary))
 }
 
+private func selfTestActiveProbeBudget(dir: URL, now: Date) {
+    let physicalPath = dir.path.hasPrefix("/var/") ? "/private" + dir.path : dir.path
+    let physicalDir = URL(fileURLWithPath: physicalPath, isDirectory: true)
+    let directory = physicalDir.appendingPathComponent("active-budget")
+    let budget = ActiveProbeBudget(directory: directory)
+    var submitted = 0
+    precondition(budget.status(now: now).error == nil && !budget.status(now: now).enabled && budget.status(now: now).used == 0)
+    precondition(budget.submit(now: now, { submitted += 1 }) != nil && submitted == 0)
+    // Both actual probe entry points fail before reading credentials or making requests when OFF.
+    var pingDenied = false, toolDenied = false
+    MCPChannelProbe().run(budget: budget) { if case .unknown(let reason) = $0 { pingDenied = reason == "云端主动探测已关闭" } }
+    MCPToolExecutionProbe().run(budget: budget) { if case .unknown(let reason) = $0 { toolDenied = reason == "云端主动探测已关闭" } }
+    precondition(pingDenied && toolDenied && budget.status(now: now).used == 0)
+    precondition(budget.setEnabled(true, now: now))
+    for index in 1...6 {
+        let reopened = ActiveProbeBudget(directory: directory)
+        precondition(reopened.submit(now: now, { submitted += 1 }) == nil)
+        precondition(budget.status(now: now).used == index)
+    }
+    precondition(budget.submit(now: now, { submitted += 1 }) != nil && submitted == 6)
+    precondition(budget.setEnabled(false, now: now) && budget.setEnabled(true, now: now))
+    precondition(budget.status(now: now).used == 6, "Switching and reopening must not reset the rolling budget")
+    let beforeExpiry = now.addingTimeInterval(ActiveProbeBudget.window - 1)
+    precondition(budget.submit(now: beforeExpiry, { submitted += 1 }) != nil)
+    let expiry = now.addingTimeInterval(ActiveProbeBudget.window)
+    precondition(budget.submit(now: expiry, { submitted += 1 }) == nil && budget.status(now: expiry).used == 1)
+    precondition(budget.status(now: now).error != nil, "A backwards clock must fail closed")
+    let ledger = directory.appendingPathComponent("active-probe-budget.json")
+    try! Data("invalid".utf8).write(to: ledger)
+    precondition(budget.status(now: expiry).error != nil && !budget.setEnabled(true, now: expiry))
+    precondition(budget.submit(now: expiry, { submitted += 1 }) != nil && submitted == 7)
+    try! FileManager.default.removeItem(at: ledger)
+    try! FileManager.default.createSymbolicLink(atPath: ledger.path, withDestinationPath: dir.appendingPathComponent("missing").path)
+    precondition(budget.status(now: expiry).error != nil && budget.submit(now: expiry, { submitted += 1 }) != nil)
+    let linkedDirectory = physicalDir.appendingPathComponent("linked-budget")
+    try! FileManager.default.createSymbolicLink(at: linkedDirectory, withDestinationURL: directory)
+    precondition(ActiveProbeBudget(directory: linkedDirectory).status(now: expiry).error != nil)
+
+    let failingDirectory = physicalDir.appendingPathComponent("cannot-persist")
+    let failing = ActiveProbeBudget(directory: failingDirectory)
+    precondition(failing.setEnabled(true, now: now))
+    precondition(chmod(failingDirectory.path, 0o500) == 0)
+    precondition(failing.submit(now: now, { submitted += 1 }) != nil && submitted == 7)
+    precondition(failing.status(now: now).used == 0, "A failed reservation must not consume a slot")
+    precondition(chmod(failingDirectory.path, 0o700) == 0)
+
+    // Separate budget instances model simultaneous processes sharing one persistent lock/ledger.
+    let concurrentDirectory = physicalDir.appendingPathComponent("concurrent-budget")
+    precondition(ActiveProbeBudget(directory: concurrentDirectory).setEnabled(true, now: now))
+    let countLock = NSLock()
+    var concurrentSubmissions = 0
+    DispatchQueue.concurrentPerform(iterations: 12) { _ in
+        _ = ActiveProbeBudget(directory: concurrentDirectory).submit(now: now) {
+            countLock.lock(); concurrentSubmissions += 1; countLock.unlock()
+        }
+    }
+    precondition(concurrentSubmissions == 6 && ActiveProbeBudget(directory: concurrentDirectory).status(now: now).used == 6)
+}
+
 func selfTest() {
     let now = Date(timeIntervalSince1970: 2_000_000_000)
     func quota(_ usage: [String: Any]) -> UsageQuota? {
@@ -2829,7 +3067,7 @@ func selfTest() {
     var watchdogTest = ChannelWatchdogState(startedAt: now)
     precondition(!watchdogTest.isDue(now: now.addingTimeInterval(89)) && watchdogTest.isDue(now: now.addingTimeInterval(90)))
     watchdogTest.lastProbe = now.addingTimeInterval(90)
-    precondition(!watchdogTest.isDue(now: now.addingTimeInterval(119)) && watchdogTest.isDue(now: now.addingTimeInterval(120)))
+    precondition(!watchdogTest.isDue(now: now.addingTimeInterval(689)) && watchdogTest.isDue(now: now.addingTimeInterval(690)))
     for n in 1...3 { watchdogTest.observed(.noLiveConnection, now: now.addingTimeInterval(Double(90 + n * 30))); precondition(watchdogTest.failures == n) }
     watchdogTest.observed(.unknown("网络未知"), now: now.addingTimeInterval(200)); precondition(watchdogTest.failures == 3, "Unknown probes must preserve explicit disconnect history")
     watchdogTest.observed(.healthy, now: now.addingTimeInterval(230)); precondition(watchdogTest.failures == 0 && watchdogTest.status == "通道畅通")
@@ -3031,6 +3269,7 @@ func selfTest() {
     let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
     try! FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: dir) }
+    selfTestActiveProbeBudget(dir: dir, now: now)
     let ledgerFile = dir.appendingPathComponent("recovery.json")
     precondition(ledgerTest.save(to: ledgerFile))
     precondition(!ChannelRecoveryLedger.load(from: ledgerFile).canAttempt(at: now.addingTimeInterval(299)))
@@ -3535,6 +3774,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private var panelChat: NSTextField?
     private var panelChatTime: NSTextField?
     private var panelChatDetail: NSTextField?
+    private var panelProbeToggle: NSButton?
+    private var panelProbeBudget: NSTextField?
+    private var panelManualCheck: NSButton?
     private var panelRecoveryToggle: NSButton?
     private var panelRecoveryStatus: NSTextField?
     private var panelWakeStatus: NSTextField?
@@ -3670,6 +3912,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             }
             return "无活动故障"
         }
+        if let reason = activeProbeStatus.blockReason { return "复查已暂停 · \(reason)" }
         if channelBusy || manualPingBusy { return "正在复查 · \(category.title)" }
         if let next = channelIncident.nextRecheck, next > now {
             let seconds = max(1, Int(next.timeIntervalSince(now).rounded(.up)))
@@ -3708,7 +3951,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             if let category = channelIncidentCategory(for: event) {
                 _ = channelIncident.observe(category, at: date)
                 let signal = category == .cloudRealtimeCapacity ? "cloud_realtime_capacity" : "channel_disruption"
-                auditChannel(kind: "signal", result: signal, action: "read_only_recheck_scheduled", at: date)
+                auditChannel(kind: "signal", result: signal, action: activeProbeStatus.blockReason == nil ? "read_only_recheck_scheduled" : "observed_without_active_probe", at: date)
                 if channelIncident.consumeCapacityAlert() {
                     auditChannel(kind: "alert", result: "cloud_capacity_alerted_once", action: "wait_for_cloud_recovery", at: date)
                 }
@@ -3726,8 +3969,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         if changed { render() }
     }
 
+    private var activeProbeStatus: ActiveProbeBudget.Status {
+        previewMode ? ActiveProbeBudget.Status(enabled: false, used: 0, error: nil) : ActiveProbeBudget.shared.status()
+    }
     private func pollChannel() {
         let now = Date()
+        if let reason = activeProbeStatus.blockReason {
+            deferredReason = reason
+            if snapshot.channelChecked == nil {
+                snapshot.channelState = "未主动验证"
+                snapshot.channelDetail = "\(reason)；继续观察本机日志与设备登记"
+            }
+            return
+        }
         guard !channelBusy, !manualPingBusy, !watchdog.recovering else { return }
         let due = channelIncident.activeCategory != nil ? channelIncident.recheckDue(now: now) : watchdog.isDue(now: now)
         guard due else { return }
@@ -3811,7 +4065,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         guard !previewMode, !toolProbeBusy, !watchdog.recovering else { return }
         refreshToolExecutionFromActivity(snapshot.activity, now: now)
         if toolExecutionFresh(snapshot, now: now) { return }
-        guard now.timeIntervalSince(lastToolProbeAttempt) >= 30 else { return }
+        if let reason = activeProbeStatus.blockReason { toolProbeDeferredReason = reason; return }
+        guard now.timeIntervalSince(lastToolProbeAttempt) >= 600 else { return }
         guard snapshot.service == "运行中" else { toolProbeDeferredReason = "Commander 服务未运行"; return }
         guard channelIndicator(service: snapshot.service, state: snapshot.channelState, checked: snapshot.channelChecked, now: now) == "●" else {
             toolProbeDeferredReason = "消息通道尚未确认"; return
@@ -3823,6 +4078,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
     private func startToolExecutionProbe(manual: Bool) {
         let now = Date()
+        if let reason = activeProbeStatus.blockReason { toolProbeDeferredReason = reason; if manual { manualCheckBlocked(reason) }; return }
         guard !toolProbeBusy else { if manual { manualNotice = "工具执行检查已在进行"; render() }; return }
         refreshToolExecutionFromActivity(snapshot.activity, now: now)
         if toolExecutionFresh(snapshot, now: now) {
@@ -3870,6 +4126,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         return "调用状态尚未确认"
     }
     @objc private func manualCheck() {
+        if let reason = activeProbeStatus.blockReason { manualCheckBlocked(reason); return }
         guard !watchdog.recovering else { manualCheckBlocked("自动恢复处理中，暂不能手动检查"); return }
         guard !channelBusy, !manualPingBusy else { manualCheckBlocked("已有连接检查进行中"); return }
         guard channelIncident.activeCategory != nil || Date().timeIntervalSince(watchdog.startedAt) >= 90 else { manualCheckBlocked("启动等待中，暂不能手动检查"); return }
@@ -3879,14 +4136,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             DispatchQueue.main.async {
                 self.manualPingBusy = false
                 self.recordProbe(result, now: Date(), manual: true)
-                if case .healthy = result { self.startToolExecutionProbe(manual: true) }
-                else { self.manualNotice = "消息通道未确认；未进行工具执行检查"; self.render() }
+                self.manualNotice = "手动检查已完成：一次 ping；\(self.probeDescription(result))"; self.render()
             }
         }
     }
     private func manualCheckBlocked(_ reason: String) { manualNotice = reason; render() }
     private func considerRecovery() {
         let now = Date()
+        if let reason = activeProbeStatus.blockReason { snapshot.channelDetail = "自动恢复已暂停：\(reason)"; render(); return }
         if localRestartSuppressed(for: channelIncident.activeCategory) {
             snapshot.channelDetail = "云端实时服务连接池异常；本机重启不会修复该容量问题"
             auditChannel(kind: "recovery_decision", result: "restart_suppressed_cloud_capacity",
@@ -3934,7 +4191,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }
     }
     private func recoveryGateOpen(oldPID: Int32) -> Bool {
-        watchdog.recovering && recoveryLedger.autoRecoveryEnabled && recoveryLedger.canAttempt(at: Date()) &&
+        activeProbeStatus.blockReason == nil && watchdog.recovering && recoveryLedger.autoRecoveryEnabled && recoveryLedger.canAttempt(at: Date()) &&
         snapshot.service == "运行中" && activitySafeForRecovery(snapshot.activity) && !activityBusy &&
         Date().timeIntervalSince(lastActivityPoll) < 3
     }
@@ -4091,10 +4348,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         if panelWindow?.isVisible == true { renderPanel() }
     }
     private func recoveryAvailability() -> String {
+        guard recoveryLedger.autoRecoveryEnabled else { return "已关闭" }
+        if let reason = activeProbeStatus.blockReason { return "已暂停 · \(reason)" }
         if localRestartSuppressed(for: channelIncident.activeCategory) {
             return "云端容量异常 · 不重启本机 · 退避复查"
         }
-        guard recoveryLedger.autoRecoveryEnabled else { return "已关闭" }
         if watchdog.recovering { return "恢复中" }
         guard recoveryLedger.canAttempt(at: Date()) else { return "已开启 · 冷却中" }
         guard snapshot.service == "运行中" else { return "已开启 · 等待 Commander 服务" }
@@ -4126,7 +4384,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let old = quotaIsStale(quota, now: Date(), refreshSeconds: quotaRefreshSeconds) ? " · 上次数据已过期" : ""
         switch quota.state {
         case .disconnected: return "未连接 · 连接后读取官方用量"
-        case .connecting: return "请在专用浏览器登录，完成后关闭该窗口"
+        case .connecting: return quotaBrowser.hasOwnedLogin ? "登录成功后点击“完成登录并同步”，关闭专用窗口后后台读取" : "专用资料仍被浏览器占用；请完全退出专用登录窗口后刷新"
         case .refreshing: return "正在刷新额度" + (quota.used == nil ? "" : " · 保留上次成功数据") + old
         case .loginRequired: return "专用浏览器需要登录 · 点击“连接额度账户”或“打开登录窗口”" + old
         case .unavailable: return (quotaFailureReason.map { "同步失败：\($0)" } ?? "额度暂不可用") + (quota.used == nil ? " · 可稍后刷新" : " · 保留上次成功数据") + old
@@ -4143,6 +4401,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         quotaSynced?.stringValue = "最近成功同步：\(prominentStamp(quota.syncedAt))"
         quotaButton?.title = quotaEnabled ? "打开登录窗口" : "连接额度账户"
         quotaButton?.isEnabled = !previewMode && !quotaRequestInFlight && quota.state != .refreshing
+        quotaRefreshButton?.title = quotaBrowser.hasOwnedLogin ? "完成登录并同步" : "刷新"
         quotaRefreshButton?.isEnabled = !previewMode && !quotaRequestInFlight && quota.state != .refreshing
         quotaPauseButton?.isEnabled = !previewMode && quotaEnabled
         if !quotaIntervalMenuOpen { quotaIntervalPicker?.selectItem(at: quotaRefreshOptions.firstIndex(of: quotaRefreshSeconds) ?? 3) }
@@ -4155,7 +4414,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
     private func quotaSection() -> NSView {
         let connect = NSButton(title: quotaEnabled ? "打开登录窗口" : "连接额度账户", target: self, action: #selector(connectQuota)); connect.bezelStyle = .rounded; connect.isEnabled = !previewMode && !quotaRequestInFlight && quota.state != .refreshing
-        let refresh = NSButton(title: "刷新", target: self, action: #selector(manualQuotaRefresh)); refresh.bezelStyle = .rounded; refresh.isEnabled = !previewMode && !quotaRequestInFlight && quota.state != .refreshing
+        let refresh = NSButton(title: quotaBrowser.hasOwnedLogin ? "完成登录并同步" : "刷新", target: self, action: #selector(manualQuotaRefresh)); refresh.bezelStyle = .rounded; refresh.isEnabled = !previewMode && !quotaRequestInFlight && quota.state != .refreshing
         let pause = NSButton(title: "暂停同步", target: self, action: #selector(pauseQuota)); pause.bezelStyle = .rounded; pause.isEnabled = !previewMode && quotaEnabled
         let intervalLabel = label("后台自动同步", size: 12, color: .secondaryLabelColor)
         let interval = NSPopUpButton()
@@ -4220,7 +4479,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }
     }
     @objc private func manualQuotaRefresh() {
+        guard !previewMode, !quotaRequestInFlight, !quotaTerminateWhenIdle else { return }
         guard quotaEnabled else { connectQuota(); return }
+        if quotaBrowser.finishOwnedLogin() { quota.state = .connecting; renderQuota(); return }
         refreshQuota()
     }
     @objc private func pauseQuota() {
@@ -4286,6 +4547,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let chat = chatMonitorSummary(snapshot.timeline)
         let diagnosis = currentDiagnosis()
         var object: [String: Any] = ["chatgpt": ["answer": chat.answer, "update_connection": chat.connection, "recent_issue": chat.history as Any? ?? NSNull(), "coverage": snapshot.timeline.coverage, "delivery_timeout_directly_observable": false, "limitation": chat.deliveryLimit], "service": snapshot.service, "cloud": snapshot.cloud, "last_seen": snapshot.lastSeen.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "checked_at": ISO8601DateFormatter.flex.string(from: snapshot.checked), "error_count": snapshot.errorCount, "paused": paused, "idle_prevention": assertion != 0, "message": snapshot.message, "channel": ["state": snapshot.channelState, "detail": snapshot.channelDetail, "consecutive_no_live": snapshot.channelFailures, "checked_at": snapshot.channelChecked.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "auto_recovery_enabled": recoveryLedger.autoRecoveryEnabled, "last_recovery_attempt": recoveryLedger.lastAttempt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "last_ping_at": lastPingAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "last_ping_result": lastPingResult, "check_deferred_reason": deferredReason, "recovery_status": recoveryAvailability(), "last_recovery_result": lastRecoveryOutcome as Any? ?? NSNull()], "menu": ["menubar_title": item.button?.title ?? "", "menubar_has_icon": item.button?.image != nil, "connection": summaryLines[0].title, "channel": summaryLines[0].title, "tool_execution": summaryLines[1].title, "action": summaryLines[2].title, "recovery": summaryLines[3].title, "chatgpt": summaryLines[4].title, "execution_step_rows": rows, "execution_steps": safeSteps, "tool_call_elapsed_seconds": callElapsed as Any? ?? NSNull(), "tool_call_state": currentState, "recent_actions": snapshot.activity.recent], "activity": ["state": snapshot.activity.state, "tool": CommanderActivity.safeToolIdentifier(snapshot.activity.tool), "active_count": snapshot.activity.activeCount, "observed_at": snapshot.activity.observed.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "recent": snapshot.activity.recent, "error": snapshot.activity.error, "coverage_gap": snapshot.activity.coverageGap, "gap_reason": snapshot.activity.gapReason, "gap_first_at": snapshot.activity.gapFirstAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "gap_last_at": snapshot.activity.gapLastAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "backlog_bytes": snapshot.activity.backlogBytes, "catching_up": snapshot.activity.catchingUp, "pending_line": snapshot.activity.pendingLine, "idle_proven": snapshot.activity.idleProven], "timeline": ["coverage": snapshot.timeline.coverage, "commander_errors_this_run": snapshot.timeline.commanderErrors, "conversation_labels_verified_at": snapshot.timeline.conversationLabelsVerifiedAt as Any? ?? NSNull(), "last_chatgpt_app_event": lastAppEvent, "events": timelineRows]]
+        let probeBudget = activeProbeStatus
+        object["active_probing"] = ["enabled": probeBudget.enabled, "attempts_last_24h": probeBudget.error == nil ? probeBudget.used as Any : NSNull(), "limit": ActiveProbeBudget.limit, "window_seconds": Int(ActiveProbeBudget.window), "blocked_reason": probeBudget.blockReason as Any? ?? NSNull()]
         object["tool_execution"] = ["state": snapshot.toolExecutionState, "detail": snapshot.toolExecutionDetail, "checked_at": snapshot.toolExecutionChecked.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "fresh": toolExecutionFresh(snapshot, now: Date()), "evidence_ttl_seconds": Int(toolExecutionEvidenceTTL), "probe_deferred_reason": toolProbeDeferredReason]
         object["usage_quota"] = ["state": quota.state.rawValue, "used": quota.used as Any? ?? NSNull(), "total": quota.total as Any? ?? NSNull(), "remaining": quota.remaining as Any? ?? NSNull(), "plan": quota.plan.isEmpty ? NSNull() : quota.plan as Any, "month": quota.month.isEmpty ? NSNull() : quota.month as Any, "last_successful_sync": quota.syncedAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "last_error": quotaFailureReason as Any? ?? NSNull(), "refresh_interval_seconds": quotaRefreshSeconds, "backend": "chrome_headless_private_profile"]
         object["channel_incident"] = [
@@ -4312,6 +4575,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         catch { fputs("CommanderGuard: unable to write sanitized status file\n", stderr) }
     }
     @objc private func togglePause() { paused.toggle(); UserDefaults.standard.set(!paused, forKey: "keepAwakeEnabled"); updateGuard(); render() }
+    @objc private func toggleActiveProbing() {
+        let enabled = !activeProbeStatus.enabled
+        guard ActiveProbeBudget.shared.setEnabled(enabled) else { manualCheckBlocked("主动探测设置无法安全保存；设置未改变，无法保存预算时不会发送探测"); return }
+        manualNotice = enabled ? "主动探测已开启：所有自动、手动与恢复后探测共用24小时6次上限" : "主动探测已关闭；已提交的请求可能仍会计费，本机观察与额度同步继续"
+        if !enabled && watchdog.recovering && !recoveryLaunched { abortRecovery("主动探测已关闭；自动恢复已暂停，未开始重启") }
+        else { render() }
+    }
     @objc private func toggleAutoRecovery() {
         var next = recoveryLedger; next.autoRecoveryEnabled.toggle()
         guard next.save(to: recoveryURL) else { manualNotice = "自动恢复设置无法保存；设置未改变"; snapshot.channelDetail = manualNotice!; render(); return }
@@ -4411,16 +4681,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
         let controls = NSStackView(); controls.orientation = .horizontal; controls.alignment = .centerY; controls.spacing = 22
         let recovery = NSButton(checkboxWithTitle: "自动恢复本机 Commander", target: self, action: #selector(toggleAutoRecovery))
-        recovery.toolTip = "自动探测累计 3 次明确断链，且日志完整并确认没有本机任务时，才重启本机 Commander；不会重试原任务或修复云端问题。"
+        recovery.toolTip = "云端主动探测关闭或预算用尽时自动恢复暂停；开启后自动探测累计 3 次明确断链，且日志完整并确认没有本机任务时，才重启本机 Commander；不会重试原任务或修复云端问题。"
         let wake = NSButton(checkboxWithTitle: "防止闲置睡眠（Guard）", target: self, action: #selector(togglePause))
         wake.toolTip = "仅防止系统因闲置而睡眠，不阻止手动睡眠、屏幕息屏或重启。关闭只撤销 Guard 的请求；其他程序仍可能保持唤醒。"
-        let check = NSButton(title: "检查链路", target: self, action: #selector(manualCheck)); check.bezelStyle = .rounded
+        let check = NSButton(title: "手动 ping（1次）", target: self, action: #selector(manualCheck)); check.bezelStyle = .rounded
+        check.toolTip = "需要开启云端主动探测且预算未用尽；此按钮只发送一次 ping，可能消耗一次额度；自动工具检查仍共用预算。"
+        panelManualCheck = check
         [recovery, wake, check].forEach { $0.isEnabled = !previewMode }
         panelRecoveryToggle = recovery; panelWakeToggle = wake
         controls.addArrangedSubview(recovery); controls.addArrangedSubview(wake)
         let spacer = NSView(); spacer.setContentHuggingPriority(.defaultLow, for: .horizontal); controls.addArrangedSubview(spacer)
         controls.addArrangedSubview(check)
         let controlContent = vertical(5)
+        let probeToggle = NSButton(checkboxWithTitle: "云端主动探测（可能消耗额度）", target: self, action: #selector(toggleActiveProbing))
+        probeToggle.toolTip = "默认关闭。开启后常规探测间隔至少10分钟，ping 与 list_sessions、手动及恢复后探测共用滚动24小时最多6次上限；失败也占用一次。关闭阻止新的云端工具请求并暂停自动恢复；已提交的请求可能仍会计费。本机日志观察、云设备状态查询与额度同步继续。不会免费保持云端连接。"
+        probeToggle.isEnabled = !previewMode
+        panelProbeToggle = probeToggle
+        let probeBudget = label("最近24小时主动探测 0/6", size: 12, weight: .semibold)
+        panelProbeBudget = probeBudget
+        controlContent.addArrangedSubview(probeToggle)
+        controlContent.addArrangedSubview(probeBudget)
         controlContent.addArrangedSubview(controls)
         controls.widthAnchor.constraint(equalTo: controlContent.widthAnchor).isActive = true
         let recoveryStatus = label("自动恢复：等待检查", size: 12, weight: .semibold)
@@ -4519,6 +4799,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         panelChatDetail?.stringValue = middleTruncate(chat.connection, limit: 56)
 
 
+        let probeStatus = activeProbeStatus
+        panelProbeToggle?.state = probeStatus.enabled ? .on : .off
+        panelProbeBudget?.stringValue = probeStatus.display
+        panelManualCheck?.isEnabled = !previewMode && probeStatus.blockReason == nil && !manualPingBusy && !channelBusy && !watchdog.recovering
         panelRecoveryToggle?.state = recoveryLedger.autoRecoveryEnabled ? .on : .off
         panelWakeToggle?.state = paused ? .off : .on
         panelRecoveryStatus?.stringValue = "自动恢复：\(middleTruncate(recoveryAvailability(), limit: 85))"
@@ -4855,9 +5139,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         recoveryLedger = ChannelRecoveryLedger()
         snapshot.activity = ActivitySummary(state: "未观察到新调用", idleProven: true)
         snapshot.channelChecked = Date()
-        verify(recoveryAvailability() == "已开启 · 监测中，当前无需恢复", "Healthy checked channel must not claim it is still waiting for its first check")
+        verify(recoveryAvailability() == "已暂停 · 云端主动探测已关闭", "OFF must pause recovery even with healthy channel evidence")
         snapshot.channelChecked = Date().addingTimeInterval(-3600)
-        verify(recoveryAvailability() == "已开启 · 等待下一次通道检查", "Expired channel evidence must remain due for a new check")
+        verify(recoveryAvailability() == "已暂停 · 云端主动探测已关闭", "OFF must pause recovery even with expired channel evidence")
+        snapshot.channelChecked = nil; snapshot.channelState = "启动等待中"
+        pollChannel()
+        verify(snapshot.channelState == "未主动验证" && snapshot.channelDetail.contains("云端主动探测已关闭"), "OFF must not leave an unprobed channel displaying startup wait forever")
         snapshot = savedSnapshot; recoveryLedger = savedRecoveryLedger
         verify(middleTruncate("云端实时服务连接池异常", limit: 12).count <= 12, "small-limit middle truncation overflowed")
         verify(middleTruncate("abcdef", limit: 1) == "…", "single-character truncation must stay bounded")
@@ -4874,6 +5161,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         verify(panelChat?.stringValue == "当前连接正常", "Historical ChatGPT issues must not replace the current healthy state")
         verify(panelSectionCount == 3, "Overview must show status, current task, and compact quota")
         verify(panelControlCard?.isHidden == false && panelRecoveryToggle?.title == "自动恢复本机 Commander" && panelRecoveryToggle?.toolTip?.contains("不会重试原任务") == true, "Recovery control must explain its local-only action and safeguards")
+        verify(panelProbeToggle?.title == "云端主动探测（可能消耗额度）" && panelProbeToggle?.state == .off && panelProbeBudget?.stringValue == "最近24小时主动探测 0/6" && panelManualCheck?.isEnabled == false, "Probe switch must default OFF and show its rolling budget")
         verify(panelWakeToggle?.title == "防止闲置睡眠（Guard）" && panelWakeToggle?.toolTip?.contains("其他程序仍可能保持唤醒") == true && panelWakeStatus?.stringValue.contains("保持唤醒：") == true, "Wake control must describe its actual assertion and limits")
         verify(quotaProgress?.isHidden == false && quotaSynced?.stringValue.range(of: #"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}"#, options: .regularExpression) != nil, "Quota card must show finite progress and prominent last successful sync")
         if let menu = quotaIntervalPicker?.menu {
@@ -4944,6 +5232,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 }
 
 if CommandLine.arguments.contains("--self-test") { selfTest() }
+else if CommandLine.arguments.contains("--active-probe-status") {
+    let status = ActiveProbeBudget.shared.status()
+    print("enabled=\(status.enabled) · \(status.display)")
+    exit(status.error == nil ? 0 : 1)
+}
 else if CommandLine.arguments.contains("--preview-ui") {
     let app = NSApplication.shared
     app.setActivationPolicy(.regular)
