@@ -493,7 +493,7 @@ final class HeadlessQuotaBrowser {
       if (location.origin !== "https://mcp.desktopcommander.app" || location.pathname !== "/usage") return "login";
       const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), 12000);
       try {
-        const response = await fetch("https://auth.desktopcommander.app/auth/billing/usage", {credentials:"include",redirect:"error",signal:controller.signal});
+        const response = await fetch("https://auth.desktopcommander.app/auth/billing/usage", {credentials:"include",redirect:"error",cache:"no-store",signal:controller.signal});
         if (response.status === 401 || response.status === 403) return "login";
         if (!response.ok) return "http-" + response.status;
         if (Number(response.headers.get("content-length") || 0) > 262144 || !response.body) return "invalid-response";
@@ -1383,8 +1383,10 @@ func toolExecutionFresh(_ snapshot: Snapshot, now: Date, maxAge: TimeInterval = 
     return age >= 0 && age <= maxAge
 }
 
-func recoveryConfirmed(oldPID: Int32, newPID: Int32?, probe: ChannelProbeResult) -> Bool {
-    guard let newPID, newPID != oldPID else { return false }
+func actualProbeTimestamp(submitted: Bool, at date: Date) -> String? { submitted ? ISO8601DateFormatter.flex.string(from: date) : nil }
+
+func recoveryConfirmed(oldPID: Int32, newPID: Int32?, currentPID: Int32?, oldProcessExited: Bool, probe: ChannelProbeResult) -> Bool {
+    guard let newPID, oldPID > 0, newPID > 0, newPID != oldPID, currentPID == newPID, oldProcessExited else { return false }
     if case .healthy = probe { return true }
     return false
 }
@@ -2468,7 +2470,7 @@ struct ChannelWatchdogState {
     var detail = "等待 Commander 与日志完成启动"
     var recovering = false
 
-    func isDue(now: Date) -> Bool { now.timeIntervalSince(startedAt) >= 90 && now.timeIntervalSince(lastProbe) >= 600 && !recovering }
+    func isDue(now: Date, intervalSeconds: Int = ActiveProbeBudget.defaultIntervalSeconds) -> Bool { now.timeIntervalSince(startedAt) >= 90 && now.timeIntervalSince(lastProbe) >= TimeInterval(intervalSeconds) && !recovering }
     mutating func observed(_ result: ChannelProbeResult, now: Date) {
         switch result {
         case .healthy:
@@ -2514,23 +2516,51 @@ struct ChannelRecoveryLedger: Codable {
     }
 }
 
+func prominentStamp(_ date: Date?) -> String { date.map { let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd HH:mm:ss"; return f.string(from: $0) } ?? "暂无" }
+
 /// Shared by every Guard tools/call path, including command-line and recovery probes.
 /// Reserve before submission: failures/timeouts still consume a slot; denied requests do not.
 final class ActiveProbeBudget {
-    static let limit = 6
-    static let window: TimeInterval = 24 * 60 * 60
+    static let intervalOptions = [300, 600, 900, 1800, 3600, 7200, 10800, 21600]
+    static let intervalTitles = intervalOptions.map { seconds in seconds < 3600 ? "每 \(seconds / 60) 分钟" : seconds == 3600 ? "每小时" : "每 \(seconds / 3600) 小时" }
+    static let defaultIntervalSeconds = 3600
+    static let defaultIntervalIndex = intervalOptions.firstIndex(of: defaultIntervalSeconds)!
     static let shared = ActiveProbeBudget(directory: FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/CommanderGuard"))
     struct State: Codable {
-        var version = 1
+        var version = 2
         var enabled = false
-        var attempts: [Double] = []
+        var intervalSeconds = ActiveProbeBudget.defaultIntervalSeconds
+        var lastSubmittedAt: Double?
+    }
+    private struct LegacyState: Decodable {
+        let version: Int
+        let enabled: Bool
+        let attempts: [Double]
     }
     struct Status {
         let enabled: Bool
-        let used: Int
+        let intervalSeconds: Int
+        let lastSubmittedAt: Date?
+        let now: Date
         let error: String?
-        var blockReason: String? { error ?? (!enabled ? "云端主动探测已关闭" : (used >= ActiveProbeBudget.limit ? "最近24小时主动探测已达6次上限" : nil)) }
-        var display: String { "最近24小时主动探测 \(error == nil ? String(used) : "未知")/6" + (error.map { " · \($0)" } ?? "") }
+        var permissionBlockReason: String? { error ?? (!enabled ? "云端主动探测已关闭" : nil) }
+        var nextAllowedAt: Date? { lastSubmittedAt?.addingTimeInterval(TimeInterval(intervalSeconds)) }
+        var blockReason: String? {
+            permissionBlockReason ?? nextAllowedAt.flatMap { $0 > now ? "探测间隔未到；下次可检查：\(prominentStamp($0))" : nil }
+        }
+        var dailyEstimate: Int { 86400 / intervalSeconds }
+        var intervalTitle: String { ActiveProbeBudget.intervalOptions.firstIndex(of: intervalSeconds).map { ActiveProbeBudget.intervalTitles[$0] } ?? "未知频率" }
+        var display: String {
+            let detail: String
+            if let error { detail = error }
+            else if !enabled { detail = "已关闭" }
+            else if let nextAllowedAt, nextAllowedAt > now { detail = "下次：\(prominentStamp(nextAllowedAt))" }
+            else { detail = "现在可检查" }
+            return "\(intervalTitle) · 按此频率约\(dailyEstimate)次/天 · \(detail)"
+        }
+    }
+    private func status(_ state: State, now: Date) -> Status {
+        Status(enabled: state.enabled, intervalSeconds: state.intervalSeconds, lastSubmittedAt: state.lastSubmittedAt.map(Date.init(timeIntervalSince1970:)), now: now, error: nil)
     }
     private let directory: URL
     private let localLock = NSLock()
@@ -2541,12 +2571,17 @@ final class ActiveProbeBudget {
             let fd = try openDirectory(createIfMissing: false); defer { close(fd) }
             // Atomic replacement gives readers a complete snapshot; admission reloads under the lock.
             let state = try load(fd, now: now)
-            return Status(enabled: state.enabled, used: state.attempts.count, error: nil)
-        } catch Failure.missingDirectory { return Status(enabled: false, used: 0, error: nil) }
-        catch { return Status(enabled: false, used: 0, error: "探测预算记录不可用；已暂停") }
+            return status(state, now: now)
+        } catch Failure.missingDirectory { return Status(enabled: false, intervalSeconds: Self.defaultIntervalSeconds, lastSubmittedAt: nil, now: now, error: nil) }
+        catch { return Status(enabled: false, intervalSeconds: Self.defaultIntervalSeconds, lastSubmittedAt: nil, now: now, error: "探测记录不可用；已暂停") }
     }
     func setEnabled(_ enabled: Bool, now: Date = Date()) -> Bool {
         do { return try locked { fd in var state = try load(fd, now: now); state.enabled = enabled; try save(state, fd); return true } }
+        catch { return false }
+    }
+    func setIntervalSeconds(_ seconds: Int, now: Date = Date()) -> Bool {
+        guard Self.intervalOptions.contains(seconds) else { return false }
+        do { return try locked { fd in var state = try load(fd, now: now); state.intervalSeconds = seconds; try save(state, fd); return true } }
         catch { return false }
     }
     /// Keep the cross-process lock until the request is submitted, so OFF cannot race admission.
@@ -2554,14 +2589,14 @@ final class ActiveProbeBudget {
         do {
             return try locked { fd in
                 var state = try load(fd, now: now)
-                let status = Status(enabled: state.enabled, used: state.attempts.count, error: nil)
+                let status = status(state, now: now)
                 if let reason = status.blockReason { return reason }
-                state.attempts.append(now.timeIntervalSince1970)
+                state.lastSubmittedAt = now.timeIntervalSince1970
                 try save(state, fd)
                 request()
                 return nil
             }
-        } catch { return "探测预算无法安全保存；未发送请求" }
+        } catch { return "探测记录无法安全保存；未发送请求" }
     }
     private enum Failure: Error { case unsafeStorage, missingDirectory }
     private func locked<T>(_ body: (Int32) throws -> T) throws -> T {
@@ -2611,12 +2646,22 @@ final class ActiveProbeBudget {
         guard safeFile(fd) else { throw Failure.unsafeStorage }
         var bytes = [UInt8](repeating: 0, count: 4097)
         let count = read(fd, &bytes, bytes.count)
-        guard count > 0, count <= 4096,
-              var state = try? JSONDecoder().decode(State.self, from: Data(bytes.prefix(count))),
-              state.version == 1, state.attempts.count <= Self.limit,
-              now.timeIntervalSince1970.isFinite,
-              state.attempts.allSatisfy({ $0.isFinite && $0 >= 0 && $0 <= now.timeIntervalSince1970 }) else { throw Failure.unsafeStorage }
-        state.attempts.removeAll { now.timeIntervalSince1970 - $0 >= Self.window }
+        guard count > 0, count <= 4096, now.timeIntervalSince1970.isFinite, now.timeIntervalSince1970 >= 0 else { throw Failure.unsafeStorage }
+        let data = Data(bytes.prefix(count))
+        struct Version: Decodable { let version: Int }
+        guard let version = try? JSONDecoder().decode(Version.self, from: data) else { throw Failure.unsafeStorage }
+        let state: State
+        if version.version == 1 {
+            guard let legacy = try? JSONDecoder().decode(LegacyState.self, from: data), legacy.attempts.count <= 6,
+                  legacy.attempts.allSatisfy({ $0.isFinite && $0 >= 0 && $0 <= now.timeIntervalSince1970 }) else { throw Failure.unsafeStorage }
+            // Raising the old six-call limit requires a new opt-in; preserve its latest reservation.
+            state = State(lastSubmittedAt: legacy.attempts.max())
+        } else {
+            guard version.version == 2, let decoded = try? JSONDecoder().decode(State.self, from: data) else { throw Failure.unsafeStorage }
+            state = decoded
+        }
+        guard Self.intervalOptions.contains(state.intervalSeconds),
+              state.lastSubmittedAt.map({ $0.isFinite && $0 >= 0 && $0 <= now.timeIntervalSince1970 }) ?? true else { throw Failure.unsafeStorage }
         return state
     }
     private func save(_ state: State, _ directoryFD: Int32) throws {
@@ -2646,9 +2691,10 @@ final class MCPChannelProbe: NSObject, URLSessionDataDelegate, URLSessionTaskDel
     private var http: HTTPURLResponse?
     private var requestID = UUID().uuidString
     private var deviceID = ""
+    private(set) var submitted = false
 
     func run(budget: ActiveProbeBudget = .shared, _ done: @escaping (ChannelProbeResult) -> Void) {
-        completion = done
+        completion = done; submitted = false
         if let reason = budget.status().blockReason { finish(.unknown(reason)); return }
         let file = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".desktop-commander-device/device.json")
         guard let data = try? Data(contentsOf: file), let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
@@ -2667,7 +2713,7 @@ final class MCPChannelProbe: NSObject, URLSessionDataDelegate, URLSessionTaskDel
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = 8; configuration.timeoutIntervalForResource = 10
         session = URLSession(configuration: configuration, delegate: self, delegateQueue: OperationQueue())
-        if let reason = budget.submit({ session.dataTask(with: request).resume() }) { finish(.unknown(reason)) }
+        if let reason = budget.submit({ self.submitted = true; self.session.dataTask(with: request).resume() }) { finish(.unknown(reason)) }
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) { completionHandler(nil) }
@@ -2745,9 +2791,10 @@ final class MCPToolExecutionProbe: NSObject, URLSessionDataDelegate, URLSessionT
     private var http: HTTPURLResponse?
     private var requestID = UUID().uuidString
     private var deviceID = ""
+    private(set) var submitted = false
 
     func run(budget: ActiveProbeBudget = .shared, _ done: @escaping (ToolExecutionProbeResult) -> Void) {
-        completion = done
+        completion = done; submitted = false
         if let reason = budget.status().blockReason { finish(.unknown(reason)); return }
         let file = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".desktop-commander-device/device.json")
         guard let data = try? Data(contentsOf: file), let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
@@ -2766,7 +2813,7 @@ final class MCPToolExecutionProbe: NSObject, URLSessionDataDelegate, URLSessionT
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = 8; configuration.timeoutIntervalForResource = 10
         session = URLSession(configuration: configuration, delegate: self, delegateQueue: OperationQueue())
-        if let reason = budget.submit({ session.dataTask(with: request).resume() }) { finish(.unknown(reason)) }
+        if let reason = budget.submit({ self.submitted = true; self.session.dataTask(with: request).resume() }) { finish(.unknown(reason)) }
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) { completionHandler(nil) }
@@ -2946,47 +2993,67 @@ private func selfTestActiveProbeBudget(dir: URL, now: Date) {
     let directory = physicalDir.appendingPathComponent("active-budget")
     let budget = ActiveProbeBudget(directory: directory)
     var submitted = 0
-    precondition(budget.status(now: now).error == nil && !budget.status(now: now).enabled && budget.status(now: now).used == 0)
+    let expectedSubmissions = ActiveProbeBudget.intervalOptions.count * 2
+    var lastSubmittedAt = now
+    precondition(ActiveProbeBudget.intervalOptions == [300, 600, 900, 1800, 3600, 7200, 10800, 21600])
+    precondition(ActiveProbeBudget.intervalTitles == ["每 5 分钟", "每 10 分钟", "每 15 分钟", "每 30 分钟", "每小时", "每 2 小时", "每 3 小时", "每 6 小时"])
+    precondition(ActiveProbeBudget.intervalOptions[ActiveProbeBudget.defaultIntervalIndex] == ActiveProbeBudget.defaultIntervalSeconds)
+    precondition(!budget.status(now: now).enabled && budget.status(now: now).intervalSeconds == 3600 && budget.status(now: now).lastSubmittedAt == nil)
     precondition(budget.submit(now: now, { submitted += 1 }) != nil && submitted == 0)
-    // Both actual probe entry points fail before reading credentials or making requests when OFF.
+    precondition(budget.setIntervalSeconds(600, now: now) && !budget.status(now: now).enabled, "Changing frequency must not grant permission")
+    // OFF and cadence denial happen before loading real credentials or sending a request.
+    let ping = MCPChannelProbe(), tool = MCPToolExecutionProbe()
     var pingDenied = false, toolDenied = false
-    MCPChannelProbe().run(budget: budget) { if case .unknown(let reason) = $0 { pingDenied = reason == "云端主动探测已关闭" } }
-    MCPToolExecutionProbe().run(budget: budget) { if case .unknown(let reason) = $0 { toolDenied = reason == "云端主动探测已关闭" } }
-    precondition(pingDenied && toolDenied && budget.status(now: now).used == 0)
+    ping.run(budget: budget) { if case .unknown(let reason) = $0 { pingDenied = reason == "云端主动探测已关闭" } }
+    tool.run(budget: budget) { if case .unknown(let reason) = $0 { toolDenied = reason == "云端主动探测已关闭" } }
+    precondition(pingDenied && toolDenied && !ping.submitted && !tool.submitted)
     precondition(budget.setEnabled(true, now: now))
-    for index in 1...6 {
+    for (index, interval) in ActiveProbeBudget.intervalOptions.enumerated() {
+        let moment = now.addingTimeInterval(Double(index * 50000))
+        precondition(budget.setIntervalSeconds(interval, now: moment))
+        precondition(budget.submit(now: moment, { submitted += 1 }) == nil)
         let reopened = ActiveProbeBudget(directory: directory)
-        precondition(reopened.submit(now: now, { submitted += 1 }) == nil)
-        precondition(budget.status(now: now).used == index)
+        let status = reopened.status(now: moment)
+        precondition(status.lastSubmittedAt == moment && status.nextAllowedAt == moment.addingTimeInterval(Double(interval)))
+        precondition(status.permissionBlockReason == nil && status.blockReason != nil, "Cadence must not revoke recovery permission")
+        precondition(status.dailyEstimate == [288, 144, 96, 48, 24, 12, 8, 4][index] && status.intervalTitle == ActiveProbeBudget.intervalTitles[index])
+        precondition(reopened.submit(now: moment.addingTimeInterval(Double(interval - 1)), { submitted += 1 }) != nil)
+        precondition(budget.setEnabled(false, now: moment) && budget.setEnabled(true, now: moment))
+        precondition(budget.submit(now: moment, { submitted += 1 }) != nil)
+        lastSubmittedAt = moment.addingTimeInterval(Double(interval))
+        precondition(budget.submit(now: lastSubmittedAt, { submitted += 1 }) == nil)
     }
-    precondition(budget.submit(now: now, { submitted += 1 }) != nil && submitted == 6)
-    precondition(budget.setEnabled(false, now: now) && budget.setEnabled(true, now: now))
-    precondition(budget.status(now: now).used == 6, "Switching and reopening must not reset the rolling budget")
-    let beforeExpiry = now.addingTimeInterval(ActiveProbeBudget.window - 1)
-    precondition(budget.submit(now: beforeExpiry, { submitted += 1 }) != nil)
-    let expiry = now.addingTimeInterval(ActiveProbeBudget.window)
-    precondition(budget.submit(now: expiry, { submitted += 1 }) == nil && budget.status(now: expiry).used == 1)
+    precondition(submitted == expectedSubmissions)
+    let expiry = now.addingTimeInterval(Double(ActiveProbeBudget.intervalOptions.count * 50000))
+    precondition(!budget.setIntervalSeconds(60, now: expiry))
+    precondition(budget.setIntervalSeconds(600, now: expiry) && budget.status(now: expiry).lastSubmittedAt == lastSubmittedAt)
     precondition(budget.status(now: now).error != nil, "A backwards clock must fail closed")
     let ledger = directory.appendingPathComponent("active-probe-budget.json")
     try! Data("invalid".utf8).write(to: ledger)
     precondition(budget.status(now: expiry).error != nil && !budget.setEnabled(true, now: expiry))
-    precondition(budget.submit(now: expiry, { submitted += 1 }) != nil && submitted == 7)
+    precondition(budget.submit(now: expiry, { submitted += 1 }) != nil && submitted == expectedSubmissions)
+    // Safe legacy state requires a new opt-in and keeps its last submitted timestamp.
+    let legacy = "{\"version\":1,\"enabled\":true,\"attempts\":[\(expiry.timeIntervalSince1970)]}"
+    try! Data(legacy.utf8).write(to: ledger)
+    precondition(!budget.status(now: expiry).enabled && budget.status(now: expiry).lastSubmittedAt == expiry)
+    precondition(budget.setEnabled(true, now: expiry) && budget.status(now: expiry).blockReason != nil)
+    for invalid in ["{\"version\":3,\"enabled\":true,\"intervalSeconds\":600}", "{\"version\":2,\"enabled\":true,\"intervalSeconds\":60}", "{\"version\":2,\"enabled\":true,\"intervalSeconds\":600,\"lastSubmittedAt\":\(expiry.timeIntervalSince1970 + 1)}"] {
+        try! Data(invalid.utf8).write(to: ledger)
+        precondition(budget.status(now: expiry).error != nil && budget.submit(now: expiry, { submitted += 1 }) != nil)
+    }
     try! FileManager.default.removeItem(at: ledger)
     try! FileManager.default.createSymbolicLink(atPath: ledger.path, withDestinationPath: dir.appendingPathComponent("missing").path)
     precondition(budget.status(now: expiry).error != nil && budget.submit(now: expiry, { submitted += 1 }) != nil)
     let linkedDirectory = physicalDir.appendingPathComponent("linked-budget")
     try! FileManager.default.createSymbolicLink(at: linkedDirectory, withDestinationURL: directory)
     precondition(ActiveProbeBudget(directory: linkedDirectory).status(now: expiry).error != nil)
-
     let failingDirectory = physicalDir.appendingPathComponent("cannot-persist")
     let failing = ActiveProbeBudget(directory: failingDirectory)
     precondition(failing.setEnabled(true, now: now))
     precondition(chmod(failingDirectory.path, 0o500) == 0)
-    precondition(failing.submit(now: now, { submitted += 1 }) != nil && submitted == 7)
-    precondition(failing.status(now: now).used == 0, "A failed reservation must not consume a slot")
+    precondition(failing.submit(now: now, { submitted += 1 }) != nil && submitted == expectedSubmissions)
+    precondition(failing.status(now: now).lastSubmittedAt == nil, "Failed persistence must not reserve or send")
     precondition(chmod(failingDirectory.path, 0o700) == 0)
-
-    // Separate budget instances model simultaneous processes sharing one persistent lock/ledger.
     let concurrentDirectory = physicalDir.appendingPathComponent("concurrent-budget")
     precondition(ActiveProbeBudget(directory: concurrentDirectory).setEnabled(true, now: now))
     let countLock = NSLock()
@@ -2996,7 +3063,17 @@ private func selfTestActiveProbeBudget(dir: URL, now: Date) {
             countLock.lock(); concurrentSubmissions += 1; countLock.unlock()
         }
     }
-    precondition(concurrentSubmissions == 6 && ActiveProbeBudget(directory: concurrentDirectory).status(now: now).used == 6)
+    precondition(concurrentSubmissions == 1 && ActiveProbeBudget(directory: concurrentDirectory).status(now: now).lastSubmittedAt == now)
+    // Actual entry points reject timing before credential reads; this ledger is isolated.
+    let waiting = ActiveProbeBudget(directory: physicalDir.appendingPathComponent("waiting-budget"))
+    let liveNow = Date()
+    precondition(waiting.setEnabled(true, now: liveNow) && waiting.submit(now: liveNow, {}) == nil)
+    let waitingPing = MCPChannelProbe(), waitingTool = MCPToolExecutionProbe()
+    var pingTimingDenied = false, toolTimingDenied = false
+    waitingPing.run(budget: waiting) { if case .unknown(let reason) = $0 { pingTimingDenied = reason.contains("探测间隔未到") } }
+    waitingTool.run(budget: waiting) { if case .unknown(let reason) = $0 { toolTimingDenied = reason.contains("探测间隔未到") } }
+    precondition(pingTimingDenied && toolTimingDenied && !waitingPing.submitted && !waitingTool.submitted)
+
 }
 
 func selfTest() {
@@ -3064,10 +3141,11 @@ func selfTest() {
     let timeoutError = NSError(domain: NSURLErrorDomain, code: NSURLErrorTimedOut)
     precondition(toolProbeKind(MCPToolExecutionProbe.transportFailure(error: timeoutError, statusCode: nil)!) == 2)
     precondition(MCPToolExecutionProbe.transportFailure(error: nil, statusCode: 200) == nil)
+    precondition(actualProbeTimestamp(submitted: false, at: now) == nil && actualProbeTimestamp(submitted: true, at: now) == ISO8601DateFormatter.flex.string(from: now))
     var watchdogTest = ChannelWatchdogState(startedAt: now)
     precondition(!watchdogTest.isDue(now: now.addingTimeInterval(89)) && watchdogTest.isDue(now: now.addingTimeInterval(90)))
     watchdogTest.lastProbe = now.addingTimeInterval(90)
-    precondition(!watchdogTest.isDue(now: now.addingTimeInterval(689)) && watchdogTest.isDue(now: now.addingTimeInterval(690)))
+    precondition(!watchdogTest.isDue(now: now.addingTimeInterval(689), intervalSeconds: 600) && watchdogTest.isDue(now: now.addingTimeInterval(690), intervalSeconds: 600))
     for n in 1...3 { watchdogTest.observed(.noLiveConnection, now: now.addingTimeInterval(Double(90 + n * 30))); precondition(watchdogTest.failures == n) }
     watchdogTest.observed(.unknown("网络未知"), now: now.addingTimeInterval(200)); precondition(watchdogTest.failures == 3, "Unknown probes must preserve explicit disconnect history")
     watchdogTest.observed(.healthy, now: now.addingTimeInterval(230)); precondition(watchdogTest.failures == 0 && watchdogTest.status == "通道畅通")
@@ -3080,10 +3158,12 @@ func selfTest() {
     watchdogTest.observedManual(.healthy, now: now); precondition(watchdogTest.failures == 0 && watchdogTest.status == "通道畅通")
     var ledgerTest = ChannelRecoveryLedger(); ledgerTest.recordAttempt(at: now)
     precondition(!ledgerTest.canAttempt(at: now.addingTimeInterval(299)) && ledgerTest.canAttempt(at: now.addingTimeInterval(300)))
-    precondition(!recoveryConfirmed(oldPID: 100, newPID: nil, probe: .healthy))
-    precondition(!recoveryConfirmed(oldPID: 100, newPID: 100, probe: .healthy))
-    precondition(!recoveryConfirmed(oldPID: 100, newPID: 101, probe: .unknown("未知")))
-    precondition(recoveryConfirmed(oldPID: 100, newPID: 101, probe: .healthy))
+    precondition(!recoveryConfirmed(oldPID: 100, newPID: nil, currentPID: nil, oldProcessExited: true, probe: .healthy))
+    precondition(!recoveryConfirmed(oldPID: 100, newPID: 100, currentPID: 100, oldProcessExited: true, probe: .healthy))
+    precondition(!recoveryConfirmed(oldPID: 100, newPID: 101, currentPID: 101, oldProcessExited: true, probe: .unknown("未知")))
+    precondition(recoveryConfirmed(oldPID: 100, newPID: 101, currentPID: 101, oldProcessExited: true, probe: .healthy))
+    precondition(!recoveryConfirmed(oldPID: 100, newPID: 101, currentPID: 102, oldProcessExited: true, probe: .healthy))
+    precondition(!recoveryConfirmed(oldPID: 100, newPID: 101, currentPID: 101, oldProcessExited: false, probe: .healthy))
     precondition(activitySafeForRecovery(ActivitySummary(state: "未观察到新调用", idleProven: true)))
     precondition(!activitySafeForRecovery(ActivitySummary(state: "未观察到新调用", coverageGap: true)))
     precondition(callState(ActivitySummary(state: "未观察到新调用", coverageGap: true)) == "状态未确认")
@@ -3750,8 +3830,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private var lastRecoveryOutcome: String?
     private var manualNotice: String?
     private var manualPingBusy = false
-    private var toolProbeBusy = false
-    private var lastToolProbeAttempt = Date.distantPast
     private var toolProbeDeferredReason = "等待首次工具检查"
     private var lastActivityPoll = Date.distantPast
     private var recoveryLaunched = false
@@ -3776,6 +3854,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private var panelChatDetail: NSTextField?
     private var panelProbeToggle: NSButton?
     private var panelProbeBudget: NSTextField?
+    private var panelProbeIntervalPicker: NSPopUpButton?
+    private var probeIntervalMenuOpen = false
     private var panelManualCheck: NSButton?
     private var panelRecoveryToggle: NSButton?
     private var panelRecoveryStatus: NSTextField?
@@ -3793,6 +3873,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private let toolHistoryReader = ToolHistoryReader()
     private var lastToolHistoryPoll = Date.distantPast
     private var verifiedRestart: (old: Int32, new: Int32)?
+    private var pendingRecoveryVerification: (old: Int32, new: Int32)?
     private let timelineReader = TimelineReader()
     private var activityBusy = false
     private var activityTimer: Timer?
@@ -3887,6 +3968,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         render()
     }
     private func auditChannel(kind: String, result: String, action: String? = nil, at: Date = Date()) {
+        guard !previewMode else { return }
         let record = ChannelDecisionRecord(at: at, kind: kind, result: result,
                                            category: channelIncident.activeCategory?.rawValue ?? channelIncident.recentCategory?.rawValue,
                                            explicitDisconnects: watchdog.failures, action: action)
@@ -3894,6 +3976,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     private func saveChannelIncident() {
+        guard !previewMode else { return }
         _ = channelIncident.save(to: channelIncidentURL)
     }
 
@@ -3970,7 +4053,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     private var activeProbeStatus: ActiveProbeBudget.Status {
-        previewMode ? ActiveProbeBudget.Status(enabled: false, used: 0, error: nil) : ActiveProbeBudget.shared.status()
+        previewMode ? ActiveProbeBudget.Status(enabled: false, intervalSeconds: ActiveProbeBudget.defaultIntervalSeconds, lastSubmittedAt: nil, now: Date(), error: nil) : ActiveProbeBudget.shared.status()
     }
     private func pollChannel() {
         let now = Date()
@@ -3983,18 +4066,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             return
         }
         guard !channelBusy, !manualPingBusy, !watchdog.recovering else { return }
-        let due = channelIncident.activeCategory != nil ? channelIncident.recheckDue(now: now) : watchdog.isDue(now: now)
+        let due = channelIncident.activeCategory != nil ? channelIncident.recheckDue(now: now) : watchdog.isDue(now: now, intervalSeconds: activeProbeStatus.intervalSeconds)
         guard due else { return }
         watchdog.lastProbe = now
         guard snapshot.service == "运行中" else { recordDeferred("Commander 服务未运行"); return }
         channelBusy = true
         deferredReason = channelIncident.activeCategory == nil ? "正在检查" : "正在复查持续通道异常"
         render()
-        MCPChannelProbe().run { result in
+        let probe = MCPChannelProbe()
+        probe.run { result in
             DispatchQueue.main.async {
                 self.channelBusy = false
                 let checkedAt = Date()
-                self.recordProbe(result, now: checkedAt)
+                self.recordProbe(result, now: checkedAt, submitted: probe.submitted)
                 if case .noLiveConnection = result, self.watchdog.failures >= 3 {
                     if localRestartSuppressed(for: self.channelIncident.activeCategory) {
                         self.auditChannel(kind: "recovery_decision", result: "restart_suppressed_cloud_capacity",
@@ -4009,7 +4093,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }
     }
 
-    private func recordProbe(_ result: ChannelProbeResult, now: Date, manual: Bool = false) {
+    private func recordProbe(_ result: ChannelProbeResult, now: Date, manual: Bool = false, submitted: Bool = true) {
+        guard submitted else {
+            recordDeferred(probeDescription(result)); return
+        }
+        if case .healthy = result, let pending = pendingRecoveryVerification {
+            verifyPendingRecovery(now: now, currentPID: servicePID(), oldProcessExited: kill(pending.old, 0) == -1 && errno == ESRCH)
+        }
         lastPingAt = now; lastPingResult = probeDescription(result); deferredReason = "未延后"
         manualNotice = nil
         if manual { watchdog.observedManual(result, now: now) }
@@ -4037,6 +4127,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         render()
     }
 
+    private func verifyPendingRecovery(now: Date, currentPID: Int32?, oldProcessExited: Bool) {
+        guard let pending = pendingRecoveryVerification else { return }
+        if recoveryConfirmed(oldPID: pending.old, newPID: pending.new, currentPID: currentPID, oldProcessExited: oldProcessExited, probe: .healthy) {
+            lastRecoveryOutcome = "服务 PID 已变化，后续实际 ping 成功"
+            verifiedRestart = pending
+            pendingRecoveryVerification = nil
+            auditChannel(kind: "recovery", result: "restart_confirmed", action: "channel_recovered", at: now)
+            if !previewMode { pollActivity() }
+        } else if let currentPID, currentPID != pending.new {
+            pendingRecoveryVerification = nil
+        }
+    }
     private func recordDeferred(_ reason: String) {
         let now = Date()
         deferredReason = reason; manualNotice = nil
@@ -4061,57 +4163,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         toolProbeDeferredReason = "无需额外探测"
     }
     private func pollToolExecution() {
-        let now = Date()
-        guard !previewMode, !toolProbeBusy, !watchdog.recovering else { return }
-        refreshToolExecutionFromActivity(snapshot.activity, now: now)
-        if toolExecutionFresh(snapshot, now: now) { return }
-        if let reason = activeProbeStatus.blockReason { toolProbeDeferredReason = reason; return }
-        guard now.timeIntervalSince(lastToolProbeAttempt) >= 600 else { return }
-        guard snapshot.service == "运行中" else { toolProbeDeferredReason = "Commander 服务未运行"; return }
-        guard channelIndicator(service: snapshot.service, state: snapshot.channelState, checked: snapshot.channelChecked, now: now) == "●" else {
-            toolProbeDeferredReason = "消息通道尚未确认"; return
-        }
-        guard activitySafeForRecovery(snapshot.activity), !activityBusy else {
-            toolProbeDeferredReason = activityDeferralReason(snapshot.activity); return
-        }
-        startToolExecutionProbe(manual: false)
-    }
-    private func startToolExecutionProbe(manual: Bool) {
-        let now = Date()
-        if let reason = activeProbeStatus.blockReason { toolProbeDeferredReason = reason; if manual { manualCheckBlocked(reason) }; return }
-        guard !toolProbeBusy else { if manual { manualNotice = "工具执行检查已在进行"; render() }; return }
-        refreshToolExecutionFromActivity(snapshot.activity, now: now)
-        if toolExecutionFresh(snapshot, now: now) {
-            if manual { manualNotice = "通道已检查；工具执行由最近真实调用验证"; render() }
-            return
-        }
-        guard snapshot.service == "运行中" else { toolProbeDeferredReason = "Commander 服务未运行"; if manual { manualNotice = "工具检查暂缓：Commander 服务未运行"; render() }; return }
-        guard activitySafeForRecovery(snapshot.activity), !activityBusy else {
-            let reason = activityDeferralReason(snapshot.activity); toolProbeDeferredReason = reason
-            if manual { manualNotice = "通道已检查；工具检查暂缓：\(reason)"; render() }
-            return
-        }
-        lastToolProbeAttempt = now; toolProbeBusy = true; toolProbeDeferredReason = "正在执行只读工具检查"; render()
-        MCPToolExecutionProbe().run { result in
-            DispatchQueue.main.async {
-                self.toolProbeBusy = false
-                self.recordToolExecution(result, now: Date())
-                if manual { self.manualNotice = "通道已检查；\(self.toolExecutionSummary(now: Date()))"; self.render() }
-            }
-        }
-    }
-    private func recordToolExecution(_ result: ToolExecutionProbeResult, now: Date) {
-        snapshot.toolExecutionChecked = now
-        switch result {
-        case .verified:
-            snapshot.toolExecutionState = "已验证"; snapshot.toolExecutionDetail = "只读 list_sessions 已经本机工具层执行"
-        case .failed(let reason):
-            snapshot.toolExecutionState = "失败"; snapshot.toolExecutionDetail = reason
-        case .unknown(let reason):
-            snapshot.toolExecutionState = "未知"; snapshot.toolExecutionDetail = reason
-        }
-        toolProbeDeferredReason = "未延后"
-        render()
+        guard !previewMode else { return }
+        refreshToolExecutionFromActivity(snapshot.activity)
+        if !toolExecutionFresh(snapshot, now: Date()) { toolProbeDeferredReason = "等待真实工具调用成功记录；不自动发送额外工具请求" }
     }
     private func toolExecutionSummary(now: Date) -> String {
         if snapshot.toolExecutionState == "已验证" && !toolExecutionFresh(snapshot, now: now) { return "工具执行待复查" }
@@ -4132,18 +4186,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         guard channelIncident.activeCategory != nil || Date().timeIntervalSince(watchdog.startedAt) >= 90 else { manualCheckBlocked("启动等待中，暂不能手动检查"); return }
         guard snapshot.service == "运行中" else { manualCheckBlocked("Commander 服务未运行"); return }
         manualNotice = nil; manualPingBusy = true; deferredReason = "手动检查进行中"; render()
-        MCPChannelProbe().run { result in
+        let probe = MCPChannelProbe()
+        probe.run { result in
             DispatchQueue.main.async {
                 self.manualPingBusy = false
-                self.recordProbe(result, now: Date(), manual: true)
-                self.manualNotice = "手动检查已完成：一次 ping；\(self.probeDescription(result))"; self.render()
+                self.recordProbe(result, now: Date(), manual: true, submitted: probe.submitted)
+                self.manualNotice = probe.submitted ? "手动检查已完成：一次 ping；\(self.probeDescription(result))" : "未发送 ping：\(self.probeDescription(result))"; self.render()
             }
         }
     }
     private func manualCheckBlocked(_ reason: String) { manualNotice = reason; render() }
     private func considerRecovery() {
         let now = Date()
-        if let reason = activeProbeStatus.blockReason { snapshot.channelDetail = "自动恢复已暂停：\(reason)"; render(); return }
+        if let reason = activeProbeStatus.permissionBlockReason { snapshot.channelDetail = "自动恢复已暂停：\(reason)"; render(); return }
         if localRestartSuppressed(for: channelIncident.activeCategory) {
             snapshot.channelDetail = "云端实时服务连接池异常；本机重启不会修复该容量问题"
             auditChannel(kind: "recovery_decision", result: "restart_suppressed_cloud_capacity",
@@ -4191,7 +4246,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }
     }
     private func recoveryGateOpen(oldPID: Int32) -> Bool {
-        activeProbeStatus.blockReason == nil && watchdog.recovering && recoveryLedger.autoRecoveryEnabled && recoveryLedger.canAttempt(at: Date()) &&
+        activeProbeStatus.permissionBlockReason == nil && watchdog.recovering && recoveryLedger.autoRecoveryEnabled && recoveryLedger.canAttempt(at: Date()) &&
         snapshot.service == "运行中" && activitySafeForRecovery(snapshot.activity) && !activityBusy &&
         Date().timeIntervalSince(lastActivityPoll) < 3
     }
@@ -4226,24 +4281,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                 if let current = self.servicePID(), current != oldPID { newPID = current; break }
             }
             guard let newPID else { DispatchQueue.main.async { self.recoveryFinished(oldPID: oldPID, newPID: nil, result: .unknown("重启后服务 PID 未变化")) }; return }
-            MCPChannelProbe().run { result in DispatchQueue.main.async { self.recoveryFinished(oldPID: oldPID, newPID: newPID, result: result) } }
+            let probe = MCPChannelProbe()
+            probe.run { result in DispatchQueue.main.async { self.recoveryFinished(oldPID: oldPID, newPID: newPID, result: result, submitted: probe.submitted) } }
         }
     }
-    private func recoveryFinished(oldPID: Int32, newPID: Int32?, result: ChannelProbeResult) {
+    private func recoveryFinished(oldPID: Int32, newPID: Int32?, result: ChannelProbeResult, submitted: Bool = false) {
         let finishedAt = Date()
         watchdog.recovering = false; recoveryLaunched = false
-        if newPID != nil { lastPingAt = finishedAt; lastPingResult = probeDescription(result); snapshot.channelChecked = lastPingAt }
+        if submitted { lastPingAt = finishedAt; lastPingResult = probeDescription(result); snapshot.channelChecked = lastPingAt }
+        if let newPID, newPID != oldPID { pendingRecoveryVerification = (oldPID, newPID) }
         lastRecoveryOutcome = newPID == nil ? resultMessageForMissingRecoveryProbe(result) : probeDescription(result)
-        if recoveryConfirmed(oldPID: oldPID, newPID: newPID, probe: result) {
+        if submitted && recoveryConfirmed(oldPID: oldPID, newPID: newPID, currentPID: servicePID(), oldProcessExited: kill(oldPID, 0) == -1 && errno == ESRCH, probe: result) {
+            pendingRecoveryVerification = nil
             watchdog.failures = 0; snapshot.channelState = "通道已恢复"; snapshot.channelDetail = "服务 PID 已变化，后续 MCP ping 成功"
             auditChannel(kind: "recovery", result: "restart_confirmed", action: "channel_recovered", at: finishedAt)
             markChannelIncidentRecovered(at: finishedAt, result: "recovered_after_guarded_restart")
-            if let newPID, kill(oldPID, 0) == -1 && errno == ESRCH {
+            if let newPID {
                 verifiedRestart = (oldPID, newPID)
                 pollActivity()
             }
         } else {
-            snapshot.channelState = "恢复尚未确认"; snapshot.channelDetail = newPID == nil ? (watchdog.detail + "；" + probeDescription(result)) : "服务已重启，但后续 MCP ping 未成功（\(probeDescription(result))）"
+            snapshot.channelState = "恢复尚未确认"; snapshot.channelDetail = newPID == nil ? (watchdog.detail + "；" + probeDescription(result)) : submitted ? "服务已重启，但后续 MCP ping 未成功（\(probeDescription(result))）" : "服务已重启，等待下次实际 ping 确认（\(probeDescription(result))）"
             auditChannel(kind: "recovery", result: "restart_unconfirmed", action: "retain_fault_history", at: finishedAt)
             if channelIncident.activeCategory != nil { channelIncident.scheduleAfterCheck(now: finishedAt); saveChannelIncident() }
         }
@@ -4349,7 +4407,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
     private func recoveryAvailability() -> String {
         guard recoveryLedger.autoRecoveryEnabled else { return "已关闭" }
-        if let reason = activeProbeStatus.blockReason { return "已暂停 · \(reason)" }
+        if let reason = activeProbeStatus.permissionBlockReason { return "已暂停 · \(reason)" }
         if localRestartSuppressed(for: channelIncident.activeCategory) {
             return "云端容量异常 · 不重启本机 · 退避复查"
         }
@@ -4445,9 +4503,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
     func menuWillOpen(_ menu: NSMenu) {
         if menu === quotaIntervalPicker?.menu { quotaIntervalMenuOpen = true }
+        if menu === panelProbeIntervalPicker?.menu { probeIntervalMenuOpen = true }
     }
     func menuDidClose(_ menu: NSMenu) {
         if menu === quotaIntervalPicker?.menu { quotaIntervalMenuOpen = false }
+        if menu === panelProbeIntervalPicker?.menu { probeIntervalMenuOpen = false }
+    }
+    @objc private func probeRefreshIntervalChanged(_ sender: NSPopUpButton) {
+        let index = sender.indexOfSelectedItem
+        guard !previewMode, ActiveProbeBudget.intervalOptions.indices.contains(index) else { return }
+        guard ActiveProbeBudget.shared.setIntervalSeconds(ActiveProbeBudget.intervalOptions[index]) else {
+            manualCheckBlocked("探测频率无法安全保存；设置未改变"); return
+        }
+        manualNotice = "探测频率已保存；计费关系未确认，开关状态不变"
+        render()
     }
     @objc private func quotaRefreshIntervalChanged(_ sender: NSPopUpButton) {
         let index = sender.indexOfSelectedItem
@@ -4548,7 +4617,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let diagnosis = currentDiagnosis()
         var object: [String: Any] = ["chatgpt": ["answer": chat.answer, "update_connection": chat.connection, "recent_issue": chat.history as Any? ?? NSNull(), "coverage": snapshot.timeline.coverage, "delivery_timeout_directly_observable": false, "limitation": chat.deliveryLimit], "service": snapshot.service, "cloud": snapshot.cloud, "last_seen": snapshot.lastSeen.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "checked_at": ISO8601DateFormatter.flex.string(from: snapshot.checked), "error_count": snapshot.errorCount, "paused": paused, "idle_prevention": assertion != 0, "message": snapshot.message, "channel": ["state": snapshot.channelState, "detail": snapshot.channelDetail, "consecutive_no_live": snapshot.channelFailures, "checked_at": snapshot.channelChecked.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "auto_recovery_enabled": recoveryLedger.autoRecoveryEnabled, "last_recovery_attempt": recoveryLedger.lastAttempt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "last_ping_at": lastPingAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "last_ping_result": lastPingResult, "check_deferred_reason": deferredReason, "recovery_status": recoveryAvailability(), "last_recovery_result": lastRecoveryOutcome as Any? ?? NSNull()], "menu": ["menubar_title": item.button?.title ?? "", "menubar_has_icon": item.button?.image != nil, "connection": summaryLines[0].title, "channel": summaryLines[0].title, "tool_execution": summaryLines[1].title, "action": summaryLines[2].title, "recovery": summaryLines[3].title, "chatgpt": summaryLines[4].title, "execution_step_rows": rows, "execution_steps": safeSteps, "tool_call_elapsed_seconds": callElapsed as Any? ?? NSNull(), "tool_call_state": currentState, "recent_actions": snapshot.activity.recent], "activity": ["state": snapshot.activity.state, "tool": CommanderActivity.safeToolIdentifier(snapshot.activity.tool), "active_count": snapshot.activity.activeCount, "observed_at": snapshot.activity.observed.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "recent": snapshot.activity.recent, "error": snapshot.activity.error, "coverage_gap": snapshot.activity.coverageGap, "gap_reason": snapshot.activity.gapReason, "gap_first_at": snapshot.activity.gapFirstAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "gap_last_at": snapshot.activity.gapLastAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "backlog_bytes": snapshot.activity.backlogBytes, "catching_up": snapshot.activity.catchingUp, "pending_line": snapshot.activity.pendingLine, "idle_proven": snapshot.activity.idleProven], "timeline": ["coverage": snapshot.timeline.coverage, "commander_errors_this_run": snapshot.timeline.commanderErrors, "conversation_labels_verified_at": snapshot.timeline.conversationLabelsVerifiedAt as Any? ?? NSNull(), "last_chatgpt_app_event": lastAppEvent, "events": timelineRows]]
         let probeBudget = activeProbeStatus
-        object["active_probing"] = ["enabled": probeBudget.enabled, "attempts_last_24h": probeBudget.error == nil ? probeBudget.used as Any : NSNull(), "limit": ActiveProbeBudget.limit, "window_seconds": Int(ActiveProbeBudget.window), "blocked_reason": probeBudget.blockReason as Any? ?? NSNull()]
+        object["active_probing"] = ["enabled": probeBudget.enabled, "interval_seconds": probeBudget.intervalSeconds, "estimated_calls_per_day": probeBudget.dailyEstimate, "last_submitted_at": probeBudget.lastSubmittedAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "next_allowed_at": probeBudget.nextAllowedAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "blocked_reason": probeBudget.blockReason as Any? ?? NSNull(), "billing_confirmed_free": false]
         object["tool_execution"] = ["state": snapshot.toolExecutionState, "detail": snapshot.toolExecutionDetail, "checked_at": snapshot.toolExecutionChecked.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "fresh": toolExecutionFresh(snapshot, now: Date()), "evidence_ttl_seconds": Int(toolExecutionEvidenceTTL), "probe_deferred_reason": toolProbeDeferredReason]
         object["usage_quota"] = ["state": quota.state.rawValue, "used": quota.used as Any? ?? NSNull(), "total": quota.total as Any? ?? NSNull(), "remaining": quota.remaining as Any? ?? NSNull(), "plan": quota.plan.isEmpty ? NSNull() : quota.plan as Any, "month": quota.month.isEmpty ? NSNull() : quota.month as Any, "last_successful_sync": quota.syncedAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "last_error": quotaFailureReason as Any? ?? NSNull(), "refresh_interval_seconds": quotaRefreshSeconds, "backend": "chrome_headless_private_profile"]
         object["channel_incident"] = [
@@ -4577,8 +4646,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     @objc private func togglePause() { paused.toggle(); UserDefaults.standard.set(!paused, forKey: "keepAwakeEnabled"); updateGuard(); render() }
     @objc private func toggleActiveProbing() {
         let enabled = !activeProbeStatus.enabled
-        guard ActiveProbeBudget.shared.setEnabled(enabled) else { manualCheckBlocked("主动探测设置无法安全保存；设置未改变，无法保存预算时不会发送探测"); return }
-        manualNotice = enabled ? "主动探测已开启：所有自动、手动与恢复后探测共用24小时6次上限" : "主动探测已关闭；已提交的请求可能仍会计费，本机观察与额度同步继续"
+        guard ActiveProbeBudget.shared.setEnabled(enabled) else { manualCheckBlocked("主动探测设置无法安全保存；设置未改变，不会发送探测"); return }
+        manualNotice = enabled ? "主动探测已开启：自动、手动与恢复后探测共用所选间隔，可能消耗额度" : "主动探测已关闭；已提交的请求可能仍会计费，本机观察与额度同步继续"
         if !enabled && watchdog.recovering && !recoveryLaunched { abortRecovery("主动探测已关闭；自动恢复已暂停，未开始重启") }
         else { render() }
     }
@@ -4681,11 +4750,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
         let controls = NSStackView(); controls.orientation = .horizontal; controls.alignment = .centerY; controls.spacing = 22
         let recovery = NSButton(checkboxWithTitle: "自动恢复本机 Commander", target: self, action: #selector(toggleAutoRecovery))
-        recovery.toolTip = "云端主动探测关闭或预算用尽时自动恢复暂停；开启后自动探测累计 3 次明确断链，且日志完整并确认没有本机任务时，才重启本机 Commander；不会重试原任务或修复云端问题。"
+        recovery.toolTip = "云端主动探测关闭时自动恢复暂停；开启后自动探测累计 3 次明确断链，且日志完整并确认没有本机任务时，才重启本机 Commander。恢复后确认需等待所选探测间隔；不会重试原任务或修复云端问题。"
         let wake = NSButton(checkboxWithTitle: "防止闲置睡眠（Guard）", target: self, action: #selector(togglePause))
         wake.toolTip = "仅防止系统因闲置而睡眠，不阻止手动睡眠、屏幕息屏或重启。关闭只撤销 Guard 的请求；其他程序仍可能保持唤醒。"
         let check = NSButton(title: "手动 ping（1次）", target: self, action: #selector(manualCheck)); check.bezelStyle = .rounded
-        check.toolTip = "需要开启云端主动探测且预算未用尽；此按钮只发送一次 ping，可能消耗一次额度；自动工具检查仍共用预算。"
+        check.toolTip = "需要开启云端主动探测且所选间隔已到；此按钮只发送一次 ping，可能消耗一次额度，与自动和恢复后检查共用间隔。"
         panelManualCheck = check
         [recovery, wake, check].forEach { $0.isEnabled = !previewMode }
         panelRecoveryToggle = recovery; panelWakeToggle = wake
@@ -4694,12 +4763,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         controls.addArrangedSubview(check)
         let controlContent = vertical(5)
         let probeToggle = NSButton(checkboxWithTitle: "云端主动探测（可能消耗额度）", target: self, action: #selector(toggleActiveProbing))
-        probeToggle.toolTip = "默认关闭。开启后常规探测间隔至少10分钟，ping 与 list_sessions、手动及恢复后探测共用滚动24小时最多6次上限；失败也占用一次。关闭阻止新的云端工具请求并暂停自动恢复；已提交的请求可能仍会计费。本机日志观察、云设备状态查询与额度同步继续。不会免费保持云端连接。"
+        probeToggle.toolTip = "默认关闭，计费关系未确认。开启后按所选间隔发送一次 ping；自动、手动、命令行及恢复后检查共用持久间隔，失败也开始计时，不自动附加工具检查。关闭阻止新的云端工具请求并暂停自动恢复；已提交请求可能仍计费。本机观察、设备状态与额度同步继续。"
         probeToggle.isEnabled = !previewMode
         panelProbeToggle = probeToggle
-        let probeBudget = label("最近24小时主动探测 0/6", size: 12, weight: .semibold)
+        let probeBudget = label(activeProbeStatus.display, size: 12, weight: .semibold)
+        let probeInterval = NSPopUpButton()
+        probeInterval.addItems(withTitles: ActiveProbeBudget.intervalTitles)
+        probeInterval.selectItem(at: ActiveProbeBudget.intervalOptions.firstIndex(of: activeProbeStatus.intervalSeconds) ?? ActiveProbeBudget.defaultIntervalIndex)
+        probeInterval.target = self; probeInterval.action = #selector(probeRefreshIntervalChanged(_:))
+        probeInterval.isEnabled = !previewMode; probeInterval.menu?.delegate = self
+        probeInterval.widthAnchor.constraint(equalToConstant: 112).isActive = true
+        panelProbeIntervalPicker = probeInterval
+        let probeIntervalRow = NSStackView(views: [probeToggle, NSView(), label("探测频率", size: 12), probeInterval])
+        probeIntervalRow.orientation = .horizontal; probeIntervalRow.alignment = .centerY; probeIntervalRow.spacing = 8
         panelProbeBudget = probeBudget
-        controlContent.addArrangedSubview(probeToggle)
+        controlContent.addArrangedSubview(probeIntervalRow)
         controlContent.addArrangedSubview(probeBudget)
         controlContent.addArrangedSubview(controls)
         controls.widthAnchor.constraint(equalTo: controlContent.widthAnchor).isActive = true
@@ -4728,7 +4806,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         renderPanelPage()
     }
     private func stamp(_ date: Date?) -> String { date.map { DateFormatter.localizedString(from: $0, dateStyle: .medium, timeStyle: .medium) } ?? "暂无" }
-    private func prominentStamp(_ date: Date?) -> String { date.map { let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd HH:mm:ss"; return f.string(from: $0) } ?? "暂无" }
     private func displayPingResult(_ value: String) -> String { value.replacingOccurrences(of: "ping 成功", with: "命令连接检查成功") }
     private func currentDiagnosis(now: Date = Date()) -> IncidentDiagnosis {
         if let category = channelIncident.activeCategory {
@@ -4783,7 +4860,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         panelToolExecution?.stringValue = toolState
         panelToolExecution?.textColor = snapshot.toolExecutionState == "失败" ? .systemRed : (toolExecutionFresh(snapshot, now: now) ? .systemGreen : .labelColor)
         panelToolExecutionTime?.stringValue = "检查：\(prominentStamp(snapshot.toolExecutionChecked))"
-        panelToolExecutionDetail?.stringValue = middleTruncate(toolProbeBusy ? "正在执行只读工具检查" : snapshot.toolExecutionDetail, limit: 56)
+        panelToolExecutionDetail?.stringValue = middleTruncate(snapshot.toolExecutionDetail, limit: 56)
 
         let chat = chatMonitorSummary(snapshot.timeline)
         panelChat?.stringValue = chat.answer
@@ -4802,6 +4879,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let probeStatus = activeProbeStatus
         panelProbeToggle?.state = probeStatus.enabled ? .on : .off
         panelProbeBudget?.stringValue = probeStatus.display
+        if !probeIntervalMenuOpen { panelProbeIntervalPicker?.selectItem(at: ActiveProbeBudget.intervalOptions.firstIndex(of: probeStatus.intervalSeconds) ?? ActiveProbeBudget.defaultIntervalIndex) }
         panelManualCheck?.isEnabled = !previewMode && probeStatus.blockReason == nil && !manualPingBusy && !channelBusy && !watchdog.recovering
         panelRecoveryToggle?.state = recoveryLedger.autoRecoveryEnabled ? .on : .off
         panelWakeToggle?.state = paused ? .off : .on
@@ -4863,7 +4941,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         scroll.reflectScrolledClipView(scroll.contentView)
     }
     private func renderPanelPage() {
-        guard panelWindow != nil, !quotaIntervalMenuOpen else { return }
+        guard panelWindow != nil, !quotaIntervalMenuOpen, !probeIntervalMenuOpen else { return }
         let recordsPage = panelPage == 1
         panelHeading?.isHidden = panelPage != 0
         panelHeroes?.isHidden = panelPage != 0
@@ -4896,7 +4974,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             var statusRows = [("状态", diagnosis.title), ("建议", diagnosis.nextAction)]
             if let notice = manualNotice { statusRows.append(("操作提示", displayPingResult(notice))) }
             else if manualPingBusy || channelBusy { statusRows.append(("链路检查", "正在检查消息通道…")) }
-            else if toolProbeBusy { statusRows.append(("链路检查", "正在执行只读工具检查…")) }
             setSections([
                 section("当前状态", rows: statusRows),
                 quotaSection(),
@@ -5136,6 +5213,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }
         guard let window = panelWindow, let root = window.contentView, let scroll = panelScroll else { fputs("CommanderGuard UI check failed: panel was not created\n", stderr); exit(2) }
         let savedSnapshot = snapshot, savedRecoveryLedger = recoveryLedger
+        let savedWatchdog = watchdog, savedDeferredReason = deferredReason, savedManualNotice = manualNotice
+        let savedPendingRecovery = pendingRecoveryVerification, savedVerifiedRestart = verifiedRestart
+        let savedIncident = channelIncident
         recoveryLedger = ChannelRecoveryLedger()
         snapshot.activity = ActivitySummary(state: "未观察到新调用", idleProven: true)
         snapshot.channelChecked = Date()
@@ -5145,7 +5225,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         snapshot.channelChecked = nil; snapshot.channelState = "启动等待中"
         pollChannel()
         verify(snapshot.channelState == "未主动验证" && snapshot.channelDetail.contains("云端主动探测已关闭"), "OFF must not leave an unprobed channel displaying startup wait forever")
+        let beforeDeniedPing = lastPingAt, beforeDeniedCheck = snapshot.channelChecked
+        recordProbe(.unknown("探测间隔未到"), now: Date(), submitted: false)
+        verify(lastPingAt == beforeDeniedPing && snapshot.channelChecked == beforeDeniedCheck, "Denied checks must not create actual ping timestamps")
+        let savedRecoveryOutcome = lastRecoveryOutcome
+        pendingRecoveryVerification = (100, 101)
+        verifyPendingRecovery(now: Date(), currentPID: nil, oldProcessExited: false)
+        verify(pendingRecoveryVerification?.new == 101, "Unknown current PID must retain pending verification")
+        verifyPendingRecovery(now: Date(), currentPID: 101, oldProcessExited: false)
+        verify(pendingRecoveryVerification?.new == 101, "Unconfirmed old process exit must retain verification")
+        verifyPendingRecovery(now: Date(), currentPID: 102, oldProcessExited: true)
+        verify(pendingRecoveryVerification == nil && lastRecoveryOutcome == savedRecoveryOutcome, "A replaced PID must invalidate without confirming recovery")
+        pendingRecoveryVerification = (100, 101)
+        verifyPendingRecovery(now: Date(), currentPID: 101, oldProcessExited: true)
+        verify(pendingRecoveryVerification == nil && verifiedRestart?.new == 101 && lastRecoveryOutcome?.contains("实际 ping 成功") == true, "Matching exited-old/new-current evidence must confirm recovery")
+        verifiedRestart = savedVerifiedRestart; pendingRecoveryVerification = savedPendingRecovery
+        lastRecoveryOutcome = savedRecoveryOutcome
         snapshot = savedSnapshot; recoveryLedger = savedRecoveryLedger
+        watchdog = savedWatchdog; deferredReason = savedDeferredReason; manualNotice = savedManualNotice
+        channelIncident = savedIncident
+        render()
         verify(middleTruncate("云端实时服务连接池异常", limit: 12).count <= 12, "small-limit middle truncation overflowed")
         verify(middleTruncate("abcdef", limit: 1) == "…", "single-character truncation must stay bounded")
         for size in [NSSize(width: 940, height: 720), NSSize(width: 760, height: 560)] {
@@ -5161,7 +5260,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         verify(panelChat?.stringValue == "当前连接正常", "Historical ChatGPT issues must not replace the current healthy state")
         verify(panelSectionCount == 3, "Overview must show status, current task, and compact quota")
         verify(panelControlCard?.isHidden == false && panelRecoveryToggle?.title == "自动恢复本机 Commander" && panelRecoveryToggle?.toolTip?.contains("不会重试原任务") == true, "Recovery control must explain its local-only action and safeguards")
-        verify(panelProbeToggle?.title == "云端主动探测（可能消耗额度）" && panelProbeToggle?.state == .off && panelProbeBudget?.stringValue == "最近24小时主动探测 0/6" && panelManualCheck?.isEnabled == false, "Probe switch must default OFF and show its rolling budget")
+        verify(panelProbeToggle?.title == "云端主动探测（可能消耗额度）" && panelProbeToggle?.state == .off && panelProbeBudget?.stringValue == activeProbeStatus.display && panelProbeIntervalPicker?.indexOfSelectedItem == ActiveProbeBudget.defaultIntervalIndex && panelProbeIntervalPicker?.numberOfItems == ActiveProbeBudget.intervalOptions.count && panelManualCheck?.isEnabled == false, "Probe switch must default OFF and show the selected cadence")
         verify(panelWakeToggle?.title == "防止闲置睡眠（Guard）" && panelWakeToggle?.toolTip?.contains("其他程序仍可能保持唤醒") == true && panelWakeStatus?.stringValue.contains("保持唤醒：") == true, "Wake control must describe its actual assertion and limits")
         verify(quotaProgress?.isHidden == false && quotaSynced?.stringValue.range(of: #"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}"#, options: .regularExpression) != nil, "Quota card must show finite progress and prominent last successful sync")
         if let menu = quotaIntervalPicker?.menu {
@@ -5170,6 +5269,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             verify(quotaIntervalMenuOpen && panelScroll?.documentView === savedDocument, "Live updates must preserve an open quota frequency menu")
             menuDidClose(menu)
             verify(!quotaIntervalMenuOpen, "Closing the frequency menu must resume panel updates")
+        }
+        if let menu = panelProbeIntervalPicker?.menu {
+            let savedDocument = panelScroll?.documentView
+            menuWillOpen(menu); renderPanelPage()
+            verify(probeIntervalMenuOpen && panelScroll?.documentView === savedDocument, "Live updates must preserve the probe frequency menu")
+            menuDidClose(menu)
+            verify(!probeIntervalMenuOpen, "Closing the probe frequency menu must resume updates")
         }
         verify(quotaIntervalPicker?.numberOfItems == quotaRefreshOptions.count && quotaIntervalPicker?.indexOfSelectedItem == (quotaRefreshOptions.firstIndex(of: quotaRefreshSeconds) ?? 3), "Quota card must show the configured background sync interval")
         if let overviewRoot = scroll.documentView as? TopAlignedPanelDocumentView,
@@ -5225,7 +5331,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let selectedID = selectedRecordID
         renderPanel()
         verify(selectedRecordID == selectedID && recordDetail?.stringValue.contains("swift test --filter ConnectionTests") == true, "Selected record detail must survive refresh")
-        verify(item.button?.image?.isTemplate == true && item.button?.title.contains("通道可回应") == true && item.button?.title.contains("DC ") == false, "Menu bar must show an icon and scoped live status")
+        verify(item.button?.image?.isTemplate == true && item.button?.title.contains("通道可回应") == true && item.button?.title.contains("DC ") == false, "Menu bar must show an icon and scoped live status; title=\(item.button?.title ?? "nil"), icon=\(item.button?.image?.isTemplate.description ?? "nil"), channel=\(snapshot.channelState)")
         verify(panelHeading?.isHidden == true && panelHeroes?.isHidden == true && panelControlCard?.isHidden == true, "Records page must remain visually focused")
         print("CommanderGuard UI check passed")
     }
@@ -5253,21 +5359,23 @@ else if CommandLine.arguments.contains("--probe-headless") {
     } catch { fputs("CommanderGuard headless check failed: \(error.localizedDescription)\n", stderr); exit(2) }
 }
 else if CommandLine.arguments.contains("--probe-channel") {
-    MCPChannelProbe().run { result in
+    let probe = MCPChannelProbe()
+    probe.run { result in
         let state: String
         let code: Int32
         switch result { case .healthy: state = "通道畅通"; code = 0; case .noLiveConnection: state = "设备无实时连接"; code = 2; case .unknown: state = "通道状态未知"; code = 1 }
-        if let data = try? JSONSerialization.data(withJSONObject: ["channel": state, "checked_at": ISO8601DateFormatter.flex.string(from: Date())], options: [.sortedKeys]), let text = String(data: data, encoding: .utf8) { print(text) }
+        if let data = try? JSONSerialization.data(withJSONObject: ["channel": state, "submitted": probe.submitted, "checked_at": actualProbeTimestamp(submitted: probe.submitted, at: Date()) as Any? ?? NSNull()], options: [.sortedKeys]), let text = String(data: data, encoding: .utf8) { print(text) }
         exit(code)
     }
     dispatchMain()
 }
 else if CommandLine.arguments.contains("--probe-tool") {
-    MCPToolExecutionProbe().run { result in
+    let probe = MCPToolExecutionProbe()
+    probe.run { result in
         let state: String
         let code: Int32
         switch result { case .verified: state = "工具执行已验证"; code = 0; case .failed: state = "工具执行失败"; code = 2; case .unknown: state = "工具执行状态未知"; code = 1 }
-        if let data = try? JSONSerialization.data(withJSONObject: ["tool_execution": state, "checked_at": ISO8601DateFormatter.flex.string(from: Date())], options: [.sortedKeys]), let text = String(data: data, encoding: .utf8) { print(text) }
+        if let data = try? JSONSerialization.data(withJSONObject: ["tool_execution": state, "submitted": probe.submitted, "checked_at": actualProbeTimestamp(submitted: probe.submitted, at: Date()) as Any? ?? NSNull()], options: [.sortedKeys]), let text = String(data: data, encoding: .utf8) { print(text) }
         exit(code)
     }
     dispatchMain()

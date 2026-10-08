@@ -17,7 +17,7 @@ This project is for macOS users who already use [Remote Desktop Commander](https
 | Feature | What you can see or do |
 |---|---|
 | Live status | Menu bar icon and text show channel status; the panel tracks the message channel, tool execution, and ChatGPT answer state separately |
-| Optional active probes | OFF by default; device `ping` and safe, read-only `list_sessions` share a persistent limit of 6 attempts per rolling 24 hours |
+| Optional active probes | OFF by default; choose a device `ping` every 5, 10, 15, or 30 minutes, or 1, 2, 3, or 6 hours; all entry points share that interval |
 | Automatic recovery | After repeated explicit disconnects, checks tasks, logs, processes, and cooldown before deciding whether to restart the managed Commander service |
 | Activity records | Up to 100 recent local calls, with search, filters, redacted details, and anonymous session attribution when reliable upstream metadata exists |
 | Cloud usage | Uses the official usage page in Chrome to display used, included, and remaining calls, progress, and the last successful sync time |
@@ -61,9 +61,11 @@ Open `build/CommanderGuard.app` in Finder after the build completes. Click its m
 
 By default, Guard observes local logs, real calls and device registration without sending MCP tool probes. To test device responsiveness, enable active probes and click “手动 ping（1次）” (one manual ping). The button sends one request. A device ping does not prove local tool execution works.
 
-Automatic, manual, command-line and post-recovery probes share **6 total attempts per rolling 24 hours**. Failed or timed-out requests count too. Relaunching Guard or toggling the setting does not reset the stored budget. Routine ping and tool checks each have a minimum ten-minute interval; incident backoff still obeys the shared cap. Usage-account reads do not consume this probe budget.
+Choose **5, 10, 15, or 30 minutes, or 1, 2, 3, or 6 hours** under “探测频率” (probe interval). The default is 1 hour. Use 15 minutes for regular active checks, 1 hour for light ongoing observation, and 5 minutes for temporary diagnosis. Automatic, manual, command-line and post-recovery probes all wait the selected interval since the last submitted request. Failed and timed-out requests also start that wait; they do not trigger rapid retries. Relaunches, toggles and interval changes retain the last request time. Changing the interval does not itself submit a request.
 
-OFF blocks new `tools/call` requests and pauses automatic recovery. Submitted requests cannot be recalled. An exhausted budget, corrupt ledger, backwards clock or failed safe write also blocks probes. Logs, device-registration reads, ChatGPT observation, usage sync and idle-sleep prevention continue. An unconfirmed state is not evidence of health or idleness.
+This replaces the fixed six-attempt daily cap. Continuous probing at one fixed interval permits about 288, 144, 96, 48, 24, 12, 8, or 4 requests per day; the panel shows this estimate and the next allowed time. The estimate is not a count of actual calls in the previous 24 hours. Desktop Commander has not published a device-ping billing exemption. Earlier comparisons observed no usage increase during those specific windows. Usage-account reads are separate from MCP tool probes and do not consume this interval.
+
+OFF blocks new `tools/call` requests and pauses automatic recovery. Submitted requests cannot be recalled. A corrupt ledger, backwards clock or failed safe write also blocks probes. Logs, device-registration reads, ChatGPT observation, usage sync and idle-sleep prevention continue. An unconfirmed state is not evidence of health or idleness.
 
 ### Optional: use the existing installer
 
@@ -83,7 +85,7 @@ The panel has three pages, a resizable window, and support for system light and 
 
 | Page | What to look for |
 |---|---|
-| 概览 (Overview) | The status needing attention, local task activity, usage, main toggles, probe budget, and the one-ping button |
+| 概览 (Overview) | The status needing attention, local task activity, usage, main toggles, probe interval, next allowed time, and the one-ping button |
 | 操作记录 (Activity) | Hides `ping` checks by default; search commands, tools, paths, or known sessions, and select a row for its tool name, details, time and duration; choose “全部（含连接检查）” to include checks |
 | 故障与恢复 (Incidents and recovery) | Recent incidents, probes, recovery times and results, without repeating Overview status cards or controls |
 
@@ -109,9 +111,9 @@ The usage endpoint is the read-only interface currently used by the official web
 
 ### The console says online, but tools fail
 
-An online console entry generally reflects registration or a heartbeat. Inspect local errors and recent real calls first. If needed, enable active probes and send one manual ping within the budget. The device answers `ping` directly, without running a local tool.
+An online console entry generally reflects registration or a heartbeat. Inspect local errors and recent real calls first. If needed, enable active probes and send one manual ping within the selected interval. The device answers `ping` directly, without running a local tool.
 
-Tool execution prefers a recent, explicitly successful real call. Once that evidence is older than 120 seconds, Guard sends read-only `list_sessions` only if active probes are enabled, budget remains, the channel recently responded, logs are complete and the device is confirmed idle. Probe response bodies are discarded. A failed tool probe does not itself trigger a restart.
+Tool execution uses recent, explicitly successful real calls. Evidence older than 120 seconds is marked stale. Guard no longer sends automatic `list_sessions` calls to refresh that evidence. For a deliberate tool-execution check, use the `--probe-tool` diagnostic below. It obeys the same switch and interval, may consume quota, and discards the response body. A failed tool probe does not itself trigger a restart.
 
 ### Guard cannot safely confirm that the device is idle
 
@@ -119,7 +121,7 @@ The message “本机日志覆盖有缺口，无法安全确认空闲” means G
 
 ### Cloud Realtime connection pool error
 
-“云端实时服务连接池异常” means Guard observed `IncreaseConnectionPool` in the logs. This cloud capacity category suppresses local automatic restarts. When probes are enabled and budget remains, read-only rechecks use 10 / 20 / 40 / 80 / 120-second backoff. OFF or the shared six-attempt cap stops further probes.
+“云端实时服务连接池异常” means Guard observed `IncreaseConnectionPool` in the logs. This cloud capacity category suppresses local automatic restarts. Rechecks obey the selected probe interval; incident backoff cannot bypass it. Turning active probes OFF pauses rechecks.
 
 Use the latest check result and timestamp to assess the current state. An old capacity warning or an online console entry cannot establish whether the command channel has recovered. Guard records the incident and rechecks, but cannot expand or repair the cloud connection pool. See [Realtime Error Codes](https://supabase.com/docs/guides/realtime/error_codes) and [Realtime Settings](https://supabase.com/docs/guides/realtime/settings).
 
@@ -131,9 +133,9 @@ An update connection reopening establishes only that connection's recovery; a re
 
 ## When automatic recovery runs
 
-Both active probes and automatic recovery must be enabled, with probe budget remaining. Turning probes OFF preserves the saved recovery permission but pauses new recovery attempts; the panel explains why.
+Both active probes and automatic recovery must be enabled, and the probe ledger must be readable and safely writable. Turning probes OFF preserves the saved recovery permission but pauses new recovery attempts; the panel explains why.
 
-Guard starts evaluating recovery after automatic probes accumulate three explicit “device has no live connection” results. Unknown results between them do not clear that evidence; a confirmed healthy `ping` does.
+Guard starts evaluating recovery after automatic probes accumulate three explicit “device has no live connection” results. Longer intervals delay this decision: three confirmations at a three-hour interval span several hours. Probes check the channel at that moment; Commander still handles its own heartbeat and reconnection. Unknown results between them do not clear that evidence; a confirmed healthy `ping` does.
 
 Enabling this toggle permits Guard to restart the managed local Commander service. Turning it off keeps observation and alerts running but prevents new automatic restarts; a restart already launched cannot be undone. The setting is saved. It does not unconditionally start a stopped service, repair the cloud, or sign you in again.
 
@@ -144,7 +146,7 @@ Before a restart, automatic recovery must be enabled and all of the following mu
 - The cloud has no pending or running calls.
 - The five-minute cooldown since the previous recovery attempt has elapsed.
 
-Timeouts, expired authentication, unrecognized responses, failed tool probes, and cloud capacity errors do not individually trigger a restart. Guard reports recovery success only after the service PID changes and the new service responds to `ping`. That result does not establish that the original business task continued or finished.
+Timeouts, expired authentication, unrecognized responses, failed tool probes, and cloud capacity errors do not individually trigger a restart. Post-restart verification also waits for the selected probe interval. Until then, recovery remains unconfirmed. Guard reports success only after the service PID changes and that new service responds to `ping`. That result does not establish that the original business task continued or finished.
 
 These checks cannot cover every independently running background task. Turn off automatic recovery when you need manual control of the service.
 
@@ -172,7 +174,7 @@ State files live in `~/Library/Application Support/CommanderGuard/`:
 | `channel-incident.json` | Current and recent channel categories, timestamps, backoff, and recovery state |
 | `channel-decisions.jsonl` | Probe and recovery decisions, capped at 512 KiB with one rotated copy |
 | `channel-recovery.json` | Recovery toggle and last attempt time, without credentials |
-| `active-probe-budget.json` | Probe permission and rolling request timestamps, without credentials; relaunches do not reset it |
+| `active-probe-budget.json` | Probe permission, interval and last request time, without credentials; relaunches do not reset it; upgrading an old ledger switches probing OFF |
 
 Session attribution accepts only upstream `_meta["openai/session"]` or `origin_context_id`. Raw identifiers are SHA-256 hashed into short anonymous fingerprints. Missing fields produce no attribution label; conflicting fields still show “归属冲突” (attribution conflict). Timing, the foreground chat, terminal processes, and `origin_instance` are not attribution evidence.
 
@@ -186,14 +188,14 @@ Missing times and durations in reconstructed history are marked unknown. A retur
 
 ## Manual checks and development
 
-Run these commands in the project directory. Both probes obey the same switch and shared limit; OFF means no cloud request. When enabled, they use the real connection and may consume quota, without starting automatic recovery. `--probe-tool` sends a read-only tool call.
+Run these commands in the project directory. Both probes obey the same switch and shared interval; OFF means no cloud request. When enabled, they use the real connection and may consume quota, without starting automatic recovery. `--probe-tool` sends a read-only tool call.
 
 ```bash
 ./build/CommanderGuard.app/Contents/MacOS/CommanderGuard --probe-channel
 ./build/CommanderGuard.app/Contents/MacOS/CommanderGuard --probe-tool
 ```
 
-Read the switch and budget without loading credentials or sending requests:
+Read the switch, interval and next allowed time without loading credentials or sending requests:
 
 ```bash
 ./build/CommanderGuard.app/Contents/MacOS/CommanderGuard --active-probe-status
