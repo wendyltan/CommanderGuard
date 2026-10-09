@@ -81,15 +81,17 @@ The script builds the app, installs it to `~/Applications/CommanderGuard.app`, c
 
 ## Everyday use
 
-The panel has three pages, a resizable window, and support for system light and dark appearance.
+The panel has three pages, a resizable window, and support for system light and dark appearance. A compact status strip and navigation remain visible across pages. Overview groups the current conclusion, guard controls, usage and local activity; important times include both the clock time and the age of the evidence.
 
 | Page | What to look for |
 |---|---|
 | 概览 (Overview) | The status needing attention, local task activity, usage, main toggles, probe interval, next allowed time, and the one-ping button |
-| 操作记录 (Activity) | Hides `ping` checks by default; search commands, tools, paths, or known sessions, and select a row for its tool name, details, time and duration; choose “全部（含连接检查）” to include checks |
-| 故障与恢复 (Incidents and recovery) | Recent incidents, probes, recovery times and results, without repeating Overview status cards or controls |
+| 操作记录 (Activity) | Columns show time, action, result, duration and session. `ping` is hidden by default; older records with unknown times can be expanded separately. Search and filters retain access to records, and selection shows sanitized details. Reliable session identifiers use stable accent colors |
+| 故障与恢复 (Incidents and recovery) | A compact status strip, followed by chronological incidents, probes and recovery evidence, without repeating the guard controls |
 
-The menu bar keeps updating. The internal marker `●` means the message channel recently responded, `!` means the service is not running or the channel explicitly failed, and `?` means the result is unconfirmed, stale, or lacks evidence.
+The menu bar keeps updating a short status. The channel shows the last actual probe result and its time. “上次探测成功” (last probe succeeded) records past evidence; it does not guarantee a live connection now. The internal marker `●` means the message channel recently responded, `!` means the service is not running or the channel explicitly failed, and `?` means the result is unconfirmed, stale, or lacks evidence. Waiting for the next check is not a new failure.
+
+A toggle records your permission; its adjacent status explains whether Guard can act now. Automatic recovery can be enabled yet paused because incomplete logs prevent Guard from proving the host is idle. No observed operation is different from confirmed idle. ChatGPT connection recovery is also shown separately from the completeness of the original answer.
 
 ### Connect cloud usage
 

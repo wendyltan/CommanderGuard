@@ -1400,10 +1400,42 @@ func channelIndicator(service: String, state: String, checked: Date?, now: Date)
 func channelSummary(_ snapshot: Snapshot, now: Date) -> String {
     if snapshot.service == "未运行" { return "Commander 服务未运行" }
     if snapshot.channelState == "通道畅通" || snapshot.channelState == "通道已恢复" {
-        if channelIndicator(service: snapshot.service, state: snapshot.channelState, checked: snapshot.channelChecked, now: now) != "●" { return "待复查（上次通道探测成功）" }
-        return "通道可回应"
+        guard let checked = snapshot.channelChecked, checked <= now else { return "探测结果待核对" }
+        return "上次探测成功"
     }
     return ["启动宽限": "启动等待中", "通道异常": "异常", "通道不可用": "不可用", "通道状态未知": "未确认", "正在恢复通道": "正在恢复", "恢复尚未确认": "恢复尚未确认"][snapshot.channelState] ?? snapshot.channelState
+}
+
+func displayEvidenceTime(_ date: Date?, now: Date = Date()) -> String {
+    guard let date else { return "时间未知" }
+    let formatter = DateFormatter(); formatter.locale = Locale(identifier: "zh_CN")
+    formatter.dateFormat = Calendar.current.isDate(date, inSameDayAs: now) ? "HH:mm:ss" : "yyyy-MM-dd HH:mm:ss"
+    let stamp = formatter.string(from: date)
+    let age = now.timeIntervalSince(date)
+    guard age >= 0 else { return stamp }
+    let seconds = Int(age)
+    let relative = seconds < 60 ? "刚刚" : seconds < 3600 ? "\(seconds / 60)分钟前" : seconds < 86400 ? "\(seconds / 3600)小时前" : "\(seconds / 86400)天前"
+    return "\(stamp)（\(relative)）"
+}
+
+func activityOverviewText(_ activity: ActivitySummary) -> String {
+    if activity.catchingUp { return "日志追赶中；尚无法确认空闲" }
+    if activity.activeCount > 0 { return "处理中：\(activity.activeCount) 项活动" }
+    if activity.error || activity.coverageGap || !activity.idleProven { return "尚无法确认空闲" }
+    return "已确认空闲"
+}
+
+func chatOverviewTitle(_ summary: ChatMonitorSummary) -> String {
+    if summary.answer.hasPrefix("回答异常") { return "回答异常" }
+    if summary.connection.contains("已建立") { return "连接正常" }
+    if summary.connection.contains("准备重连") { return "正在重连" }
+    if ["失败", "已关闭", "耗尽"].contains(where: summary.connection.contains) { return "连接异常" }
+    return summary.connection.contains("未知") ? "连接未知" : "连接状态未确认"
+}
+
+func chatOverviewDetail(_ summary: ChatMonitorSummary) -> String {
+    let answer = summary.answer == "回答恢复已记录" ? "记录到回答恢复完成" : summary.answer.hasPrefix("回答异常") ? "原回答恢复：尚未确认" : "原回答是否完整：无法确认"
+    return [answer, summary.history].compactMap { $0 }.joined(separator: "；")
 }
 
 func wakePreventionSummary(enabled: Bool, serviceRunning: Bool, assertionActive: Bool) -> String {
@@ -3178,12 +3210,27 @@ func selfTest() {
     precondition(channelIndicator(service: "运行中", state: "通道畅通", checked: now.addingTimeInterval(-76), now: now) == "?")
     precondition(channelIndicator(service: "运行中", state: "通道不可用", checked: now, now: now) == "!")
     precondition(channelIndicator(service: "未运行", state: "通道畅通", checked: now, now: now) == "!")
+    precondition(displayEvidenceTime(now.addingTimeInterval(-90), now: now).contains("分钟前"))
+    precondition(!displayEvidenceTime(now.addingTimeInterval(60), now: now).contains("前"))
+    precondition(activityOverviewText(ActivitySummary(state: "未观察到新调用")) == "尚无法确认空闲")
+    precondition(activityOverviewText(ActivitySummary(state: "未观察到新调用", idleProven: true)) == "已确认空闲")
+    let chatOverview = ChatMonitorSummary(answer: "当前未见异常", connection: "更新连接已建立", history: nil)
+    precondition(chatOverviewTitle(chatOverview) == "连接正常" && chatOverviewDetail(chatOverview).contains("原回答是否完整：无法确认"))
+    precondition(chatOverviewTitle(ChatMonitorSummary(answer: "回答异常（恢复未确认）", connection: "更新连接已建立", history: nil)) == "回答异常")
+    precondition(chatOverviewDetail(ChatMonitorSummary(answer: "回答恢复已记录", connection: "更新连接已建立", history: nil)) == "记录到回答恢复完成")
     precondition(wakePreventionSummary(enabled: true, serviceRunning: true, assertionActive: true) == "Guard 正在防止闲置睡眠")
     precondition(wakePreventionSummary(enabled: true, serviceRunning: false, assertionActive: false) == "等待 Commander 服务运行")
     precondition(wakePreventionSummary(enabled: false, serviceRunning: true, assertionActive: false) == "已关闭")
     var displaySnapshot = Snapshot(service: "运行中", channelState: "通道畅通", channelChecked: now)
-    precondition(channelSummary(displaySnapshot, now: now) == "通道可回应")
-    precondition(channelSummary(displaySnapshot, now: now.addingTimeInterval(76)) == "待复查（上次通道探测成功）")
+    precondition(channelSummary(displaySnapshot, now: now).contains("上次探测成功"))
+    for age in [76.0, 600.0, 3600.0] {
+        precondition(channelSummary(displaySnapshot, now: now.addingTimeInterval(age)) == "上次探测成功" && channelIndicator(service: displaySnapshot.service, state: displaySnapshot.channelState, checked: displaySnapshot.channelChecked, now: now.addingTimeInterval(age)) == "?")
+    }
+    displaySnapshot.channelChecked = nil
+    precondition(channelSummary(displaySnapshot, now: now) == "探测结果待核对")
+    displaySnapshot.channelChecked = now.addingTimeInterval(1)
+    precondition(channelSummary(displaySnapshot, now: now) == "探测结果待核对")
+    displaySnapshot.channelChecked = now
     displaySnapshot.service = "未运行"
     precondition(channelSummary(displaySnapshot, now: now) == "Commander 服务未运行")
     precondition(CloudState.classify(status: "online", lastSeen: fresh, now: now) == "服务器登记在线")
@@ -3801,6 +3848,23 @@ func selfTest() {
     print("CommanderGuard self-test passed")
 }
 
+final class PanelBackgroundView: NSView {
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        effectiveAppearance.performAsCurrentDrawingAppearance { layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor }
+    }
+}
+
+final class PanelCardView: NSView {
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            layer?.borderColor = NSColor.separatorColor.cgColor
+            layer?.backgroundColor = NSColor.controlBackgroundColor.blended(withFraction: 0.06, of: .labelColor)?.cgColor
+        }
+    }
+}
+
 final class TopAlignedPanelDocumentView: NSView {
     override var isFlipped: Bool { true }
 }
@@ -3839,9 +3903,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private var panelScroll: NSScrollView?
     private var panelNav: NSSegmentedControl?
     private var panelSectionCount = 0
+    private var panelSectionWidths: [NSLayoutConstraint] = []
     private var panelHeading: NSStackView?
     private var panelHeroes: NSStackView?
     private var panelControlCard: NSView?
+    private var panelManualCheckStatus: NSTextField?
     private var panelHeroMinimum: NSLayoutConstraint?
     private var panelConnection: NSTextField?
     private var panelConnectionTime: NSTextField?
@@ -3869,6 +3935,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private var recordDetail: NSTextField?
     private var recordSteps: [ActivityStep] = []
     private var selectedRecordID: String?
+    private var historicalRecordsExpanded = false
+    private var historicalRecordsToggle: NSButton?
     private let activityReader = ActivityLogReader(errorURL: FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/RemoteDesktopCommander/stderr.log"))
     private let toolHistoryReader = ToolHistoryReader()
     private var lastToolHistoryPoll = Date.distantPast
@@ -4372,6 +4440,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let connection = activeIncident == nil ? channelIndicator(service: snapshot.service, state: snapshot.channelState, checked: snapshot.channelChecked, now: now) : "!"
         let channelLiveSummary = channelSummary(snapshot, now: now)
         let channelHeadline = activeIncident?.title ?? channelLiveSummary
+        let menuChannel: String
+        if activeIncident != nil {
+            menuChannel = "! 通道故障"
+        } else if snapshot.service == "未运行" {
+            menuChannel = "! 服务未运行"
+        } else if snapshot.channelState == "通道异常" || snapshot.channelState == "通道不可用" {
+            menuChannel = "! 通道异常"
+        } else if snapshot.channelState == "通道畅通" || snapshot.channelState == "通道已恢复" {
+            menuChannel = connection == "●" ? "● 通道正常" : "? 上次成功 \(snapshot.channelChecked.map { DateFormatter.localizedString(from: $0, dateStyle: .none, timeStyle: .short) } ?? "时间未知")"
+        } else {
+            menuChannel = "? 通道未确认"
+        }
         let connectionText = "Commander 服务\(snapshot.service == "运行中" ? "运行中" : (snapshot.service == "未运行" ? "未运行" : "状态未知"))"
         summaryLines[0].title = activeIncident.map { "消息通道：\($0.title) · \(channelIncidentHandling(now: now))" } ?? "消息通道：\(channelLiveSummary)"
         summaryLines[1].title = "工具执行：\(toolExecutionSummary(now: now))"
@@ -4393,8 +4473,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let returnedStep = activeStep == nil ? recentlyReturnedCall(activity, uptime: uptime) : nil
         let barAction = activeStep.map(\.detail) ?? returnedStep.map(\.detail) ?? callStatus
         let barDuration = returnedStep.map { durationText($0.duration) }
-        let shortAction = middleTruncate(CommanderActivity.menuDetail(barAction), limit: 16)
-        item.button?.title = "\(connection) \(middleTruncate(channelHeadline, limit: 12))\(barTimer.isEmpty ? (barDuration.map { " \($0)" } ?? "") : " \(barTimer)") · \(shortAction)"
+        item.button?.title = "\(menuChannel)\(barTimer.isEmpty ? (barDuration.map { " · \($0)" } ?? "") : " · \(barTimer)")"
         item.button?.setAccessibilityLabel("CommanderGuard，\(channelHeadline)")
         item.button?.setAccessibilityValue("消息通道当前健康：\(channelLiveSummary)；处置：\(channelIncidentHandling(now: now))；本机操作：\(barAction)；\(callStatus)")
         item.button?.setAccessibilityHelp("点击打开运行概览；右键可查看菜单")
@@ -4442,13 +4521,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let old = quotaIsStale(quota, now: Date(), refreshSeconds: quotaRefreshSeconds) ? " · 上次数据已过期" : ""
         switch quota.state {
         case .disconnected: return "未连接 · 连接后读取官方用量"
-        case .connecting: return quotaBrowser.hasOwnedLogin ? "登录成功后点击“完成登录并同步”，关闭专用窗口后后台读取" : "专用资料仍被浏览器占用；请完全退出专用登录窗口后刷新"
-        case .refreshing: return "正在刷新额度" + (quota.used == nil ? "" : " · 保留上次成功数据") + old
-        case .loginRequired: return "专用浏览器需要登录 · 点击“连接额度账户”或“打开登录窗口”" + old
+        case .connecting: return quotaBrowser.hasOwnedLogin ? "登录后点击“完成登录并同步”" : "登录窗口仍打开；退出后再刷新"
+        case .refreshing: return "正在刷新" + (quota.used == nil ? "" : " · 保留上次数据") + old
+        case .loginRequired: return "需要登录 · 点击连接账户" + old
         case .unavailable: return (quotaFailureReason.map { "同步失败：\($0)" } ?? "额度暂不可用") + (quota.used == nil ? " · 可稍后刷新" : " · 保留上次成功数据") + old
-        case .fresh: return "独立额度账户 · 后台无头同步 · 当前周期：\(quota.month) · \(quota.plan)" + old
+        case .fresh: return "当前周期：\(quota.month) · \(quota.plan)" + old
         case .stale: return "数据已过期 · 保留上次成功读取（\(quota.month)）" + (quotaFailureReason.map { " · \($0)" } ?? "")
-        case .unlimited: return "独立额度账户 · 后台无头同步 · 当前周期：\(quota.month) · \(quota.plan) · 无限制" + old
+        case .unlimited: return "当前周期：\(quota.month) · \(quota.plan) · 无限制" + old
         }
     }
     private func renderQuota() {
@@ -4456,10 +4535,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         quotaValue?.stringValue = quotaDisplay()
         quotaValue?.textColor = quotaIsStale(quota, now: Date(), refreshSeconds: quotaRefreshSeconds) ? .systemOrange : .labelColor
         quotaStatus?.stringValue = quotaStateText()
-        quotaSynced?.stringValue = "最近成功同步：\(prominentStamp(quota.syncedAt))"
-        quotaButton?.title = quotaEnabled ? "打开登录窗口" : "连接额度账户"
+        quotaSynced?.stringValue = "上次成功同步：\(displayEvidenceTime(quota.syncedAt))"
+        quotaButton?.title = quotaEnabled ? "登录" : "连接"
         quotaButton?.isEnabled = !previewMode && !quotaRequestInFlight && quota.state != .refreshing
-        quotaRefreshButton?.title = quotaBrowser.hasOwnedLogin ? "完成登录并同步" : "刷新"
+        quotaRefreshButton?.title = quotaBrowser.hasOwnedLogin ? "完成登录" : "刷新"
         quotaRefreshButton?.isEnabled = !previewMode && !quotaRequestInFlight && quota.state != .refreshing
         quotaPauseButton?.isEnabled = !previewMode && quotaEnabled
         if !quotaIntervalMenuOpen { quotaIntervalPicker?.selectItem(at: quotaRefreshOptions.firstIndex(of: quotaRefreshSeconds) ?? 3) }
@@ -4471,30 +4550,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         if item != nil { render() }
     }
     private func quotaSection() -> NSView {
-        let connect = NSButton(title: quotaEnabled ? "打开登录窗口" : "连接额度账户", target: self, action: #selector(connectQuota)); connect.bezelStyle = .rounded; connect.isEnabled = !previewMode && !quotaRequestInFlight && quota.state != .refreshing
-        let refresh = NSButton(title: quotaBrowser.hasOwnedLogin ? "完成登录并同步" : "刷新", target: self, action: #selector(manualQuotaRefresh)); refresh.bezelStyle = .rounded; refresh.isEnabled = !previewMode && !quotaRequestInFlight && quota.state != .refreshing
-        let pause = NSButton(title: "暂停同步", target: self, action: #selector(pauseQuota)); pause.bezelStyle = .rounded; pause.isEnabled = !previewMode && quotaEnabled
-        let intervalLabel = label("后台自动同步", size: 12, color: .secondaryLabelColor)
+        let connect = NSButton(title: quotaEnabled ? "登录" : "连接", target: self, action: #selector(connectQuota)); connect.bezelStyle = .rounded; connect.isEnabled = !previewMode && !quotaRequestInFlight && quota.state != .refreshing
+        let refresh = NSButton(title: quotaBrowser.hasOwnedLogin ? "完成登录" : "刷新", target: self, action: #selector(manualQuotaRefresh)); refresh.bezelStyle = .rounded; refresh.isEnabled = !previewMode && !quotaRequestInFlight && quota.state != .refreshing
+        let pause = NSButton(title: "暂停", target: self, action: #selector(pauseQuota)); pause.bezelStyle = .rounded; pause.isEnabled = !previewMode && quotaEnabled
+        let intervalLabel = label("自动同步", size: 12, color: .secondaryLabelColor)
         let interval = NSPopUpButton()
         interval.addItems(withTitles: ["手动", "每分钟", "每 2 分钟", "每 5 分钟", "每 10 分钟", "每 30 分钟", "每小时"])
         interval.selectItem(at: quotaRefreshOptions.firstIndex(of: quotaRefreshSeconds) ?? 3)
         interval.target = self; interval.action = #selector(quotaRefreshIntervalChanged(_:)); interval.isEnabled = !previewMode
         interval.menu?.delegate = self
         interval.widthAnchor.constraint(equalToConstant: 112).isActive = true
-        let title = label("云端额度", size: 12, weight: .semibold, color: .secondaryLabelColor)
+        let title = label("额度", size: 12, weight: .semibold, color: .secondaryLabelColor)
         let actions = NSStackView(views: [title, NSView(), pause, refresh, connect]); actions.orientation = .horizontal; actions.alignment = .centerY; actions.spacing = 8
         let intervalRow = NSStackView(views: [intervalLabel, interval, NSView()]); intervalRow.orientation = .horizontal; intervalRow.alignment = .centerY; intervalRow.spacing = 8
         let value = label(quotaDisplay(), size: 17, weight: .semibold)
         let progress = NSProgressIndicator(); progress.isIndeterminate = false; progress.minValue = 0; progress.maxValue = 1; progress.style = .bar; progress.heightAnchor.constraint(equalToConstant: 5).isActive = true
         if let total = quota.total, let used = quota.used { progress.doubleValue = total == 0 ? 0 : min(1, Double(used) / Double(total)) } else { progress.isHidden = true }
         let status = label(quotaStateText(), size: 12, color: .secondaryLabelColor)
-        let synced = label("最近成功同步：\(prominentStamp(quota.syncedAt))", size: 12, weight: .semibold)
-        synced.font = .monospacedDigitSystemFont(ofSize: 12.5, weight: .semibold)
+        let synced = label("上次成功同步：\(displayEvidenceTime(quota.syncedAt))", size: 17, weight: .semibold)
+        synced.font = .monospacedDigitSystemFont(ofSize: 17, weight: .semibold)
+        synced.textColor = .labelColor
         if quotaIsStale(quota, now: Date(), refreshSeconds: quotaRefreshSeconds) { value.textColor = .systemOrange }
         let stack = vertical(7)
         [actions, intervalRow, value, progress, status, synced].forEach { stack.addArrangedSubview($0); $0.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true }
         quotaButton = connect; quotaPauseButton = pause; quotaRefreshButton = refresh; quotaIntervalPicker = interval; quotaValue = value; quotaStatus = status; quotaSynced = synced; quotaProgress = progress
-        return card(stack, padding: 14)
+        return card(stack, padding: 12)
+    }
+    private func quotaAndTaskSection(_ taskRows: [(String, String)]) -> NSView {
+        let row = NSStackView(views: [quotaSection(), section("当前任务", rows: taskRows)])
+        row.orientation = .horizontal; row.alignment = .top; row.distribution = .fillEqually; row.spacing = 9
+        return row
     }
     private func clearQuota(_ state: UsageQuota.State) {
         quotaFailureReason = nil
@@ -4688,8 +4773,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let stack = NSStackView(); stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = spacing
         return stack
     }
-    private func card(_ content: NSView, padding: CGFloat = 18) -> NSVisualEffectView {
-        let card = NSVisualEffectView(); card.material = .contentBackground; card.state = .active
+    private func card(_ content: NSView, padding: CGFloat = 18) -> NSView {
+        let card = PanelCardView()
         card.wantsLayer = true; card.layer?.cornerRadius = 16; card.layer?.masksToBounds = true
         card.layer?.borderColor = NSColor.separatorColor.cgColor; card.layer?.borderWidth = 1
         card.addSubview(content); content.translatesAutoresizingMaskIntoConstraints = false
@@ -4702,30 +4787,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         return card
     }
     private func heroCard(_ eyebrow: String, value: NSTextField, time: NSTextField, detail: NSTextField) -> NSView {
-        let stack = vertical(5)
-        stack.addArrangedSubview(label(eyebrow.uppercased(), size: 10, weight: .semibold, color: .secondaryLabelColor))
+        let stack = vertical(2)
+        stack.addArrangedSubview(label(eyebrow, size: 10, weight: .semibold, color: .secondaryLabelColor))
         stack.addArrangedSubview(value); stack.addArrangedSubview(time)
-        value.font = .systemFont(ofSize: 16, weight: .semibold)
-        value.maximumNumberOfLines = 2
-        time.font = .monospacedDigitSystemFont(ofSize: 10.5, weight: .medium)
+        stack.addArrangedSubview(detail)
+        value.font = .systemFont(ofSize: 14, weight: .semibold)
+        value.maximumNumberOfLines = 1
+        time.font = .monospacedDigitSystemFont(ofSize: 14, weight: .medium)
         time.textColor = .secondaryLabelColor
-        detail.isHidden = true
-        return card(stack, padding: 12)
+        detail.font = .systemFont(ofSize: 12, weight: .regular)
+        detail.textColor = .secondaryLabelColor
+        detail.maximumNumberOfLines = 2
+        return card(stack, padding: 8)
     }
     private func buildPanel() {
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 940, height: 720), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
         window.title = previewMode ? "CommanderGuard · 界面预览" : "CommanderGuard"
         if previewMode && CommandLine.arguments.contains("--preview-dark") { window.appearance = NSAppearance(named: .darkAqua) }
+        if previewMode && CommandLine.arguments.contains("--preview-light") { window.appearance = NSAppearance(named: .aqua) }
         window.isReleasedWhenClosed = false; window.minSize = NSSize(width: 760, height: 560); window.center()
-        let root = NSView(); root.wantsLayer = true; window.contentView = root
-        let layout = vertical(14); layout.edgeInsets = NSEdgeInsets(top: 22, left: 28, bottom: 20, right: 28)
+        let root = PanelBackgroundView(); root.wantsLayer = true; window.contentView = root
+        let layout = vertical(9); layout.edgeInsets = NSEdgeInsets(top: 12, left: 24, bottom: 12, right: 24)
         root.addSubview(layout); layout.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([layout.leadingAnchor.constraint(equalTo: root.leadingAnchor), layout.trailingAnchor.constraint(equalTo: root.trailingAnchor), layout.topAnchor.constraint(equalTo: root.topAnchor), layout.bottomAnchor.constraint(equalTo: root.bottomAnchor)])
 
         let title = vertical(4)
         title.addArrangedSubview(label("COMMANDERGUARD", size: 11, weight: .bold, color: .secondaryLabelColor))
-        title.addArrangedSubview(label("运行概览", size: 27, weight: .bold))
-        title.addArrangedSubview(label(previewMode ? "设计预览 · 以下为固定示例数据" : "消息通道、工具执行与 ChatGPT 回答分层观察", size: 13, color: .secondaryLabelColor))
+        title.addArrangedSubview(label("运行概览", size: 21, weight: .bold))
+        if previewMode { title.addArrangedSubview(label("设计预览 · 固定示例数据", size: 12, color: .secondaryLabelColor)) }
         layout.addArrangedSubview(title)
         panelHeading = title
 
@@ -4739,11 +4828,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         panelHeroes = heroes
         let commandCard = heroCard("消息通道", value: commandValue, time: commandTime, detail: commandDetail)
         let toolCard = heroCard("工具执行", value: toolValue, time: toolTime, detail: toolDetail)
-        let chatCard = heroCard("ChatGPT 回答", value: chatValue, time: chatTime, detail: chatDetail)
+        let chatCard = heroCard("ChatGPT 观察", value: chatValue, time: chatTime, detail: chatDetail)
         [commandCard, toolCard, chatCard].forEach { heroes.addArrangedSubview($0) }
         toolCard.heightAnchor.constraint(equalTo: commandCard.heightAnchor).isActive = true
         chatCard.heightAnchor.constraint(equalTo: commandCard.heightAnchor).isActive = true
-        panelHeroMinimum = heroes.heightAnchor.constraint(greaterThanOrEqualToConstant: 76)
+        panelHeroMinimum = heroes.heightAnchor.constraint(greaterThanOrEqualToConstant: 56)
         panelHeroMinimum?.isActive = true
         layout.addArrangedSubview(heroes)
         heroes.widthAnchor.constraint(equalTo: layout.widthAnchor, constant: -56).isActive = true
@@ -4781,21 +4870,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         controlContent.addArrangedSubview(probeBudget)
         controlContent.addArrangedSubview(controls)
         controls.widthAnchor.constraint(equalTo: controlContent.widthAnchor).isActive = true
+        let manualCheckStatus = label("", size: 11, color: .secondaryLabelColor)
+        panelManualCheckStatus = manualCheckStatus
+        controlContent.addArrangedSubview(manualCheckStatus)
         let recoveryStatus = label("自动恢复：等待检查", size: 12, weight: .semibold)
         panelRecoveryStatus = recoveryStatus
         controlContent.addArrangedSubview(recoveryStatus)
-        controlContent.addArrangedSubview(label("自动探测累计 3 次明确断链且确认无本机任务后，才重启本机 Commander；不会重试原任务或修复云端。", size: 12, color: .secondaryLabelColor))
         let wakeStatus = label("保持唤醒：等待检查", size: 12, weight: .semibold)
         panelWakeStatus = wakeStatus
         controlContent.addArrangedSubview(wakeStatus)
-        controlContent.addArrangedSubview(label("只防闲置睡眠；不阻止手动睡眠或屏幕息屏。关闭只撤销 Guard 请求，其他程序仍可能保持唤醒。", size: 12, color: .secondaryLabelColor))
-        let controlCard = card(controlContent, padding: 16)
+        let controlCard = card(controlContent, padding: 12)
         panelControlCard = controlCard
-        layout.addArrangedSubview(controlCard)
-        controlCard.widthAnchor.constraint(equalTo: layout.widthAnchor, constant: -56).isActive = true
 
         let nav = NSSegmentedControl(labels: ["概览", "操作记录", "故障与恢复"], trackingMode: .selectOne, target: self, action: #selector(panelPageChanged(_:)))
-        nav.selectedSegment = panelPage; nav.segmentStyle = .rounded; nav.heightAnchor.constraint(equalToConstant: 32).isActive = true
+        nav.selectedSegment = panelPage; nav.segmentStyle = .rounded; nav.heightAnchor.constraint(equalToConstant: 30).isActive = true
         panelNav = nav; layout.addArrangedSubview(nav)
         let scroll = NSScrollView(); scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true; scroll.drawsBackground = false
         scroll.setContentHuggingPriority(.defaultLow, for: .vertical); scroll.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
@@ -4845,13 +4933,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         if let category = channelIncident.activeCategory {
             panelConnection?.stringValue = category.title
             panelConnection?.textColor = category == .cloudRealtimeCapacity ? .systemOrange : .systemRed
-            panelConnectionTime?.stringValue = "最近检查：\(prominentStamp(lastPingAt))"
+            panelConnectionTime?.stringValue = displayEvidenceTime(lastPingAt)
             panelConnectionDetail?.stringValue = middleTruncate(channelIncidentHandling(now: now), limit: 56)
         } else {
             panelConnection?.stringValue = channelLive
             let marker = channelIndicator(service: snapshot.service, state: snapshot.channelState, checked: snapshot.channelChecked, now: now)
             panelConnection?.textColor = marker == "●" ? .systemGreen : (marker == "!" ? .systemRed : .labelColor)
-            panelConnectionTime?.stringValue = "检查：\(prominentStamp(lastPingAt))"
+            panelConnectionTime?.stringValue = displayEvidenceTime(lastPingAt)
             let channelDetail = displayPingResult(manualNotice ?? (manualPingBusy || channelBusy ? deferredReason : snapshot.channelDetail))
             panelConnectionDetail?.stringValue = middleTruncate(channelDetail, limit: 56)
         }
@@ -4859,21 +4947,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let toolState = toolExecutionSummary(now: now)
         panelToolExecution?.stringValue = toolState
         panelToolExecution?.textColor = snapshot.toolExecutionState == "失败" ? .systemRed : (toolExecutionFresh(snapshot, now: now) ? .systemGreen : .labelColor)
-        panelToolExecutionTime?.stringValue = "检查：\(prominentStamp(snapshot.toolExecutionChecked))"
+        panelToolExecutionTime?.stringValue = displayEvidenceTime(snapshot.toolExecutionChecked)
         panelToolExecutionDetail?.stringValue = middleTruncate(snapshot.toolExecutionDetail, limit: 56)
 
         let chat = chatMonitorSummary(snapshot.timeline)
-        panelChat?.stringValue = chat.answer
-        if chat.answer.contains("异常") {
+        panelChat?.stringValue = chatOverviewTitle(chat)
+        if panelChat?.stringValue == "回答异常" || panelChat?.stringValue == "连接异常" {
             panelChat?.textColor = .systemOrange
-        } else if chat.answer.contains("未知") {
-            panelChat?.textColor = .secondaryLabelColor
-        } else {
+        } else if panelChat?.stringValue == "连接正常" {
             panelChat?.textColor = .systemGreen
+        } else {
+            panelChat?.textColor = .secondaryLabelColor
         }
         let latestAppAt = snapshot.timeline.latestAppEvent.flatMap { ISO8601DateFormatter.parse($0.sourceAt ?? $0.observedAt) }
-        panelChatTime?.stringValue = "最近事件：\(prominentStamp(latestAppAt))"
-        panelChatDetail?.stringValue = middleTruncate(chat.connection, limit: 56)
+        panelChatTime?.stringValue = displayEvidenceTime(latestAppAt)
+        panelChatDetail?.stringValue = chatOverviewDetail(chat)
 
 
         let probeStatus = activeProbeStatus
@@ -4881,9 +4969,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         panelProbeBudget?.stringValue = probeStatus.display
         if !probeIntervalMenuOpen { panelProbeIntervalPicker?.selectItem(at: ActiveProbeBudget.intervalOptions.firstIndex(of: probeStatus.intervalSeconds) ?? ActiveProbeBudget.defaultIntervalIndex) }
         panelManualCheck?.isEnabled = !previewMode && probeStatus.blockReason == nil && !manualPingBusy && !channelBusy && !watchdog.recovering
+        let manualReason = (previewMode ? "预览中，按钮不会发送请求" : nil)
+            ?? probeStatus.blockReason
+            ?? (watchdog.recovering ? "自动恢复处理中，暂不能检查" : nil)
+            ?? (channelBusy || manualPingBusy ? "已有检查进行中" : nil)
+            ?? (snapshot.service != "运行中" ? "Commander 服务未运行" : nil)
+            ?? (channelIncident.activeCategory == nil && Date().timeIntervalSince(watchdog.startedAt) < 90 ? "启动等待中，暂不能检查" : nil)
+        panelManualCheckStatus?.stringValue = manualReason.map { "暂不可检查：\($0)" } ?? "手动 ping 会占用一次所选检查间隔"
+        panelManualCheckStatus?.textColor = manualReason == nil ? .secondaryLabelColor : .systemOrange
         panelRecoveryToggle?.state = recoveryLedger.autoRecoveryEnabled ? .on : .off
         panelWakeToggle?.state = paused ? .off : .on
-        panelRecoveryStatus?.stringValue = "自动恢复：\(middleTruncate(recoveryAvailability(), limit: 85))"
+        let recoveryState = recoveryAvailability()
+        let recoveryBlocked = recoveryState.hasPrefix("已暂停") || recoveryState.hasPrefix("云端容量") || recoveryState.contains("暂缓")
+        let effectiveRecovery = recoveryState.hasPrefix("已开启 · ") ? String(recoveryState.dropFirst("已开启 · ".count)) : recoveryState
+        panelRecoveryStatus?.stringValue = recoveryLedger.autoRecoveryEnabled ? "自动恢复：开 · \(middleTruncate(effectiveRecovery, limit: 78))" : "自动恢复：关"
+        panelRecoveryStatus?.font = .systemFont(ofSize: 13, weight: .bold)
+        panelRecoveryStatus?.textColor = recoveryBlocked ? .systemOrange : .secondaryLabelColor
         panelWakeStatus?.stringValue = "保持唤醒：\(wakePreventionSummary(enabled: !paused, serviceRunning: snapshot.service == "运行中", assertionActive: assertion != 0))"
         renderPanelPage()
     }
@@ -4892,7 +4993,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let key = label(title, size: 12, weight: .medium, color: .secondaryLabelColor)
         key.widthAnchor.constraint(equalToConstant: 128).isActive = true
         let content = label(value, size: 13, color: color)
-        if ["首次观察", "最近观察"].contains(title) { content.font = .monospacedDigitSystemFont(ofSize: 17, weight: .semibold) }
+        if ["首次", "最近", "发生", "恢复", "最近探测"].contains(title) { content.font = .monospacedDigitSystemFont(ofSize: 17, weight: .semibold) }
         h.addArrangedSubview(key); h.addArrangedSubview(content)
         return h
     }
@@ -4914,13 +5015,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let stack = NSStackView()
         stack.orientation = .vertical
         stack.alignment = .leading
-        stack.spacing = 14
+        stack.spacing = 9
         stack.translatesAutoresizingMaskIntoConstraints = false
         root.addSubview(stack)
 
+        NSLayoutConstraint.deactivate(panelSectionWidths)
+        panelSectionWidths = []
         for section in sections {
             stack.addArrangedSubview(section)
-            section.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+            let width = section.widthAnchor.constraint(equalTo: stack.widthAnchor)
+            width.isActive = true
+            panelSectionWidths.append(width)
         }
 
         NSLayoutConstraint.activate([
@@ -4944,25 +5049,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         guard panelWindow != nil, !quotaIntervalMenuOpen, !probeIntervalMenuOpen else { return }
         let recordsPage = panelPage == 1
         panelHeading?.isHidden = panelPage != 0
-        panelHeroes?.isHidden = panelPage != 0
-        panelControlCard?.isHidden = panelPage != 0
+        panelHeroes?.isHidden = false
+        panelControlCard?.isHidden = true
         panelConnectionDetail?.isHidden = panelPage != 0
         panelToolExecutionDetail?.isHidden = panelPage != 0
         panelChatDetail?.isHidden = panelPage != 0
-        panelHeroMinimum?.constant = panelPage == 0 ? 76 : 0
+        panelHeroMinimum?.constant = 56
         panelScroll?.hasVerticalScroller = !recordsPage
         if recordsPage { renderLogPage(); return }
 
         if panelPage == 0 {
+            panelControlCard?.isHidden = false
             let activity = snapshot.activity
             let diagnosis = currentDiagnosis()
             var activityRows: [(String, String)] = []
             if let active = currentCallStep(activity) {
-                activityRows.append(("状态", "正在执行"))
+                activityRows.append(("状态", activityOverviewText(activity)))
                 activityRows.append(("操作", active.detail))
                 activityRows.append(("已运行", durationText(active.elapsed(at: ProcessInfo.processInfo.systemUptime))))
             } else {
-                activityRows.append(("状态", "当前没有正在执行的本机操作"))
+                activityRows.append(("状态", activityOverviewText(activity)))
             }
             if activity.error {
                 activityRows.append(("注意", "本机操作日志暂时不可读；Guard 不会据此判断空闲或自动重启"))
@@ -4971,33 +5077,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             } else if activity.catchingUp || activity.pendingLine {
                 activityRows.append(("注意", "本机操作日志仍在追赶；Guard 暂不判断为空闲"))
             }
-            var statusRows = [("状态", diagnosis.title), ("建议", diagnosis.nextAction)]
+            var statusRows = [("当前结论", diagnosis.title), ("下一步", diagnosis.nextAction)]
             if let notice = manualNotice { statusRows.append(("操作提示", displayPingResult(notice))) }
             else if manualPingBusy || channelBusy { statusRows.append(("链路检查", "正在检查消息通道…")) }
             setSections([
                 section("当前状态", rows: statusRows),
-                quotaSection(),
-                section("当前任务", rows: activityRows)
+                panelControlCard!,
+                quotaAndTaskSection(activityRows)
             ])
             return
         }
 
-        var sections: [NSView] = []
+        var datedSections: [(Date, NSView)] = []
 
         if let recentCategory = channelIncident.recentCategory {
             let result = channelIncident.activeCategory == nil ? "已恢复" : "恢复尚未确认"
             var issueRows: [(String, String)] = [
                 ("问题", recentCategory.title),
                 ("状态", result),
-                ("首次发现", prominentStamp(channelIncident.firstSeen)),
-                ("最近发生", prominentStamp(channelIncident.lastSeen))
+                ("首次", displayEvidenceTime(channelIncident.firstSeen)),
+                ("最近", displayEvidenceTime(channelIncident.lastSeen))
             ]
             if channelIncident.activeCategory == nil {
-                issueRows.append(("恢复时间", prominentStamp(channelIncident.recoveredAt)))
+                issueRows.append(("恢复", displayEvidenceTime(channelIncident.recoveredAt)))
             }
-            if let lastPingAt { issueRows.append(("最近探测", "\(prominentStamp(lastPingAt)) · \(displayPingResult(lastPingResult))")) }
+            if let lastPingAt { issueRows.append(("最近探测", "\(displayEvidenceTime(lastPingAt)) · \(displayPingResult(lastPingResult))")) }
             if let lastRecoveryOutcome { issueRows.append(("恢复结果", lastRecoveryOutcome)) }
-            sections.append(section("最近一次 Commander 连接问题", rows: issueRows))
+            datedSections.append((channelIncident.lastSeen ?? channelIncident.firstSeen ?? .distantPast, section("Commander 连接", rows: issueRows)))
         }
 
         let chat = chatMonitorSummary(snapshot.timeline)
@@ -5011,17 +5117,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             } else {
                 issueName = "对话状态刷新失败"
             }
-            sections.append(section("最近一次 ChatGPT 异常", rows: [
+            datedSections.append((issueAt, section("ChatGPT 异常", rows: [
                 ("问题", issueName),
-                ("发生时间", prominentStamp(issueAt)),
+                ("发生", displayEvidenceTime(issueAt)),
                 ("当前情况", chat.history ?? "恢复情况未确认")
-            ]))
+            ])))
         }
 
-        if sections.isEmpty {
-            sections.append(section("故障记录", rows: [("状态", "近期未记录到故障")]))
+        if datedSections.isEmpty {
+            datedSections.append((.distantPast, section("故障记录", rows: [("状态", "近期未记录到故障")])) )
         }
-        setSections(sections)
+        setSections(datedSections.sorted { $0.0 > $1.0 }.map(\.1))
     }
     private func renderLogPage() {
         guard let scroll = panelScroll else { return }
@@ -5055,7 +5161,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             filter.widthAnchor.constraint(equalToConstant: 180).isActive = true
             recordFilter = filter
 
-            let controls = NSStackView(views: [search, filter])
+            let historicalToggle = NSButton(title: "较早记录（时间不详，0条）", target: self, action: #selector(toggleHistoricalRecords(_:)))
+            historicalToggle.bezelStyle = .rounded
+            historicalToggle.setContentHuggingPriority(.required, for: .horizontal)
+            historicalRecordsToggle = historicalToggle
+            let controls = NSStackView(views: [search, filter, historicalToggle])
             controls.orientation = .horizontal
             controls.spacing = 10
             controls.translatesAutoresizingMaskIntoConstraints = false
@@ -5067,23 +5177,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             detailCard.translatesAutoresizingMaskIntoConstraints = false
 
             let table = NSTableView()
-            table.headerView = nil
-            table.rowHeight = 44
+            table.rowHeight = 40
             table.delegate = self
             table.dataSource = self
             table.usesAlternatingRowBackgroundColors = true
-            table.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
-
-            let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("record"))
-            column.title = "本机操作"
-            column.minWidth = 500
-            column.width = 900
-            column.resizingMask = .autoresizingMask
-            table.addTableColumn(column)
+            table.style = .plain
+            table.intercellSpacing = NSSize(width: 0, height: 4)
+            table.columnAutoresizingStyle = .noColumnAutoresizing
+            for (name, title, width) in [("time", "时间", CGFloat(104)), ("action", "操作", CGFloat(240)), ("result", "结果", CGFloat(82)), ("duration", "耗时", CGFloat(92)), ("session", "会话", CGFloat(144))] {
+                let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(name))
+                column.title = title
+                column.minWidth = width
+                column.width = width
+                table.addTableColumn(column)
+            }
 
             let tableScroll = NSScrollView()
             tableScroll.hasVerticalScroller = true
-            tableScroll.hasHorizontalScroller = false
+            tableScroll.hasHorizontalScroller = true
             tableScroll.autohidesScrollers = true
             tableScroll.documentView = table
             tableScroll.translatesAutoresizingMaskIntoConstraints = false
@@ -5122,12 +5233,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let query = recordSearch?.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
         let mode = recordFilter?.indexOfSelectedItem ?? 0
 
-        recordSteps = snapshot.activity.steps.filter { step in
-            let owner = step.sessionAttributionConflict ? "归属冲突" : (CommanderActivity.sessionDisplay(step.sessionKey) ?? "")
+        let allSteps = snapshot.activity.steps
+        let historicalCount = allSteps.filter(\.historical).count
+        historicalRecordsToggle?.title = "\(historicalRecordsExpanded ? "收起" : "较早")记录（时间不详，\(historicalCount)条）"
+        historicalRecordsToggle?.isHidden = historicalCount == 0
+        recordSteps = allSteps.filter { step in
+            let owner = step.sessionAttributionConflict ? "" : (CommanderActivity.sessionDisplay(step.sessionKey) ?? "")
             let text = "\(CommanderActivity.safeToolIdentifier(step.tool)) \(step.detail) \(owner)".lowercased()
             let matchesQuery = query.isEmpty || text.contains(query)
             let matchesMode = mode == 1 ? (!step.finished && !step.failed && !step.uncertain) : (mode == 2 ? (step.failed || step.uncertain) : true)
-            return matchesQuery && matchesMode && (mode == 3 || step.tool != "ping")
+            let includeHistorical = !step.historical || historicalRecordsExpanded || !query.isEmpty || mode == 3
+            return matchesQuery && matchesMode && includeHistorical && (mode == 3 || step.tool != "ping")
         }
 
         if !recordSteps.contains(where: { $0.id == selectedRecordID }) { selectedRecordID = recordSteps.first?.id }
@@ -5141,9 +5257,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         doc.layoutSubtreeIfNeeded()
         if let table = recordTable, let tableScroll = recordTableScroll {
             tableScroll.layoutSubtreeIfNeeded()
-            let width = max(500, tableScroll.contentView.bounds.width)
+            let spacing = table.intercellSpacing.width * CGFloat(max(0, table.tableColumns.count - 1))
+            let minimumColumnsWidth = table.tableColumns.reduce(0) { $0 + $1.minWidth }
+            let width = max(minimumColumnsWidth + spacing, tableScroll.contentView.bounds.width)
+            let extra = max(0, width - spacing - minimumColumnsWidth)
+            for (index, column) in table.tableColumns.enumerated() {
+                column.width = [CGFloat(104), CGFloat(240) + extra, CGFloat(82), CGFloat(92), CGFloat(144)][index]
+            }
             table.setFrameSize(NSSize(width: width, height: max(tableScroll.contentView.bounds.height, CGFloat(recordSteps.count) * table.rowHeight)))
-            if let column = table.tableColumns.first { column.width = width }
         }
 
         scroll.contentView.scroll(to: oldOrigin)
@@ -5155,15 +5276,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
     @objc private func recordSearchChanged(_ sender: NSSearchField) { renderLogPage() }
     @objc private func recordFilterChanged(_ sender: NSPopUpButton) { renderLogPage() }
+    @objc private func toggleHistoricalRecords(_ sender: NSButton) { historicalRecordsExpanded.toggle(); renderLogPage() }
     func numberOfRows(in tableView: NSTableView) -> Int { recordSteps.count }
+    private func recordTime(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = Calendar.current.isDateInToday(date) ? "HH:mm:ss" : "MM-dd\nHH:mm:ss"
+        return formatter.string(from: date)
+    }
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
         let step = recordSteps[row]
-        let time = step.historical ? "时间未知" : prominentStamp(step.startedAt)
-        let status = step.uncertain ? "未确认" : step.failed ? "异常" : step.finished ? "已返回" : "进行中"
-        let attribution = step.sessionAttributionConflict ? "归属冲突" : CommanderActivity.sessionDisplay(step.sessionKey)
-        let field = NSTextField(wrappingLabelWithString: "\(time) · \(status) · \(attribution.map { "[\($0)] · " } ?? "")\(step.detail)")
-        field.lineBreakMode = .byTruncatingTail; field.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
-        field.textColor = step.uncertain ? .systemOrange : step.failed ? .systemRed : .labelColor
+        guard let identifier = tableColumn?.identifier.rawValue else { return nil }
+        let field = NSTextField(wrappingLabelWithString: "")
+        field.lineBreakMode = .byTruncatingTail
+        field.font = .systemFont(ofSize: 13)
+        field.cell?.truncatesLastVisibleLine = true
+        switch identifier {
+        case "time":
+            field.stringValue = step.historical ? "时间未知" : recordTime(step.startedAt)
+            field.font = .monospacedSystemFont(ofSize: 13, weight: .regular)
+            field.textColor = step.historical ? .secondaryLabelColor : .labelColor
+        case "action":
+            field.stringValue = step.detail
+            field.textColor = step.historical ? .secondaryLabelColor : .labelColor
+        case "result":
+            field.stringValue = step.failed ? "异常" : step.uncertain || step.historical ? "未确认" : step.finished ? "已返回" : "进行中"
+            field.textColor = step.failed ? .systemRed : step.uncertain || step.historical ? .secondaryLabelColor : .labelColor
+        case "duration":
+            field.stringValue = step.historical ? "耗时未知" : step.uncertain ? "未确认" : step.duration.map(durationText) ?? barCallClock(step, uptime: ProcessInfo.processInfo.systemUptime)
+            field.textColor = step.historical || step.uncertain ? .secondaryLabelColor : .labelColor
+        case "session":
+            guard let session = step.sessionAttributionConflict ? nil : CommanderActivity.sessionDisplay(step.sessionKey) else { return field }
+            guard let key = step.sessionKey else { return field }
+            let bytes = Array(SHA256.hash(data: Data(key.utf8)))
+            let container = NSView()
+            let badge = NSView()
+            badge.wantsLayer = true
+            badge.layer?.cornerRadius = 4
+            badge.layer?.backgroundColor = NSColor(calibratedRed: CGFloat(bytes[0]) / 510 + 0.5, green: CGFloat(bytes[1]) / 510 + 0.5, blue: CGFloat(bytes[2]) / 510 + 0.5, alpha: 0.18).cgColor
+            let text = NSTextField(labelWithString: session)
+            let accentColors: [NSColor] = [.systemBlue, .systemPurple, .systemTeal, .systemGreen, .systemIndigo, .systemPink]
+            text.stringValue = "● \(session)"
+            text.textColor = accentColors[Int(bytes[0]) % accentColors.count]
+            text.font = .systemFont(ofSize: 13)
+            text.lineBreakMode = .byTruncatingTail
+            text.translatesAutoresizingMaskIntoConstraints = false
+            badge.addSubview(text)
+            container.addSubview(badge)
+            badge.translatesAutoresizingMaskIntoConstraints = false
+            NSLayoutConstraint.activate([text.leadingAnchor.constraint(equalTo: badge.leadingAnchor, constant: 6), text.trailingAnchor.constraint(equalTo: badge.trailingAnchor, constant: -6), text.centerYAnchor.constraint(equalTo: badge.centerYAnchor)])
+            NSLayoutConstraint.activate([badge.leadingAnchor.constraint(equalTo: container.leadingAnchor), badge.trailingAnchor.constraint(lessThanOrEqualTo: container.trailingAnchor), badge.centerYAnchor.constraint(equalTo: container.centerYAnchor), badge.heightAnchor.constraint(equalToConstant: 24)])
+            return container
+        default: return nil
+        }
         return field
     }
     func tableViewSelectionDidChange(_ notification: Notification) {
@@ -5171,17 +5336,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         selectedRecordID = recordSteps[table.selectedRow].id; updateRecordDetail()
     }
     private func updateRecordDetail() {
-        guard let step = recordSteps.first(where: { $0.id == selectedRecordID }) else { recordDetail?.stringValue = "当前筛选下没有匹配记录"; return }
+        guard let step = recordSteps.first(where: { $0.id == selectedRecordID }) else {
+            let query = recordSearch?.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let hasFoldedHistory = snapshot.activity.steps.contains(where: \.historical) && !historicalRecordsExpanded && query.isEmpty && (recordFilter?.indexOfSelectedItem ?? 0) != 3
+            recordDetail?.stringValue = hasFoldedHistory ? "本次启动后暂无新操作；较早记录可展开查看（时间不详）" : "当前筛选下没有匹配记录"
+            return
+        }
         let time = step.historical ? "时间未知" : prominentStamp(step.startedAt)
-        let state = step.uncertain ? "未确认" : step.failed ? "异常" : step.finished ? "已返回" : "进行中"
+        let state = step.failed ? "异常" : step.uncertain ? "未确认" : step.finished ? "已返回" : "进行中"
         let duration = step.historical ? "耗时未知" : step.uncertain ? "耗时未确认" : step.duration.map(durationText) ?? barCallClock(step, uptime: ProcessInfo.processInfo.systemUptime)
-        let attribution = step.sessionAttributionConflict ? "归属冲突 · 未采用" : CommanderActivity.sessionDisplay(step.sessionKey).map { "归属：\($0)（\(step.sessionSource ?? "上游会话字段")）" }
-        let value = "\(time)  ·  \(state)  ·  \(duration)\n工具：\(CommanderActivity.safeToolIdentifier(step.tool))\n\(attribution.map { $0 + "\n" } ?? "")\(step.detail)"
+        let attribution = step.sessionAttributionConflict ? nil : CommanderActivity.sessionDisplay(step.sessionKey).map { "归属：\($0)（\(step.sessionSource ?? "上游会话字段")）" }
+        let source = step.historical ? "来源：历史记录（时间不详）\n" : ""
+        let value = "\(time)  ·  \(state)  ·  \(duration)\n工具：\(CommanderActivity.safeToolIdentifier(step.tool))\n\(source)\(attribution.map { $0 + "\n" } ?? "")\(step.detail)"
         if recordDetail?.currentEditor() == nil, recordDetail?.stringValue != value { recordDetail?.stringValue = value }
     }
     private func loadPreviewSnapshot() {
         let now = Date(), uptime = ProcessInfo.processInfo.systemUptime
-        quota = UsageQuota(state: .fresh, used: 42, total: 100, plan: "free", month: "2026-10", syncedAt: now.addingTimeInterval(-35))
+        quota = UsageQuota(state: .fresh, used: 4200, total: 10000, plan: "free", month: "2026-10", syncedAt: now.addingTimeInterval(-35))
         snapshot.service = "运行中"; snapshot.cloud = "已连接"
         snapshot.channelState = "通道畅通"; snapshot.channelDetail = "最近一次检查通过 · 示例"
         snapshot.channelChecked = now.addingTimeInterval(-38)
@@ -5196,8 +5367,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             ActivityStep(id: "preview-2", tool: "start_process", detail: "执行命令 · swift test --filter ConnectionTests", startedAt: now.addingTimeInterval(-34), startedUptime: uptime - 34, duration: nil, sessionKey: previewSession, sessionSource: "openai/session"),
             ActivityStep(id: "preview-3", tool: "start_search", detail: "搜索 · rg -n 'connection' Sources", startedAt: now.addingTimeInterval(-240), startedUptime: uptime - 240, duration: 1, finished: true),
             ActivityStep(id: "preview-4", tool: "read_file", detail: "读取文件 · /Projects/example/error.log", startedAt: now.addingTimeInterval(-18), startedUptime: uptime - 18, duration: 0.4, failed: true, finished: true),
-            ActivityStep(id: "preview-5", tool: "ping", detail: "连接检查（ping）", startedAt: now.addingTimeInterval(-20), startedUptime: uptime - 20, duration: 0.1, finished: true)
+            ActivityStep(id: "preview-5", tool: "ping", detail: "连接检查（ping）", startedAt: now.addingTimeInterval(-20), startedUptime: uptime - 20, duration: 0.1, finished: true),
+            ActivityStep(id: "preview-6", tool: "read_file", detail: "历史记录 · /Projects/example/archive.log", startedAt: .distantPast, startedUptime: 0, uncertain: true, failed: true, historical: true, finished: true)
         ]
+        snapshot.activity.steps[2].sessionAttributionConflict = true
         let makeTime: (TimeInterval) -> String = { ISO8601DateFormatter.flex.string(from: now.addingTimeInterval($0)) }
         let issue = TimelineEvent(source: "chatgpt_app", event: "chatgpt_completion_transport_recovery_started", sourceAt: makeTime(-65), observedAt: makeTime(-64), conversationTitle: "设计讨论", failureKind: "resume_unavailable")
         let app = TimelineEvent(source: "chatgpt_app", event: "chatgpt_conversation_refetch_completed · error", sourceAt: makeTime(-58), observedAt: makeTime(-57), conversationTitle: "功能排查")
@@ -5245,8 +5418,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         watchdog = savedWatchdog; deferredReason = savedDeferredReason; manualNotice = savedManualNotice
         channelIncident = savedIncident
         render()
+        recoveryLedger.autoRecoveryEnabled = true
+        renderPanel()
+        verify(panelRecoveryStatus?.stringValue.contains("开 · 已暂停") == true && panelRecoveryStatus?.textColor == .systemOrange, "Enabled but blocked auto recovery must show its effective state and reason")
+        recoveryLedger = savedRecoveryLedger
+        renderPanel()
         verify(middleTruncate("云端实时服务连接池异常", limit: 12).count <= 12, "small-limit middle truncation overflowed")
         verify(middleTruncate("abcdef", limit: 1) == "…", "single-character truncation must stay bounded")
+        verify(item.button?.image != nil && item.button?.title.contains("…") == false, "menu bar keeps its icon and avoids clipped-word ellipses")
         for size in [NSSize(width: 940, height: 720), NSSize(width: 760, height: 560)] {
             window.setContentSize(size)
             for page in 0...2 {
@@ -5254,15 +5433,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                 root.layoutSubtreeIfNeeded()
                 verify(window.isVisible && scroll.frame.width > 650 && scroll.frame.height > 80, "panel content is clipped at \(Int(size.width))x\(Int(size.height)), page \(page)")
                 verify(scroll.documentView != nil, "panel page \(page) is empty")
+                verify(panelHeroes?.isHidden == false && panelNav?.isHidden == false, "Status strip and navigation must stay visible on page \(page)")
+                if size.width == 940 && page == 1, let table = recordTable, let tableScroll = recordTableScroll {
+                    let columnsWidth = table.tableColumns.reduce(0) { $0 + $1.width }
+                    let effectiveWidth = columnsWidth + table.intercellSpacing.width * CGFloat(max(0, table.tableColumns.count - 1))
+                    verify(table.style == .plain, "Records table must avoid implicit row-end padding")
+                    verify(table.frame.width <= tableScroll.contentView.bounds.width + 1 && effectiveWidth <= tableScroll.contentView.bounds.width + 1, "940px records table must fit the viewport including inter-column spacing (table \(Int(table.frame.width)), columns \(Int(effectiveWidth)), viewport \(Int(tableScroll.contentView.bounds.width)))")
+                    guard let sessionRow = recordSteps.firstIndex(where: { $0.sessionKey != nil }), let sessionColumn = table.tableColumns.first(where: { $0.identifier.rawValue == "session" }) else { preconditionFailure("Verified session row or column is missing at 940px") }
+                    let badge = tableView(table, viewFor: sessionColumn, row: sessionRow)
+                    verify((badge?.subviews.first?.subviews.first as? NSTextField)?.stringValue.contains("会话") == true, "940px session column must contain its verified-session badge")
+                }
             }
         }
+        window.setContentSize(NSSize(width: 940, height: 720))
         panelPage = 0; renderPanel(); root.layoutSubtreeIfNeeded(); scroll.layoutSubtreeIfNeeded()
-        verify(panelChat?.stringValue == "当前连接正常", "Historical ChatGPT issues must not replace the current healthy state")
-        verify(panelSectionCount == 3, "Overview must show status, current task, and compact quota")
+        scroll.contentView.scroll(to: .zero); scroll.reflectScrolledClipView(scroll.contentView)
+        verify(panelConnection?.stringValue == "上次探测成功", "Channel headline must stay concise while time and freshness remain separate")
+        verify(panelChat?.stringValue == "连接正常" && panelChatDetail?.isHidden == false && panelChatDetail?.stringValue.hasPrefix("原回答是否完整：无法确认") == true, "ChatGPT connection health must not imply answer completeness")
+        verify(panelSectionCount == 3, "Overview must show conclusion, guard controls, and a compact quota/task row")
         verify(panelControlCard?.isHidden == false && panelRecoveryToggle?.title == "自动恢复本机 Commander" && panelRecoveryToggle?.toolTip?.contains("不会重试原任务") == true, "Recovery control must explain its local-only action and safeguards")
         verify(panelProbeToggle?.title == "云端主动探测（可能消耗额度）" && panelProbeToggle?.state == .off && panelProbeBudget?.stringValue == activeProbeStatus.display && panelProbeIntervalPicker?.indexOfSelectedItem == ActiveProbeBudget.defaultIntervalIndex && panelProbeIntervalPicker?.numberOfItems == ActiveProbeBudget.intervalOptions.count && panelManualCheck?.isEnabled == false, "Probe switch must default OFF and show the selected cadence")
         verify(panelWakeToggle?.title == "防止闲置睡眠（Guard）" && panelWakeToggle?.toolTip?.contains("其他程序仍可能保持唤醒") == true && panelWakeStatus?.stringValue.contains("保持唤醒：") == true, "Wake control must describe its actual assertion and limits")
-        verify(quotaProgress?.isHidden == false && quotaSynced?.stringValue.range(of: #"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}"#, options: .regularExpression) != nil, "Quota card must show finite progress and prominent last successful sync")
+        verify(quotaProgress?.isHidden == false && quotaSynced?.isHidden == false && quotaSynced?.stringValue.range(of: #"\d{2}:\d{2}:\d{2}"#, options: .regularExpression) != nil && (quotaSynced?.font?.pointSize ?? 0) >= 17, "Quota card must show finite progress and a prominent last-success clock")
+        verify(panelHeroes?.isHidden == false && panelConnectionTime?.stringValue.range(of: #"\d{2}:\d{2}:\d{2}"#, options: .regularExpression) != nil && (panelConnectionTime?.font?.pointSize ?? 0) >= 14, "Persistent status strip must show a readable evidence time")
+        verify(panelManualCheckStatus?.stringValue.contains("暂不可检查") == true, "Disabled manual ping must explain the blocking reason without a tooltip")
         if let menu = quotaIntervalPicker?.menu {
             let savedDocument = panelScroll?.documentView
             menuWillOpen(menu); renderPanelPage()
@@ -5281,6 +5475,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         if let overviewRoot = scroll.documentView as? TopAlignedPanelDocumentView,
            let overviewStack = overviewRoot.subviews.first as? NSStackView {
             verify(overviewStack.frame.minY <= 2, "Overview content must start at the top without a blank band")
+            if overviewStack.arrangedSubviews.count == 3 {
+                let quotaAndTask = overviewStack.arrangedSubviews[2]
+                verify(overviewRoot.visibleRect.intersects(quotaAndTask.frame) && quotaAndTask.frame.maxY <= scroll.contentView.bounds.height + 2, "Quota and current task must both fit in the default 940x720 overview")
+            } else {
+                verify(false, "Overview must keep quota and current task together in the third row")
+            }
         } else {
             verify(false, "Overview document must use the top-aligned container")
         }
@@ -5304,35 +5504,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             verify(false, "Connection document must use the top-aligned container")
         }
         verify(panelNav?.label(forSegment: 2) == "故障与恢复", "Third tab must focus on incident history")
-        verify(panelControlCard?.isHidden == true && panelHeroes?.isHidden == true, "Controls and current-state cards must appear only on the overview")
+        verify(panelControlCard?.isHidden == true && panelHeroes?.isHidden == false && panelNav?.isHidden == false, "Compact status and navigation must persist outside Overview")
 
         panelPage = 1; renderPanel(); root.layoutSubtreeIfNeeded(); scroll.layoutSubtreeIfNeeded()
         guard let table = recordTable, let tableScroll = recordTableScroll else { fputs("CommanderGuard UI check failed: records are missing\n", stderr); exit(2) }
         verify(tableScroll.frame.width >= scroll.contentView.bounds.width * 0.95, "Operation table must use the available page width (table \(Int(tableScroll.frame.width)), page \(Int(scroll.contentView.bounds.width)))")
-        verify((table.tableColumns.first?.width ?? 0) >= tableScroll.contentView.bounds.width * 0.85, "Operation column must expand with the page")
-        verify(panelHeroes?.isHidden == true && panelControlCard?.isHidden == true, "Records page must prioritize records over repeated status controls")
-        verify(recordSteps.count == 4 && !recordSteps.contains(where: { $0.tool == "ping" }), "Record page must hide connection checks by default")
+        verify(table.tableColumns.reduce(0) { $0 + $1.width } >= tableScroll.contentView.bounds.width * 0.95, "Operation columns must use the available page width")
+        verify(table.tableColumns.allSatisfy { $0.width >= $0.minWidth } && table.rowHeight >= 36, "Record columns and rows must preserve readable minimum sizes")
+        verify(panelHeroes?.isHidden == false && panelControlCard?.isHidden == true, "Records page must retain the compact status strip and hide repeated controls")
+        verify(recordSteps.count == 4 && !recordSteps.contains(where: { $0.tool == "ping" || $0.historical }), "Record page must fold historical records and hide connection checks by default")
+        verify(historicalRecordsToggle?.title == "较早记录（时间不详，1条）", "Historical fold must state the unknown time and record count")
+        historicalRecordsToggle?.performClick(nil); renderLogPage()
+        verify(recordSteps.count == 5 && recordSteps.contains(where: \.historical), "Expanding the historical fold must reveal older rows")
+        historicalRecordsToggle?.performClick(nil); renderLogPage()
         recordFilter?.selectItem(at: 3); renderLogPage()
-        verify(recordSteps.count == 5 && recordSteps.contains(where: { $0.detail.contains("ping") }), "All filter must include connection checks")
+        verify(recordSteps.count == 6 && recordSteps.contains(where: { $0.detail.contains("ping") }) && recordSteps.contains(where: \.historical), "All filter must include connection checks and historical records")
+        verify(recordSteps.first(where: \.historical)?.historical == true, "Historical row must remain explicitly marked")
         recordFilter?.selectItem(at: 1); renderLogPage()
         verify(recordSteps.count == 1 && recordSteps[0].id == "preview-2", "Ongoing filter must match only ongoing work")
         recordFilter?.selectItem(at: 2); renderLogPage()
         verify(recordSteps.count == 1 && recordSteps[0].id == "preview-4", "Issue filter must include failed and unconfirmed work")
         recordSearch?.stringValue = "error.log"; renderLogPage()
         verify(recordSteps.count == 1 && recordSteps[0].detail.contains("error.log"), "Search must match sanitized paths")
+        recordSearch?.stringValue = "archive.log"; recordFilter?.selectItem(at: 0); renderLogPage()
+        verify(recordSteps.count == 1 && recordSteps[0].historical, "Search must reveal matching folded historical records")
+        guard let historicalIndex = recordSteps.firstIndex(where: \.historical) else { preconditionFailure("Historical search result is missing") }
+        recordTable?.selectRowIndexes(IndexSet(integer: historicalIndex), byExtendingSelection: false)
+        verify(recordDetail?.stringValue.contains("时间未知") == true && recordDetail?.stringValue.contains("来源：历史记录（时间不详）") == true && recordDetail?.stringValue.contains("异常") == true, "Historical selection must show honest time, source, and failure")
         recordSearch?.stringValue = "会话"; recordFilter?.selectItem(at: 0); renderLogPage()
         verify(recordSteps.count == 2 && recordSteps.allSatisfy { $0.sessionKey != nil }, "Search must retain known sessions")
+        recordSearch?.stringValue = ""; renderLogPage()
+        guard let conflictIndex = recordSteps.firstIndex(where: { $0.sessionAttributionConflict }) else { preconditionFailure("Conflicted preview row is missing") }
+        recordTable?.selectRowIndexes(IndexSet(integer: conflictIndex), byExtendingSelection: false)
+        verify(recordDetail?.stringValue.contains("归属冲突") == false && recordDetail?.stringValue.contains("归属：会话") == false, "Conflicted attribution must not appear as row ownership")
         recordSearch?.stringValue = "归属未确认"; renderLogPage()
         verify(recordSteps.isEmpty, "Unconfirmed ownership must not appear in record search")
         recordSearch?.stringValue = ""; renderLogPage()
         guard let selected = recordSteps.firstIndex(where: { $0.id == "preview-2" }) else { preconditionFailure("Filtered record rows are missing") }
         table.selectRowIndexes(IndexSet(integer: selected), byExtendingSelection: false)
         verify(recordDetail?.stringValue.contains("swift test --filter ConnectionTests") == true && recordDetail?.stringValue.contains("归属：会话 ") == true && recordDetail?.stringValue.contains("归属未确认") == false, "Selecting a row must retain verified attribution without unconfirmed ownership noise")
+        let sessionColumn = table.tableColumns.first { $0.identifier.rawValue == "session" }
+        let sessionView = sessionColumn.flatMap { tableView(table, viewFor: $0, row: selected) }
+        verify((sessionView?.subviews.first?.subviews.first as? NSTextField)?.stringValue.contains("会话") == true, "Verified session must appear as a labeled badge")
         let selectedID = selectedRecordID
         renderPanel()
         verify(selectedRecordID == selectedID && recordDetail?.stringValue.contains("swift test --filter ConnectionTests") == true, "Selected record detail must survive refresh")
-        verify(item.button?.image?.isTemplate == true && item.button?.title.contains("通道可回应") == true && item.button?.title.contains("DC ") == false, "Menu bar must show an icon and scoped live status; title=\(item.button?.title ?? "nil"), icon=\(item.button?.image?.isTemplate.description ?? "nil"), channel=\(snapshot.channelState)")
-        verify(panelHeading?.isHidden == true && panelHeroes?.isHidden == true && panelControlCard?.isHidden == true, "Records page must remain visually focused")
+        let previewSteps = snapshot.activity.steps
+        snapshot.activity.steps = [previewSteps.first(where: \.historical)!]
+        recordSearch?.stringValue = ""; recordFilter?.selectItem(at: 0); renderLogPage()
+        verify(recordSteps.isEmpty && recordDetail?.stringValue.contains("本次启动后暂无新操作") == true, "An all-historical list must explain why recent rows are folded")
+        snapshot.activity.steps = previewSteps; renderLogPage()
+        verify(item.button?.image?.isTemplate == true && item.button?.title.contains("通道正常") == true && item.button?.title.contains("DC ") == false, "Menu bar must show an icon and scoped live status; title=\(item.button?.title ?? "nil"), icon=\(item.button?.image?.isTemplate.description ?? "nil"), channel=\(snapshot.channelState)")
+        verify(panelHeading?.isHidden == true && panelHeroes?.isHidden == false && panelControlCard?.isHidden == true, "Records page must retain the compact status strip without repeated controls")
         print("CommanderGuard UI check passed")
     }
 }
