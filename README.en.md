@@ -77,7 +77,7 @@ Once your setup matches that layout, run:
 ./install.sh
 ```
 
-The script builds the app, installs it to `~/Applications/CommanderGuard.app`, creates a desktop shortcut and login LaunchAgent, and restarts CommanderGuard. The installation steps do not restart or modify Remote Desktop Commander. Once Guard starts, its recovery toggle and safety checks determine whether automatic recovery can run. The login LaunchAgent attempts to relaunch Guard after an unsuccessful exit; a normal quit does not trigger relaunch.
+The script builds the app, installs it to `~/Applications/CommanderGuard.app`, creates a desktop shortcut and login LaunchAgent, and restarts CommanderGuard. Before replacing the installed app, it sends TERM to CommanderGuard processes at that exact install path and waits up to 10 seconds; if one is still running, installation stops without overwriting the app. Preferences and the dedicated Chrome sign-in profile are preserved. Installation does not restart or modify Remote Desktop Commander. Once Guard starts, its recovery toggle and safety checks determine whether automatic recovery can run. The login LaunchAgent attempts to relaunch Guard after an unsuccessful exit; a normal quit does not trigger relaunch.
 
 ## Everyday use
 
@@ -95,17 +95,17 @@ A toggle records your permission; its adjacent status explains whether Guard can
 
 ### Connect cloud usage
 
-This shows Desktop Commander cloud tool calls usage, separate from your ChatGPT subscription limits. It is optional and requires Google Chrome to be installed.
+This shows Desktop Commander cloud tool calls usage, separate from your ChatGPT subscription limits. It is optional and requires Google Chrome to be installed. Used and included totals come from the official account response. The progress bar shows the used share of the included total, so 100% means the period's included calls are used, not a fixed count of 100. UI previews use sample data.
 
-1. Click “连接额度账户” (connect usage account) in Overview and sign in on the official site in Guard's dedicated browser window. Google sign-in is supported.
-2. After signing in, return to Guard and click “完成登录并同步” (finish sign-in and sync), which closes only the dedicated browser process Guard launched and reads usage in the background. You may also close the window and click Refresh. Guard does not edit everyday Chrome tabs or terminate its process. Guard will not force-close an unowned browser holding the profile.
-3. Choose manual only or 1, 2, 5, 10, 30, or 60 minutes under “后台自动同步” (background sync). The default is five minutes. The choice survives Guard relaunches; changing it does not immediately send a request.
+1. Click “连接” (connect) in the Overview usage card. If the account is already connected but needs sign-in, the button says “登录” (sign in). Sign in on the official site in Guard's dedicated browser window; Google sign-in is supported.
+2. While Guard's login window is open, the card button says “完成登录” (finish sign-in). Click it after signing in; Guard closes the login process it started and reads usage. You may also close the dedicated window and click “刷新” (refresh). At other times, this button reads usage. Guard does not edit everyday Chrome tabs or terminate its process. Guard will not force-close an unowned browser holding the dedicated profile.
+3. Under “自动同步” (automatic sync), choose “手动” (manual) or 1, 2, 5, 10, 30, or 60 minutes. The default is five minutes. The choice survives Guard relaunches; changing it does not immediately send a request. Click “暂停” (pause) to stop future syncs and cancel an active usage read.
 
-Automatic syncing reuses one Headless Chrome session owned by Guard and returns its page to about:blank after each read. Pausing sync, manual-only mode, signing in, quitting Guard, or a failed read releases it. This reduces Dock entries caused by repeated cold starts; macOS may still add a recent-app entry at the first launch. Guard does not change global Dock settings. Only clicking Sign in opens a visible login window; automatic failures do not open one.
+Automatic syncing reuses one Guard-owned headless Chrome session and parks it on about:blank between reads. The process stays running and uses some memory. Switching to manual mode closes an idle session; an active read finishes before the session closes. In manual mode, each refresh also closes Chrome after the read. Pausing, signing in, quitting Guard, or a failed read releases the session. macOS may add a Chrome recent-app entry on first launch; Guard does not clear existing entries or change global Dock settings. Only clicking Sign in opens the dedicated login window; automatic sync failures do not open one.
 
 The dedicated browser has its own sign-in profile. It cannot reuse your everyday Chrome Google session, so the first connection needs a separate sign-in; subsequent upgrades retain that profile. Guard does not copy cookies or account data from your everyday browser. Chrome retains authentication in its dedicated profile; Guard receives only validated usage numbers, plan, and month.
 
-“暂停同步” (pause sync) stops future requests and cancels an active usage read without signing out. Unlimited Pro plans have no finite progress bar. Temporary failures retain the last successful values and actual sync time. The stale threshold follows the selected interval, with a minimum of fifteen minutes. Expired authentication requires signing in again.
+“暂停” (pause) stops future requests and cancels an active usage read without signing out. Unlimited Pro plans have no finite progress bar. Temporary failures retain the last successful values and actual sync time. The stale threshold follows the selected interval, with a minimum of fifteen minutes. Expired authentication requires signing in again.
 
 The usage endpoint is the read-only interface currently used by the official website, rather than a guaranteed public API. Website changes may break syncing. See the [official Chrome Headless guide](https://developer.chrome.com/docs/automation-and-testing/headless) for its window-free mode.
 
@@ -209,7 +209,7 @@ The offline self-test does not start the guard or operate the Commander service:
 ./build/CommanderGuard.app/Contents/MacOS/CommanderGuard --self-test
 ```
 
-The headless check starts Chrome twice with blank pages in a temporary profile and checks for leftover locks and changes to the foreground app. It does not access an account or verify real usage:
+The headless check starts one Chrome process, runs two checks against the same blank-page target in a temporary profile, and verifies that no lock remains after exit and the foreground app is unchanged. It does not access an account or usage service:
 
 ```bash
 ./build/CommanderGuard.app/Contents/MacOS/CommanderGuard --probe-headless
