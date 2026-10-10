@@ -22,6 +22,20 @@ if [[ ! "$SOURCE" -ef "$ROOT" ]]; then
   ditto "$SOURCE/Assets" "$ROOT/Assets"
 fi
 if [[ -f "$PLIST" ]]; then launchctl bootout "gui/$(id -u)" "$PLIST" >/dev/null 2>&1 || true; fi
+APP_PROCESS="$APP/Contents/MacOS/CommanderGuard"
+for pid in $(pgrep -f "^$APP_PROCESS$"); do
+  [[ "$(ps -p "$pid" -o comm= | sed 's/^[[:space:]]*//')" == "$APP_PROCESS" ]] || continue
+  kill -TERM "$pid" 2>/dev/null || true
+done
+for ((i = 0; i < 10; i++)); do
+  running=0
+  for pid in $(pgrep -f "^$APP_PROCESS$"); do
+    [[ "$(ps -p "$pid" -o comm= | sed 's/^[[:space:]]*//')" == "$APP_PROCESS" ]] && running=1
+  done
+  (( running == 0 )) && break
+  sleep 1
+done
+if (( running != 0 )); then echo "CommanderGuard is still running; refusing to replace $APP" >&2; exit 1; fi
 ditto "$SOURCE/build/CommanderGuard.app" "$APP"
 if [[ -L "$DESKTOP" ]]; then rm "$DESKTOP"; fi
 ln -s "$APP" "$DESKTOP"

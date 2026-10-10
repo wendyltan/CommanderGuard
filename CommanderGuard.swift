@@ -93,6 +93,10 @@ final class HeadlessQuotaBrowser {
     private let worker = DispatchQueue(label: "CommanderGuard.QuotaBrowser", qos: .utility)
     private var reading = false
     private var cancelled = false
+    // Access only on worker; the profile lock remains held while this browser lives.
+    private var browser: PipeBrowser?
+    private var browserLockFD: Int32 = -1
+    private var browserReuseCount = 0
     private var loginProcess: Process?
     private var loginLockFD: Int32 = -1
     private var sawLoginWindow = false
@@ -119,22 +123,21 @@ final class HeadlessQuotaBrowser {
                 if isCancelled() { throw Failure.cancelled }
                 let executable = try Self.validateExecutable(chromeExecutable)
                 let profile = try Self.prepareProfile()
-                let lockFD = try Self.acquireProfile(profile)
-                defer { flock(lockFD, LOCK_UN); close(lockFD) }
-                if try Self.hasBrowserLock(profile) { outcome = .loginOpen }
-                else if !Self.loginRequested(profile) { outcome = .loginRequired }
-                else {
-                    if isCancelled() { throw Failure.cancelled }
-                    let session = try PipeBrowser(executable: executable, profile: profile, cancelled: { [self] in isCancelled() })
-                    defer { session.finish() }
-                    let result = try session.fetchQuota()
-                    if result == "login" { outcome = .loginRequired }
-                    else if let bytes = result.data(using: .utf8), let quota = UsageQuota.parse(bytes) { outcome = .success(quota) }
-                    else if result == "timeout" { outcome = .unavailable("官方额度服务读取超时") }
-                    else if result == "network" { outcome = .unavailable("无法连接官方额度服务") }
-                    else if result.range(of: #"^http-[1-5][0-9]{2}$"#, options: .regularExpression) != nil {
-                        outcome = .unavailable("官方额度服务返回 HTTP \(result.suffix(3))")
-                    } else { outcome = .unavailable("官方额度响应暂时不可用") }
+                if browser == nil {
+                    let lockFD = try Self.acquireProfile(profile)
+                    var keepLock = false
+                    defer { if !keepLock { flock(lockFD, LOCK_UN); close(lockFD) } }
+                    if try Self.hasBrowserLock(profile) { outcome = .loginOpen }
+                    else if !Self.loginRequested(profile) { outcome = .loginRequired }
+                    else {
+                        if isCancelled() { throw Failure.cancelled }
+                        browser = try PipeBrowser(executable: executable, profile: profile, cancelled: { [self] in isCancelled() })
+                        browserLockFD = lockFD; keepLock = true
+                        outcome = try fetchQuota()
+                    }
+                } else {
+                    browserReuseCount += 1
+                    outcome = try fetchQuota()
                 }
             } catch let error as Failure {
                 switch error {
@@ -143,6 +146,7 @@ final class HeadlessQuotaBrowser {
                 default: outcome = .unavailable(error.localizedDescription)
                 }
             } catch { outcome = .unavailable("专用浏览器暂时无法读取额度") }
+            if case .success = outcome {} else { finishBrowser() }
             stateLock.lock()
             let wasCancelled = cancelled
             reading = false
@@ -152,10 +156,43 @@ final class HeadlessQuotaBrowser {
     }
 
     func cancel() {
-        stateLock.lock(); if reading { cancelled = true }; stateLock.unlock()
+        stateLock.lock(); cancelled = true; stateLock.unlock()
+        worker.async { [self] in finishBrowser() }
+    }
+    func stop(_ completion: @escaping () -> Void) {
+        stateLock.lock(); cancelled = true; stateLock.unlock()
+        worker.async { [self] in
+            finishBrowser()
+            DispatchQueue.main.async(execute: completion)
+        }
     }
     private func isCancelled() -> Bool {
         stateLock.lock(); defer { stateLock.unlock() }; return cancelled
+    }
+    private func fetchQuota() throws -> Outcome {
+        guard let browser else { throw Failure.unavailable }
+        fputs("CommanderGuard quota browser pid=\(browser.processID) reuse=\(browserReuseCount)\n", stderr)
+        let result = try browser.fetchQuota()
+        if result == "login" { return .loginRequired }
+        if let bytes = result.data(using: .utf8), let quota = UsageQuota.parse(bytes) { return .success(quota) }
+        if result == "timeout" { return .unavailable("官方额度服务读取超时") }
+        if result == "network" { return .unavailable("无法连接官方额度服务") }
+        if result.range(of: #"^http-[1-5][0-9]{2}$"#, options: .regularExpression) != nil {
+            return .unavailable("官方额度服务返回 HTTP \(result.suffix(3))")
+        }
+        return .unavailable("官方额度响应暂时不可用")
+    }
+    private func finishBrowser() {
+        let ownedPID = browser?.processID
+        browser?.finish(); browser = nil
+        if browserLockFD >= 0 {
+            flock(browserLockFD, LOCK_UN); close(browserLockFD); browserLockFD = -1
+        }
+        if let ownedPID { fputs("CommanderGuard quota browser stopped pid=\(ownedPID) reuse=\(browserReuseCount)\n", stderr) }
+        browserReuseCount = 0
+    }
+    private func finishBrowserBeforeLogin() {
+        worker.sync { finishBrowser() }
     }
 
     /// Explicit user action only. Returns false when the dedicated login browser is already open.
@@ -163,6 +200,7 @@ final class HeadlessQuotaBrowser {
         stateLock.lock(); defer { stateLock.unlock() }
         if loginProcess != nil { return false }
         guard !reading else { throw Failure.busy }
+        finishBrowserBeforeLogin()
         let executable = try Self.validateExecutable(chromeExecutable)
         let profile = try Self.prepareProfile()
         let fd = try Self.acquireProfile(profile)
@@ -314,12 +352,15 @@ final class HeadlessQuotaBrowser {
 
     private final class PipeBrowser {
         private var pid: pid_t = 0
+        var processID: pid_t { pid }
         private var writeFD: Int32 = -1
         private var readFD: Int32 = -1
         private var buffer = Data()
         private var received = 0
         private var sequence = 0
-        private let deadline = ProcessInfo.processInfo.systemUptime + 31.8
+        private var deadline: TimeInterval = 0
+        private var targetID: String?
+        private var sessionID: String?
         private let cancelled: () -> Bool
         private var finished = false
         init(executable: URL, profile: URL, cancelled: @escaping () -> Bool) throws {
@@ -367,31 +408,50 @@ final class HeadlessQuotaBrowser {
             high = [high[0], high[3]]
         }
         deinit { finish() }
-        func probe() throws {
-            let result = try request("Target.createTarget", ["url": "about:blank"])
-            guard let id = result["targetId"] as? String else { throw Failure.protocolError }
+        private func beginOperation() {
+            deadline = ProcessInfo.processInfo.systemUptime + 31.8
+            received = 0
+        }
+        private func attachedSession() throws -> String {
+            if let sessionID { return sessionID }
+            let target = try request("Target.createTarget", ["url": "about:blank"])
+            guard let id = target["targetId"] as? String else { throw Failure.protocolError }
             let attached = try request("Target.attachToTarget", ["targetId": id, "flatten": true])
             guard let session = attached["sessionId"] as? String else { throw Failure.protocolError }
+            targetID = id; sessionID = session
+            return session
+        }
+        func probe() throws -> String {
+            beginOperation()
+            let session = try attachedSession()
             let evaluated = try request("Runtime.evaluate", ["expression": "1 + 1", "returnByValue": true], session: session)
             guard (evaluated["result"] as? [String: Any])?["value"] as? Int == 2 else { throw Failure.protocolError }
+            guard let targetID else { throw Failure.protocolError }
+            return targetID
         }
         func fetchQuota() throws -> String {
-            let target = try request("Target.createTarget", ["url": "about:blank"])
-            guard let targetID = target["targetId"] as? String else { throw Failure.protocolError }
-            let attached = try request("Target.attachToTarget", ["targetId": targetID, "flatten": true])
-            guard let session = attached["sessionId"] as? String else { throw Failure.protocolError }
+            beginOperation()
+            let session = try attachedSession()
             let navigation = try request("Page.navigate", ["url": HeadlessQuotaBrowser.pageURL], session: session)
             guard navigation["errorText"] == nil else { throw Failure.unavailable }
             while true {
                 let response = try request("Runtime.evaluate", ["expression": "document.readyState === 'loading' || location.href === 'about:blank' ? 'pending' : (location.origin === 'https://mcp.desktopcommander.app' && location.pathname === '/usage' ? 'ready' : 'login')", "returnByValue": true], session: session)
                 if (response["result"] as? [String: Any])?["value"] as? String == "ready" { break }
-                if let text = (response["result"] as? [String: Any])?["value"] as? String, text == "login" { return "login" }
+                if let text = (response["result"] as? [String: Any])?["value"] as? String, text == "login" {
+                    try park(session: session)
+                    return "login"
+                }
                 try check(until: deadline)
                 Thread.sleep(forTimeInterval: 0.1)
             }
             let result = try request("Runtime.evaluate", ["expression": HeadlessQuotaBrowser.usageScript, "awaitPromise": true, "returnByValue": true], session: session, timeout: 14)
             guard result["exceptionDetails"] == nil, let value = (result["result"] as? [String: Any])?["value"] as? String, value.utf8.count <= 8192 else { throw Failure.protocolError }
+            try park(session: session)
             return value
+        }
+        private func park(session: String) throws {
+            let navigation = try request("Page.navigate", ["url": "about:blank"], session: session)
+            guard navigation["errorText"] == nil else { throw Failure.unavailable }
         }
         private func check(until limit: TimeInterval) throws {
             if cancelled() { throw Failure.cancelled }
@@ -516,12 +576,13 @@ final class HeadlessQuotaBrowser {
         try validateDirectory(profile, privateMode: true)
         let fd = try acquireProfile(profile)
         defer { flock(fd, LOCK_UN); close(fd) }
-        for _ in 0..<2 {
-            let browser = try PipeBrowser(executable: executable, profile: profile, cancelled: { false })
-            do { try browser.probe() } catch { browser.finish(); throw error }
-            browser.finish()
-            guard !(try hasBrowserLock(profile)) else { throw Failure.profile }
-        }
+        let browser = try PipeBrowser(executable: executable, profile: profile, cancelled: { false })
+        do {
+            let target = try browser.probe()
+            guard try browser.probe() == target else { throw Failure.protocolError }
+        } catch { browser.finish(); throw error }
+        browser.finish()
+        guard !(try hasBrowserLock(profile)) else { throw Failure.profile }
     }
 
     static func runOfflineChecks() throws {
@@ -542,6 +603,15 @@ final class HeadlessQuotaBrowser {
         do { let extra = try acquireProfile(scratch); close(extra); preconditionFailure("concurrent profile lock accepted") } catch Failure.busy {}
         flock(firstLock, LOCK_UN); close(firstLock)
         let nextLock = try acquireProfile(scratch); flock(nextLock, LOCK_UN); close(nextLock)
+        for phase in 0..<3 {
+            let lifetime = HeadlessQuotaBrowser()
+            lifetime.browserLockFD = try acquireProfile(scratch)
+            if phase == 0 { lifetime.cancel() }
+            else if phase == 1 { lifetime.stop {} }
+            else { lifetime.finishBrowserBeforeLogin() }
+            lifetime.worker.sync {}
+            let releasedLock = try acquireProfile(scratch); flock(releasedLock, LOCK_UN); close(releasedLock)
+        }
         let link = scratch.appendingPathComponent("linked-profile")
         guard symlink(scratch.path, link.path) == 0 else { throw Failure.profile }
         do { try validateDirectory(link, privateMode: true); preconditionFailure("symlink profile accepted") } catch Failure.profile {}
@@ -3849,15 +3919,17 @@ func selfTest() {
 }
 
 final class PanelBackgroundView: NSView {
-    override func viewDidChangeEffectiveAppearance() {
-        super.viewDidChangeEffectiveAppearance()
+    override func viewDidMoveToWindow() { super.viewDidMoveToWindow(); updateColors() }
+    override func viewDidChangeEffectiveAppearance() { super.viewDidChangeEffectiveAppearance(); updateColors() }
+    private func updateColors() {
         effectiveAppearance.performAsCurrentDrawingAppearance { layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor }
     }
 }
 
 final class PanelCardView: NSView {
-    override func viewDidChangeEffectiveAppearance() {
-        super.viewDidChangeEffectiveAppearance()
+    override func viewDidMoveToWindow() { super.viewDidMoveToWindow(); updateColors() }
+    override func viewDidChangeEffectiveAppearance() { super.viewDidChangeEffectiveAppearance(); updateColors() }
+    private func updateColors() {
         effectiveAppearance.performAsCurrentDrawingAppearance {
             layer?.borderColor = NSColor.separatorColor.cgColor
             layer?.backgroundColor = NSColor.controlBackgroundColor.blended(withFraction: 0.06, of: .labelColor)?.cgColor
@@ -4000,11 +4072,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         pollActivity()
     }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard quotaRequestInFlight else { return .terminateNow }
-        quotaTerminateWhenIdle = true; quotaBrowser.cancel()
+        guard !previewMode else { return .terminateNow }
+        if quotaTerminateWhenIdle { return .terminateLater }
+        quotaTerminateWhenIdle = true
+        quotaBrowser.stop { NSApp.reply(toApplicationShouldTerminate: true) }
         return .terminateLater
     }
-    func applicationWillTerminate(_ n: Notification) { timer?.invalidate(); channelTimer?.invalidate(); activityTimer?.invalidate(); quotaTimer?.invalidate(); quotaBrowser.cancel(); releaseAssertion() }
+    func applicationWillTerminate(_ n: Notification) { timer?.invalidate(); channelTimer?.invalidate(); activityTimer?.invalidate(); quotaTimer?.invalidate(); releaseAssertion() }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool { openPanel(); return true }
     private func rebuild() {
         let m = NSMenu()
@@ -4607,6 +4681,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let index = sender.indexOfSelectedItem
         guard quotaRefreshOptions.indices.contains(index) else { return }
         UserDefaults.standard.set(quotaRefreshOptions[index], forKey: "quotaRefreshSeconds")
+        if quotaRefreshOptions[index] == 0 && !quotaRequestInFlight { quotaBrowser.cancel() }
         resetQuotaTimer()
         renderQuota()
     }
@@ -4666,10 +4741,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                 self.renderQuota()
             }
             self.quotaCancelRequested = false
-            if self.quotaTerminateWhenIdle {
-                self.quotaTerminateWhenIdle = false
-                NSApp.reply(toApplicationShouldTerminate: true)
-            } else if self.quotaRefreshAfterLogin {
+            if self.quotaRefreshSeconds == 0 { self.quotaBrowser.cancel() }
+            if self.quotaRefreshAfterLogin && !self.quotaTerminateWhenIdle {
                 self.quotaRefreshAfterLogin = false
                 if self.quotaEnabled { self.refreshQuota() }
             }
@@ -5451,6 +5524,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         verify(panelConnection?.stringValue == "上次探测成功", "Channel headline must stay concise while time and freshness remain separate")
         verify(panelChat?.stringValue == "连接正常" && panelChatDetail?.isHidden == false && panelChatDetail?.stringValue.hasPrefix("原回答是否完整：无法确认") == true, "ChatGPT connection health must not imply answer completeness")
         verify(panelSectionCount == 3, "Overview must show conclusion, guard controls, and a compact quota/task row")
+        verify(panelControlCard?.layer?.backgroundColor != nil, "Cards must paint their distinct background on initial attachment")
         verify(panelControlCard?.isHidden == false && panelRecoveryToggle?.title == "自动恢复本机 Commander" && panelRecoveryToggle?.toolTip?.contains("不会重试原任务") == true, "Recovery control must explain its local-only action and safeguards")
         verify(panelProbeToggle?.title == "云端主动探测（可能消耗额度）" && panelProbeToggle?.state == .off && panelProbeBudget?.stringValue == activeProbeStatus.display && panelProbeIntervalPicker?.indexOfSelectedItem == ActiveProbeBudget.defaultIntervalIndex && panelProbeIntervalPicker?.numberOfItems == ActiveProbeBudget.intervalOptions.count && panelManualCheck?.isEnabled == false, "Probe switch must default OFF and show the selected cadence")
         verify(panelWakeToggle?.title == "防止闲置睡眠（Guard）" && panelWakeToggle?.toolTip?.contains("其他程序仍可能保持唤醒") == true && panelWakeStatus?.stringValue.contains("保持唤醒：") == true, "Wake control must describe its actual assertion and limits")

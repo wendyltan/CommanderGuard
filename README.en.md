@@ -98,12 +98,12 @@ A toggle records your permission; its adjacent status explains whether Guard can
 This shows Desktop Commander cloud tool calls usage, separate from your ChatGPT subscription limits. It is optional and requires Google Chrome to be installed.
 
 1. Click “连接额度账户” (connect usage account) in Overview and sign in on the official site in Guard's dedicated browser window. Google sign-in is supported.
-2. After signing in, return to Guard and click “完成登录并同步” (finish sign-in and sync), which closes only the dedicated browser process Guard launched and reads usage in the background. You may also close the window and click Refresh. Everyday Chrome is unaffected. Guard will not force-close an unowned browser holding the profile.
+2. After signing in, return to Guard and click “完成登录并同步” (finish sign-in and sync), which closes only the dedicated browser process Guard launched and reads usage in the background. You may also close the window and click Refresh. Guard does not edit everyday Chrome tabs or terminate its process. Guard will not force-close an unowned browser holding the profile.
 3. Choose manual only or 1, 2, 5, 10, 30, or 60 minutes under “后台自动同步” (background sync). The default is five minutes. The choice survives Guard relaunches; changing it does not immediately send a request.
 
-Automatic reads use Chrome Headless, without visible windows or changes to your everyday browser tabs or foreground app. Only clicking the sign-in button opens a dedicated login window. A failed automatic read never opens a login window on its own.
+Automatic syncing reuses one Headless Chrome session owned by Guard and returns its page to about:blank after each read. Pausing sync, manual-only mode, signing in, quitting Guard, or a failed read releases it. This reduces Dock entries caused by repeated cold starts; macOS may still add a recent-app entry at the first launch. Guard does not change global Dock settings. Only clicking Sign in opens a visible login window; automatic failures do not open one.
 
-The dedicated browser has its own sign-in profile. It cannot reuse your everyday Chrome Google session, so upgrading requires signing in once in the dedicated window. Guard does not copy cookies or account data from your everyday browser. Chrome retains authentication in its dedicated profile; Guard receives only validated usage numbers, plan, and month.
+The dedicated browser has its own sign-in profile. It cannot reuse your everyday Chrome Google session, so the first connection needs a separate sign-in; subsequent upgrades retain that profile. Guard does not copy cookies or account data from your everyday browser. Chrome retains authentication in its dedicated profile; Guard receives only validated usage numbers, plan, and month.
 
 “暂停同步” (pause sync) stops future requests and cancels an active usage read without signing out. Unlimited Pro plans have no finite progress bar. Temporary failures retain the last successful values and actual sync time. The stale threshold follows the selected interval, with a minimum of fifteen minutes. Expired authentication requires signing in again.
 
