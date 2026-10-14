@@ -787,8 +787,12 @@ func isCommanderRemoteCallReceipt(_ event: TimelineEvent) -> Bool {
     event.source == "commander" && event.event.hasPrefix("调用receipt:")
 }
 
-func localRestartSuppressed(for category: ChannelIncidentCategory?) -> Bool {
-    category == .cloudRealtimeCapacity
+func localRestartSuppressed(for incident: ChannelIncidentState, at now: Date) -> Bool {
+    incident.capacitySuppressionActive(at: now)
+}
+
+func isConfirmedExternalProcessRestart(oldPID: Int32, newPID: Int32, oldProcessExited: Bool) -> Bool {
+    oldPID > 0 && newPID > 0 && oldPID != newPID && oldProcessExited
 }
 
 struct TimelineEvent: Codable {
@@ -2412,6 +2416,7 @@ struct ChannelIncidentState: Codable {
     var recentCategory: ChannelIncidentCategory?
     var firstSeen: Date?
     var lastSeen: Date?
+    var lastCapacitySeen: Date?
     var recoveredAt: Date?
     var lastProcessedTimelineAt: Date
     var eventCount = 0
@@ -2424,6 +2429,7 @@ struct ChannelIncidentState: Codable {
     init(now: Date = Date()) { lastProcessedTimelineAt = now }
 
     mutating func observe(_ category: ChannelIncidentCategory, at date: Date) -> Bool {
+        if category == .cloudRealtimeCapacity { lastCapacitySeen = max(lastCapacitySeen ?? date, date) }
         let wasActive = activeCategory != nil
         if !wasActive {
             activeCategory = category
@@ -2449,7 +2455,7 @@ struct ChannelIncidentState: Codable {
 
     mutating func markRecovered(at date: Date) {
         guard activeCategory != nil else { return }
-        recentCategory = activeCategory
+        if recentCategory != .cloudRealtimeCapacity || activeCategory == .cloudRealtimeCapacity { recentCategory = activeCategory }
         activeCategory = nil
         recoveredAt = date
         nextRecheck = nil
@@ -2484,12 +2490,27 @@ struct ChannelIncidentState: Codable {
         return now.timeIntervalSince(lastSeen) >= 60
     }
 
+    func capacitySuppressionActive(at now: Date) -> Bool {
+        guard activeCategory == .cloudRealtimeCapacity else { return false }
+        guard let lastCapacitySeen else { return true }
+        return now.timeIntervalSince(lastCapacitySeen) < 300
+    }
+
+    mutating func expireCapacitySuppression(at now: Date) -> Bool {
+        guard activeCategory == .cloudRealtimeCapacity, !capacitySuppressionActive(at: now) else { return false }
+        activeCategory = .channelDisruption
+        return true
+    }
+
     static func load(from url: URL, now: Date = Date()) -> ChannelIncidentState {
         guard FileManager.default.fileExists(atPath: url.path),
               (try? url.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) != true,
               let data = try? Data(contentsOf: url), data.count <= 8192,
-              let value = try? JSONDecoder().decode(ChannelIncidentState.self, from: data) else {
+              var value = try? JSONDecoder().decode(ChannelIncidentState.self, from: data) else {
             return ChannelIncidentState(now: now)
+        }
+        if value.activeCategory == .cloudRealtimeCapacity, value.lastCapacitySeen == nil {
+            value.lastCapacitySeen = value.lastSeen
         }
         return value
     }
@@ -3479,8 +3500,6 @@ func selfTest() {
     let capacityIncidentEvent = TimelineEvent(source: "commander", event: "Commander错误: 云端实时服务连接池异常", sourceAt: nil, observedAt: ISO8601DateFormatter.flex.string(from: now.addingTimeInterval(1)))
     precondition(channelIncidentCategory(for: genericIncidentEvent) == .channelDisruption)
     precondition(channelIncidentCategory(for: capacityIncidentEvent) == .cloudRealtimeCapacity)
-    precondition(localRestartSuppressed(for: .cloudRealtimeCapacity) && !localRestartSuppressed(for: .channelDisruption) && !localRestartSuppressed(for: nil))
-
     var incidentTest = ChannelIncidentState(now: now.addingTimeInterval(-1))
     precondition(incidentTest.observe(.channelDisruption, at: now))
     precondition(incidentTest.activeCategory == .channelDisruption && incidentTest.eventCount == 1)
@@ -3499,12 +3518,34 @@ func selfTest() {
     precondition(!incidentTest.observe(.cloudRealtimeCapacity, at: now.addingTimeInterval(2)))
     precondition(incidentTest.activeCategory == .cloudRealtimeCapacity && incidentTest.eventCount == 2)
     precondition(incidentTest.consumeCapacityAlert() && !incidentTest.consumeCapacityAlert(), "Capacity alert must be issued once per active incident")
+    precondition(incidentTest.capacitySuppressionActive(at: now.addingTimeInterval(301)))
+    precondition(!incidentTest.capacitySuppressionActive(at: now.addingTimeInterval(302)), "Capacity suppression must expire after five quiet minutes")
+    var renewedCapacity = incidentTest
+    _ = renewedCapacity.observe(.channelDisruption, at: now.addingTimeInterval(250))
+    precondition(!renewedCapacity.capacitySuppressionActive(at: now.addingTimeInterval(302)), "Generic disconnects must not renew capacity evidence")
+    _ = renewedCapacity.observe(.cloudRealtimeCapacity, at: now.addingTimeInterval(301))
+    precondition(renewedCapacity.capacitySuppressionActive(at: now.addingTimeInterval(302)), "A fresh capacity event must renew suppression")
+    precondition(localRestartSuppressed(for: incidentTest, at: now.addingTimeInterval(301)) && !localRestartSuppressed(for: incidentTest, at: now.addingTimeInterval(302)))
+    var expiredIncident = incidentTest
+    precondition(expiredIncident.expireCapacitySuppression(at: now.addingTimeInterval(302)))
+    precondition(expiredIncident.activeCategory == .channelDisruption && expiredIncident.recentCategory == .cloudRealtimeCapacity && expiredIncident.eventCount == 2)
+    expiredIncident.markRecovered(at: now.addingTimeInterval(303))
+    precondition(expiredIncident.activeCategory == nil && expiredIncident.recentCategory == .cloudRealtimeCapacity, "Expiry must retain the capacity history after recovery")
     precondition(!incidentTest.canDeclareRecovered(afterHealthyProbeAt: now.addingTimeInterval(61)))
     precondition(incidentTest.canDeclareRecovered(afterHealthyProbeAt: now.addingTimeInterval(63)))
     let incidentFile = dir.appendingPathComponent("channel-incident.json")
     precondition(incidentTest.save(to: incidentFile))
     let loadedIncident = ChannelIncidentState.load(from: incidentFile, now: now)
     precondition(loadedIncident.activeCategory == .cloudRealtimeCapacity && loadedIncident.alertIssued)
+    let legacyObjectSource = try! JSONSerialization.jsonObject(with: JSONEncoder().encode(incidentTest)) as! [String: Any]
+    var legacyObject = legacyObjectSource
+    legacyObject.removeValue(forKey: "lastCapacitySeen")
+    try! JSONSerialization.data(withJSONObject: legacyObject).write(to: incidentFile)
+    var loadedLegacyIncident = ChannelIncidentState.load(from: incidentFile, now: now)
+    precondition(loadedLegacyIncident.capacitySuppressionActive(at: now.addingTimeInterval(299)))
+    _ = loadedLegacyIncident.observe(.channelDisruption, at: now.addingTimeInterval(250))
+    precondition(!loadedLegacyIncident.capacitySuppressionActive(at: now.addingTimeInterval(302)), "Legacy incidents use lastSeen as conservative capacity evidence")
+    precondition(loadedLegacyIncident.lastCapacitySeen == now.addingTimeInterval(2), "Legacy capacity time must not drift with generic events")
     var recoveredIncident = loadedIncident
     recoveredIncident.markRecovered(at: now.addingTimeInterval(64))
     precondition(recoveredIncident.activeCategory == nil && recoveredIncident.recentCategory == .cloudRealtimeCapacity && recoveredIncident.recoveredAt == now.addingTimeInterval(64))
@@ -3670,8 +3711,10 @@ func selfTest() {
     let bootstrap = ActivityLogReader(url: log); bootstrap.poll()
     bootstrap.poll(); precondition(bootstrap.summary.active.isEmpty && !bootstrap.summary.idleProven)
     precondition(!reader.confirmedProcessRestart(oldPID: 1, newPID: 1, oldProcessExited: true))
+    precondition(!isConfirmedExternalProcessRestart(oldPID: 1, newPID: 2, oldProcessExited: false) && reader.summary.coverageGap, "A live old process must keep the coverage gap")
+    let externalRestartConfirmed = isConfirmedExternalProcessRestart(oldPID: 1, newPID: 2, oldProcessExited: true)
+    precondition(externalRestartConfirmed && reader.confirmedProcessRestart(oldPID: 1, newPID: 2, oldProcessExited: externalRestartConfirmed), "A verified external PID change must rebuild the reader epoch")
     try! Data("🚀 Starting MCP Device...\n".utf8).write(to: log)
-    precondition(reader.confirmedProcessRestart(oldPID: 1, newPID: 2, oldProcessExited: true))
     reader.poll(); reader.poll(); precondition(activitySafeForRecovery(reader.summary))
     let appRoot = dir.appendingPathComponent("app-logs", isDirectory: true)
     let day = appRoot.appendingPathComponent("2026/10/01", isDirectory: true)
@@ -4010,10 +4053,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private var historicalRecordsExpanded = false
     private var historicalRecordsToggle: NSButton?
     private let activityReader = ActivityLogReader(errorURL: FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/RemoteDesktopCommander/stderr.log"))
+    private var activityObservedPID: Int32?
     private let toolHistoryReader = ToolHistoryReader()
     private var lastToolHistoryPoll = Date.distantPast
     private var verifiedRestart: (old: Int32, new: Int32)?
     private var pendingRecoveryVerification: (old: Int32, new: Int32)?
+    private var lastActivityPIDCheck = Date.distantPast
     private let timelineReader = TimelineReader()
     private var activityBusy = false
     private var activityTimer: Timer?
@@ -4095,8 +4140,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
     private func poll() {
         DispatchQueue.global(qos: .utility).async {
-            let running = self.serviceRunning()
-            DispatchQueue.main.async { self.snapshot.service = running ? "运行中" : "未运行"; self.updateGuard(); self.render() }
+            let pid = self.servicePID()
+            DispatchQueue.main.async { self.snapshot.service = pid == nil ? "未运行" : "运行中"; self.updateGuard(); self.render() }
         }
         snapshot.checked = Date()
         Monitor.shared.check { state, seen, error in
@@ -4222,7 +4267,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                 let checkedAt = Date()
                 self.recordProbe(result, now: checkedAt, submitted: probe.submitted)
                 if case .noLiveConnection = result, self.watchdog.failures >= 3 {
-                    if localRestartSuppressed(for: self.channelIncident.activeCategory) {
+                    if localRestartSuppressed(for: self.channelIncident, at: checkedAt) {
                         self.auditChannel(kind: "recovery_decision", result: "restart_suppressed_cloud_capacity",
                                           action: "wait_for_cloud_recovery", at: checkedAt)
                         self.snapshot.channelDetail = "云端容量异常不通过重启本机 Commander 修复；继续退避复查"
@@ -4341,7 +4386,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private func considerRecovery() {
         let now = Date()
         if let reason = activeProbeStatus.permissionBlockReason { snapshot.channelDetail = "自动恢复已暂停：\(reason)"; render(); return }
-        if localRestartSuppressed(for: channelIncident.activeCategory) {
+        if localRestartSuppressed(for: channelIncident, at: now) {
             snapshot.channelDetail = "云端实时服务连接池异常；本机重启不会修复该容量问题"
             auditChannel(kind: "recovery_decision", result: "restart_suppressed_cloud_capacity",
                          action: "wait_for_cloud_recovery", at: now)
@@ -4469,12 +4514,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private func pollActivity() {
         guard !activityBusy else { return }
         let restart = verifiedRestart; verifiedRestart = nil
+        let checkProcessEpoch = Date().timeIntervalSince(lastActivityPIDCheck) >= 30
+        if checkProcessEpoch { lastActivityPIDCheck = Date() }
         let now = Date(), pollHistory = now.timeIntervalSince(lastToolHistoryPoll) >= 5
         if pollHistory { lastToolHistoryPoll = now }
         activityBusy = true
         DispatchQueue.global(qos: .utility).async {
-            if let restart { self.activityReader.confirmedProcessRestart(oldPID: restart.old, newPID: restart.new, oldProcessExited: true) }
+            if let restart {
+                self.activityReader.confirmedProcessRestart(oldPID: restart.old, newPID: restart.new, oldProcessExited: true)
+                self.activityObservedPID = restart.new
+            }
+            let pidBeforeReplay = checkProcessEpoch ? self.servicePID() : nil
+            if let old = self.activityObservedPID, let pid = pidBeforeReplay,
+               isConfirmedExternalProcessRestart(oldPID: old, newPID: pid, oldProcessExited: kill(old, 0) == -1 && errno == ESRCH) {
+                self.activityReader.confirmedProcessRestart(oldPID: old, newPID: pid, oldProcessExited: true)
+                self.activityObservedPID = pid
+            } else if self.activityObservedPID == nil, let pid = pidBeforeReplay {
+                self.activityObservedPID = pid
+            }
             self.activityReader.poll()
+            let pidAfterReplay = checkProcessEpoch ? self.servicePID() : nil
+            if let old = pidBeforeReplay, let pid = pidAfterReplay,
+               isConfirmedExternalProcessRestart(oldPID: old, newPID: pid, oldProcessExited: kill(old, 0) == -1 && errno == ESRCH) {
+                self.activityReader.confirmedProcessRestart(oldPID: old, newPID: pid, oldProcessExited: true)
+                self.activityObservedPID = pid
+            }
             if pollHistory { self.toolHistoryReader.poll() }
             self.timelineReader.poll()
             let value = self.activityReader.summary
@@ -4488,15 +4552,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             }
         }
     }
-    private func serviceRunning() -> Bool {
-        let p = Process(); p.executableURL = URL(fileURLWithPath: "/bin/launchctl"); p.arguments = ["print", "gui/\(getuid())/com.wuwendi.remote-desktop-commander"]
-        let out = Pipe(); p.standardOutput = out; p.standardError = Pipe()
-        do { try p.run() } catch { return false }
-        DispatchQueue.global().asyncAfter(deadline: .now() + 2) { if p.isRunning { p.terminate() } }
-        let data = out.fileHandleForReading.readDataToEndOfFile()
-        p.waitUntilExit()
-        return p.terminationStatus == 0 && String(data: data, encoding: .utf8)?.contains("state = running") == true && String(data: data, encoding: .utf8)?.contains("pid = ") == true
-    }
     private func updateGuard() {
         if !paused && snapshot.service == "运行中" && assertion == 0 {
             let result = IOPMAssertionCreateWithName(kIOPMAssertionTypePreventUserIdleSystemSleep as CFString, IOPMAssertionLevel(kIOPMAssertionLevelOn), "Commander service guardian" as CFString, &assertion)
@@ -4507,6 +4562,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private func releaseAssertion() { if assertion != 0 { IOPMAssertionRelease(assertion); assertion = 0 } }
     private func render() {
         guard summaryLines.count == 5 else { return }
+        if channelIncident.expireCapacitySuppression(at: Date()) { saveChannelIncident() }
         let activity = snapshot.activity
         let clockText: (Date) -> String = { DateFormatter.localizedString(from: $0, dateStyle: .none, timeStyle: .medium) }
         let now = Date()
@@ -4561,7 +4617,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private func recoveryAvailability() -> String {
         guard recoveryLedger.autoRecoveryEnabled else { return "已关闭" }
         if let reason = activeProbeStatus.permissionBlockReason { return "已暂停 · \(reason)" }
-        if localRestartSuppressed(for: channelIncident.activeCategory) {
+        if localRestartSuppressed(for: channelIncident, at: Date()) {
             return "云端容量异常 · 不重启本机 · 退避复查"
         }
         if watchdog.recovering { return "恢复中" }

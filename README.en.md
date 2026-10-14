@@ -119,11 +119,11 @@ Tool execution uses recent, explicitly successful real calls. Evidence older tha
 
 ### Guard cannot safely confirm that the device is idle
 
-The message “本机日志覆盖有缺口，无法安全确认空闲” means Guard cannot see the complete call history. Logs may have rotated, been truncated or lost, failed to read, or not yet been fully read. Recovery is deferred because a task may still be running. The warning alone establishes neither a disconnect nor task completion.
+The message “本机日志覆盖有缺口，无法安全确认空闲” means Guard cannot see the complete call history. Logs may have rotated, been truncated or lost, failed to read, or not yet been fully read. Recovery is deferred because a task may still be running. After it verifies that the managed service PID changed and the old process exited, Guard rebuilds the call timeline from the new service's startup record; it checks idleness only after reading the new service's call records. The warning alone establishes neither a disconnect nor task completion.
 
 ### Cloud Realtime connection pool error
 
-“云端实时服务连接池异常” means Guard observed `IncreaseConnectionPool` in the logs. This cloud capacity category suppresses local automatic restarts. Rechecks obey the selected probe interval; incident backoff cannot bypass it. Turning active probes OFF pauses rechecks.
+“云端实时服务连接池异常” means Guard observed `IncreaseConnectionPool` in the logs. This category suppresses local automatic restarts for five minutes after the latest capacity event. A new capacity event renews that window; ordinary disconnect checks do not. After five quiet minutes, history remains visible and recovery treats later failures as channel disruptions. Rechecks obey the selected probe interval; incident backoff cannot bypass it. Turning active probes OFF pauses rechecks.
 
 Use the latest check result and timestamp to assess the current state. An old capacity warning or an online console entry cannot establish whether the command channel has recovered. Guard records the incident and rechecks, but cannot expand or repair the cloud connection pool. See [Realtime Error Codes](https://supabase.com/docs/guides/realtime/error_codes) and [Realtime Settings](https://supabase.com/docs/guides/realtime/settings).
 
