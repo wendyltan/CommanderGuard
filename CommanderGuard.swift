@@ -3985,8 +3985,8 @@ final class PanelCardView: NSView {
     override func viewDidChangeEffectiveAppearance() { super.viewDidChangeEffectiveAppearance(); updateColors() }
     private func updateColors() {
         effectiveAppearance.performAsCurrentDrawingAppearance {
-            layer?.borderColor = NSColor.separatorColor.cgColor
-            layer?.backgroundColor = NSColor.controlBackgroundColor.blended(withFraction: 0.06, of: .labelColor)?.cgColor
+            layer?.borderColor = NSColor.separatorColor.withAlphaComponent(NSColor.separatorColor.alphaComponent * 0.6).cgColor
+            layer?.backgroundColor = NSColor.controlBackgroundColor.blended(withFraction: 0.035, of: .labelColor)?.cgColor
         }
     }
 }
@@ -4650,7 +4650,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         return "\(prominentStamp(record.timestamp)) · \(record.label) · \(record.resultLabel) · \(duration)\(caveat) · \(record.cloudReceiptLabel)"
     }
     private func quotaDisplay() -> String {
-        if quota.total == nil, let used = quota.used, !quota.plan.isEmpty { return "\(used) 次 · \(quota.plan.lowercased() == "pro" ? "Pro" : quota.plan) 无限制" }
+        if quota.total == nil, quota.used != nil, quota.plan.lowercased() == "pro" { return "Pro 无限制" }
+        if quota.total == nil, let used = quota.used, !quota.plan.isEmpty { return "\(used) 次 · \(quota.plan) 无限制" }
         guard let used = quota.used, let total = quota.total else { return quota.state == .connecting ? "正在连接…" : quota.state == .refreshing ? "正在读取…" : "暂无额度数据" }
         return "\(used) / \(total) 次 · 剩余 \(quota.remaining ?? 0) 次"
     }
@@ -4671,11 +4672,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         case .unlimited: return "当前周期：\(quota.month) · \(quota.plan) · 无限制" + old
         }
     }
+    private func quotaStatusDisplay() -> String {
+        let detail = quotaStateText()
+        guard quota.total == nil, let used = quota.used, quota.plan.lowercased() == "pro" else { return detail }
+        return "累计调用：\(used) 次 · \(detail)"
+    }
     private func renderQuota() {
         ageQuota()
         quotaValue?.stringValue = quotaDisplay()
         quotaValue?.textColor = quotaIsStale(quota, now: Date(), refreshSeconds: quotaRefreshSeconds) ? .systemOrange : .labelColor
-        quotaStatus?.stringValue = quotaStateText()
+        quotaStatus?.stringValue = quotaStatusDisplay()
         quotaSynced?.stringValue = "上次成功同步：\(displayEvidenceTime(quota.syncedAt))"
         quotaButton?.title = quotaEnabled ? "登录" : "连接"
         quotaButton?.isEnabled = !previewMode && !quotaRequestInFlight && quota.state != .refreshing
@@ -4701,25 +4707,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         interval.target = self; interval.action = #selector(quotaRefreshIntervalChanged(_:)); interval.isEnabled = !previewMode
         interval.menu?.delegate = self
         interval.widthAnchor.constraint(equalToConstant: 112).isActive = true
-        let title = label("额度", size: 12, weight: .semibold, color: .secondaryLabelColor)
+        let title = label("账户用量", size: 15, weight: .semibold, color: .secondaryLabelColor)
         let actions = NSStackView(views: [title, NSView(), pause, refresh, connect]); actions.orientation = .horizontal; actions.alignment = .centerY; actions.spacing = 8
         let intervalRow = NSStackView(views: [intervalLabel, interval, NSView()]); intervalRow.orientation = .horizontal; intervalRow.alignment = .centerY; intervalRow.spacing = 8
-        let value = label(quotaDisplay(), size: 17, weight: .semibold)
+        let value = label(quotaDisplay(), size: 15, weight: .semibold)
         let progress = NSProgressIndicator(); progress.isIndeterminate = false; progress.minValue = 0; progress.maxValue = 1; progress.style = .bar; progress.heightAnchor.constraint(equalToConstant: 5).isActive = true
         if let total = quota.total, let used = quota.used { progress.doubleValue = total == 0 ? 0 : min(1, Double(used) / Double(total)) } else { progress.isHidden = true }
-        let status = label(quotaStateText(), size: 12, color: .secondaryLabelColor)
-        let synced = label("上次成功同步：\(displayEvidenceTime(quota.syncedAt))", size: 17, weight: .semibold)
-        synced.font = .monospacedDigitSystemFont(ofSize: 17, weight: .semibold)
-        synced.textColor = .labelColor
+        let status = label(quotaStatusDisplay(), size: 12, color: .secondaryLabelColor)
+        let synced = label("上次成功同步：\(displayEvidenceTime(quota.syncedAt))", size: 12, color: .secondaryLabelColor)
+        synced.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
         if quotaIsStale(quota, now: Date(), refreshSeconds: quotaRefreshSeconds) { value.textColor = .systemOrange }
-        let stack = vertical(7)
+        let stack = vertical(6)
         [actions, intervalRow, value, progress, status, synced].forEach { stack.addArrangedSubview($0); $0.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true }
         quotaButton = connect; quotaPauseButton = pause; quotaRefreshButton = refresh; quotaIntervalPicker = interval; quotaValue = value; quotaStatus = status; quotaSynced = synced; quotaProgress = progress
-        return card(stack, padding: 12)
+        return card(stack, padding: 16)
     }
     private func quotaAndTaskSection(_ taskRows: [(String, String)]) -> NSView {
-        let row = NSStackView(views: [quotaSection(), section("当前任务", rows: taskRows)])
-        row.orientation = .horizontal; row.alignment = .top; row.distribution = .fillEqually; row.spacing = 9
+        let quota = quotaSection(), task = section("当前任务", rows: taskRows)
+        let row = NSStackView(views: [quota, task])
+        task.heightAnchor.constraint(equalTo: quota.heightAnchor).isActive = true
+        row.orientation = .horizontal; row.alignment = .top; row.distribution = .fillEqually; row.spacing = 16
         return row
     }
     private func clearQuota(_ state: UsageQuota.State) {
@@ -4913,9 +4920,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let stack = NSStackView(); stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = spacing
         return stack
     }
-    private func card(_ content: NSView, padding: CGFloat = 18) -> NSView {
+    private func card(_ content: NSView, padding: CGFloat = 16) -> NSView {
         let card = PanelCardView()
-        card.wantsLayer = true; card.layer?.cornerRadius = 16; card.layer?.masksToBounds = true
+        card.wantsLayer = true; card.layer?.cornerRadius = 12; card.layer?.masksToBounds = true
         card.layer?.borderColor = NSColor.separatorColor.cgColor; card.layer?.borderWidth = 1
         card.addSubview(content); content.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
@@ -4928,17 +4935,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
     private func heroCard(_ eyebrow: String, value: NSTextField, time: NSTextField, detail: NSTextField) -> NSView {
         let stack = vertical(2)
-        stack.addArrangedSubview(label(eyebrow, size: 10, weight: .semibold, color: .secondaryLabelColor))
+        stack.addArrangedSubview(label(eyebrow, size: 12, weight: .medium, color: .secondaryLabelColor))
         stack.addArrangedSubview(value); stack.addArrangedSubview(time)
         stack.addArrangedSubview(detail)
         value.font = .systemFont(ofSize: 14, weight: .semibold)
         value.maximumNumberOfLines = 1
-        time.font = .monospacedDigitSystemFont(ofSize: 14, weight: .medium)
+        time.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
         time.textColor = .secondaryLabelColor
         detail.font = .systemFont(ofSize: 12, weight: .regular)
         detail.textColor = .secondaryLabelColor
         detail.maximumNumberOfLines = 2
-        return card(stack, padding: 8)
+        return card(stack, padding: 12)
     }
     private func buildPanel() {
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 940, height: 720), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
@@ -4947,14 +4954,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         if previewMode && CommandLine.arguments.contains("--preview-light") { window.appearance = NSAppearance(named: .aqua) }
         window.isReleasedWhenClosed = false; window.minSize = NSSize(width: 760, height: 560); window.center()
         let root = PanelBackgroundView(); root.wantsLayer = true; window.contentView = root
-        let layout = vertical(9); layout.edgeInsets = NSEdgeInsets(top: 12, left: 24, bottom: 12, right: 24)
+        let layout = vertical(16); layout.edgeInsets = NSEdgeInsets(top: 24, left: 24, bottom: 24, right: 24)
         root.addSubview(layout); layout.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([layout.leadingAnchor.constraint(equalTo: root.leadingAnchor), layout.trailingAnchor.constraint(equalTo: root.trailingAnchor), layout.topAnchor.constraint(equalTo: root.topAnchor), layout.bottomAnchor.constraint(equalTo: root.bottomAnchor)])
 
         let title = vertical(4)
-        title.addArrangedSubview(label("COMMANDERGUARD", size: 11, weight: .bold, color: .secondaryLabelColor))
-        title.addArrangedSubview(label("运行概览", size: 21, weight: .bold))
-        if previewMode { title.addArrangedSubview(label("设计预览 · 固定示例数据", size: 12, color: .secondaryLabelColor)) }
+        title.addArrangedSubview(label("运行概览", size: 20, weight: .bold))
         layout.addArrangedSubview(title)
         panelHeading = title
 
@@ -4975,9 +4980,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         panelHeroMinimum = heroes.heightAnchor.constraint(greaterThanOrEqualToConstant: 56)
         panelHeroMinimum?.isActive = true
         layout.addArrangedSubview(heroes)
-        heroes.widthAnchor.constraint(equalTo: layout.widthAnchor, constant: -56).isActive = true
+        heroes.widthAnchor.constraint(equalTo: layout.widthAnchor, constant: -48).isActive = true
 
-        let controls = NSStackView(); controls.orientation = .horizontal; controls.alignment = .centerY; controls.spacing = 22
         let recovery = NSButton(checkboxWithTitle: "自动恢复本机 Commander", target: self, action: #selector(toggleAutoRecovery))
         recovery.toolTip = "云端主动探测关闭时自动恢复暂停；开启后自动探测累计 3 次明确断链，且日志完整并确认没有本机任务时，才重启本机 Commander。恢复后确认需等待所选探测间隔；不会重试原任务或修复云端问题。"
         let wake = NSButton(checkboxWithTitle: "防止闲置睡眠（Guard）", target: self, action: #selector(togglePause))
@@ -4987,15 +4991,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         panelManualCheck = check
         [recovery, wake, check].forEach { $0.isEnabled = !previewMode }
         panelRecoveryToggle = recovery; panelWakeToggle = wake
-        controls.addArrangedSubview(recovery); controls.addArrangedSubview(wake)
-        let spacer = NSView(); spacer.setContentHuggingPriority(.defaultLow, for: .horizontal); controls.addArrangedSubview(spacer)
-        controls.addArrangedSubview(check)
+        let recoverySpacer = NSView(); recoverySpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let recoveryStatus = label("自动恢复：等待检查", size: 12, color: .secondaryLabelColor)
+        recoveryStatus.maximumNumberOfLines = 2
+        panelRecoveryStatus = recoveryStatus
+        let recoveryRow = NSStackView(views: [recovery, recoverySpacer, recoveryStatus]); recoveryRow.orientation = .horizontal; recoveryRow.alignment = .centerY; recoveryRow.spacing = 8
+        let wakeStatus = label("保持唤醒：等待检查", size: 12, color: .secondaryLabelColor)
+        wakeStatus.maximumNumberOfLines = 2
+        panelWakeStatus = wakeStatus
+        let wakeRow = NSStackView(views: [wake, wakeStatus]); wakeRow.orientation = .horizontal; wakeRow.alignment = .centerY; wakeRow.spacing = 12
+        let manualCheckStatus = label("", size: 12, color: .secondaryLabelColor)
+        manualCheckStatus.maximumNumberOfLines = 2
+        panelManualCheckStatus = manualCheckStatus
+        let manualCheckRow = NSStackView(views: [check, manualCheckStatus]); manualCheckRow.orientation = .horizontal; manualCheckRow.alignment = .centerY; manualCheckRow.spacing = 8
         let controlContent = vertical(5)
         let probeToggle = NSButton(checkboxWithTitle: "云端主动探测（可能消耗额度）", target: self, action: #selector(toggleActiveProbing))
         probeToggle.toolTip = "默认关闭，计费关系未确认。开启后按所选间隔发送一次 ping；自动、手动、命令行及恢复后检查共用持久间隔，失败也开始计时，不自动附加工具检查。关闭阻止新的云端工具请求并暂停自动恢复；已提交请求可能仍计费。本机观察、设备状态与额度同步继续。"
         probeToggle.isEnabled = !previewMode
         panelProbeToggle = probeToggle
         let probeBudget = label(activeProbeStatus.display, size: 12, weight: .semibold)
+        probeBudget.font = .systemFont(ofSize: 12, weight: .regular)
+        probeBudget.textColor = .secondaryLabelColor
         let probeInterval = NSPopUpButton()
         probeInterval.addItems(withTitles: ActiveProbeBudget.intervalTitles)
         probeInterval.selectItem(at: ActiveProbeBudget.intervalOptions.firstIndex(of: activeProbeStatus.intervalSeconds) ?? ActiveProbeBudget.defaultIntervalIndex)
@@ -5008,17 +5024,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         panelProbeBudget = probeBudget
         controlContent.addArrangedSubview(probeIntervalRow)
         controlContent.addArrangedSubview(probeBudget)
-        controlContent.addArrangedSubview(controls)
-        controls.widthAnchor.constraint(equalTo: controlContent.widthAnchor).isActive = true
-        let manualCheckStatus = label("", size: 11, color: .secondaryLabelColor)
-        panelManualCheckStatus = manualCheckStatus
-        controlContent.addArrangedSubview(manualCheckStatus)
-        let recoveryStatus = label("自动恢复：等待检查", size: 12, weight: .semibold)
-        panelRecoveryStatus = recoveryStatus
-        controlContent.addArrangedSubview(recoveryStatus)
-        let wakeStatus = label("保持唤醒：等待检查", size: 12, weight: .semibold)
-        panelWakeStatus = wakeStatus
-        controlContent.addArrangedSubview(wakeStatus)
+        controlContent.addArrangedSubview(recoveryRow)
+        controlContent.addArrangedSubview(wakeRow)
+        controlContent.addArrangedSubview(manualCheckRow)
         let controlCard = card(controlContent, padding: 12)
         panelControlCard = controlCard
 
@@ -5028,7 +5036,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let scroll = NSScrollView(); scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true; scroll.drawsBackground = false
         scroll.setContentHuggingPriority(.defaultLow, for: .vertical); scroll.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
         panelScroll = scroll; layout.addArrangedSubview(scroll)
-        scroll.widthAnchor.constraint(equalTo: layout.widthAnchor, constant: -56).isActive = true
+        scroll.widthAnchor.constraint(equalTo: layout.widthAnchor, constant: -48).isActive = true
         panelWindow = window
         renderQuota()
         renderPanelPage()
@@ -5074,7 +5082,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             panelConnection?.stringValue = category.title
             panelConnection?.textColor = category == .cloudRealtimeCapacity ? .systemOrange : .systemRed
             panelConnectionTime?.stringValue = displayEvidenceTime(lastPingAt)
-            panelConnectionDetail?.stringValue = middleTruncate(channelIncidentHandling(now: now), limit: 56)
+            let detail = channelIncidentHandling(now: now)
+            panelConnectionDetail?.stringValue = middleTruncate(detail, limit: 56)
+            panelConnectionDetail?.toolTip = detail
         } else {
             panelConnection?.stringValue = channelLive
             let marker = channelIndicator(service: snapshot.service, state: snapshot.channelState, checked: snapshot.channelChecked, now: now)
@@ -5082,6 +5092,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             panelConnectionTime?.stringValue = displayEvidenceTime(lastPingAt)
             let channelDetail = displayPingResult(manualNotice ?? (manualPingBusy || channelBusy ? deferredReason : snapshot.channelDetail))
             panelConnectionDetail?.stringValue = middleTruncate(channelDetail, limit: 56)
+            panelConnectionDetail?.toolTip = channelDetail
         }
 
         let toolState = toolExecutionSummary(now: now)
@@ -5089,6 +5100,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         panelToolExecution?.textColor = snapshot.toolExecutionState == "失败" ? .systemRed : (toolExecutionFresh(snapshot, now: now) ? .systemGreen : .labelColor)
         panelToolExecutionTime?.stringValue = displayEvidenceTime(snapshot.toolExecutionChecked)
         panelToolExecutionDetail?.stringValue = middleTruncate(snapshot.toolExecutionDetail, limit: 56)
+        panelToolExecutionDetail?.toolTip = snapshot.toolExecutionDetail
 
         let chat = chatMonitorSummary(snapshot.timeline)
         panelChat?.stringValue = chatOverviewTitle(chat)
@@ -5102,6 +5114,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let latestAppAt = snapshot.timeline.latestAppEvent.flatMap { ISO8601DateFormatter.parse($0.sourceAt ?? $0.observedAt) }
         panelChatTime?.stringValue = displayEvidenceTime(latestAppAt)
         panelChatDetail?.stringValue = chatOverviewDetail(chat)
+        panelChatDetail?.toolTip = panelChatDetail?.stringValue
 
 
         let probeStatus = activeProbeStatus
@@ -5116,7 +5129,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             ?? (snapshot.service != "运行中" ? "Commander 服务未运行" : nil)
             ?? (channelIncident.activeCategory == nil && Date().timeIntervalSince(watchdog.startedAt) < 90 ? "启动等待中，暂不能检查" : nil)
         panelManualCheckStatus?.stringValue = manualReason.map { "暂不可检查：\($0)" } ?? "手动 ping 会占用一次所选检查间隔"
-        panelManualCheckStatus?.textColor = manualReason == nil ? .secondaryLabelColor : .systemOrange
+        panelManualCheckStatus?.textColor = manualReason?.contains("失败") == true || manualReason?.contains("异常") == true ? .systemOrange : .secondaryLabelColor
         panelRecoveryToggle?.state = recoveryLedger.autoRecoveryEnabled ? .on : .off
         panelWakeToggle?.state = paused ? .off : .on
         let recoveryState = recoveryAvailability()
@@ -5133,13 +5146,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let key = label(title, size: 12, weight: .medium, color: .secondaryLabelColor)
         key.widthAnchor.constraint(equalToConstant: 128).isActive = true
         let content = label(value, size: 13, color: color)
-        if ["首次", "最近", "发生", "恢复", "最近探测"].contains(title) { content.font = .monospacedDigitSystemFont(ofSize: 17, weight: .semibold) }
+        if ["首次", "最近", "发生", "恢复", "最近探测"].contains(title) { content.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular); content.textColor = .secondaryLabelColor }
         h.addArrangedSubview(key); h.addArrangedSubview(content)
         return h
     }
     private func section(_ title: String, subtitle: String? = nil, rows: [(String, String)]) -> NSView {
-        let stack = vertical(11)
-        stack.addArrangedSubview(label(title, size: 16, weight: .semibold))
+        let stack = vertical(8)
+        stack.addArrangedSubview(label(title, size: 15, weight: .semibold))
         if let subtitle { stack.addArrangedSubview(label(subtitle, size: 12, color: .secondaryLabelColor)) }
         for (key, value) in rows { let item = row(key, value); stack.addArrangedSubview(item); item.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true }
         return card(stack)
@@ -5147,6 +5160,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private func setSections(_ sections: [NSView]) {
         guard let scroll = panelScroll else { return }
         panelSectionCount = sections.count
+        scroll.window?.contentView?.layoutSubtreeIfNeeded()
         let oldY = scroll.contentView.bounds.origin.y
         let viewport = scroll.contentView.bounds
 
@@ -5155,7 +5169,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let stack = NSStackView()
         stack.orientation = .vertical
         stack.alignment = .leading
-        stack.spacing = 9
+        stack.spacing = 16
         stack.translatesAutoresizingMaskIntoConstraints = false
         root.addSubview(stack)
 
@@ -5309,15 +5323,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             controls.orientation = .horizontal
             controls.spacing = 10
             controls.translatesAutoresizingMaskIntoConstraints = false
+            [search, filter, historicalToggle].forEach { $0.heightAnchor.constraint(equalToConstant: 28).isActive = true }
 
             let detail = label("选择一条记录查看详情", size: 13)
             detail.isSelectable = true
             recordDetail = detail
-            let detailCard = card(detail, padding: 14)
+            let detailCard = card(detail, padding: 16)
             detailCard.translatesAutoresizingMaskIntoConstraints = false
 
             let table = NSTableView()
-            table.rowHeight = 40
+            table.rowHeight = 36
             table.delegate = self
             table.dataSource = self
             table.usesAlternatingRowBackgroundColors = true
@@ -5439,11 +5454,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         case "action":
             field.stringValue = step.detail
             field.textColor = step.historical ? .secondaryLabelColor : .labelColor
+            if step.tool == "start_process" { field.font = .monospacedSystemFont(ofSize: 12, weight: .regular) }
         case "result":
             field.stringValue = step.failed ? "异常" : step.uncertain || step.historical ? "未确认" : step.finished ? "已返回" : "进行中"
             field.textColor = step.failed ? .systemRed : step.uncertain || step.historical ? .secondaryLabelColor : .labelColor
         case "duration":
             field.stringValue = step.historical ? "耗时未知" : step.uncertain ? "未确认" : step.duration.map(durationText) ?? barCallClock(step, uptime: ProcessInfo.processInfo.systemUptime)
+            field.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
             field.textColor = step.historical || step.uncertain ? .secondaryLabelColor : .labelColor
         case "session":
             guard let session = step.sessionAttributionConflict ? nil : CommanderActivity.sessionDisplay(step.sessionKey) else { return field }
@@ -5572,6 +5589,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                 panelPage = page; renderPanel()
                 root.layoutSubtreeIfNeeded()
                 verify(window.isVisible && scroll.frame.width > 650 && scroll.frame.height > 80, "panel content is clipped at \(Int(size.width))x\(Int(size.height)), page \(page)")
+                if let heroes = panelHeroes {
+                    let frame = heroes.convert(heroes.bounds, to: root)
+                    verify(frame.minX >= 23 && frame.maxX <= root.bounds.width - 23, "Status strip must honor the 24px outer inset at \(Int(size.width))px")
+                }
+                if let scroll = panelScroll {
+                    let frame = scroll.convert(scroll.bounds, to: root)
+                    verify(frame.minX >= 23 && frame.maxX <= root.bounds.width - 23, "Page content must honor the 24px outer inset at \(Int(size.width))px")
+                }
                 verify(scroll.documentView != nil, "panel page \(page) is empty")
                 verify(panelHeroes?.isHidden == false && panelNav?.isHidden == false, "Status strip and navigation must stay visible on page \(page)")
                 if size.width == 940 && page == 1, let table = recordTable, let tableScroll = recordTableScroll {
@@ -5588,6 +5613,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         window.setContentSize(NSSize(width: 940, height: 720))
         panelPage = 0; renderPanel(); root.layoutSubtreeIfNeeded(); scroll.layoutSubtreeIfNeeded()
         scroll.contentView.scroll(to: .zero); scroll.reflectScrolledClipView(scroll.contentView)
+        let savedQuota = quota
+        quota = UsageQuota(state: .unlimited, used: 9893, total: nil, plan: "pro", month: "2026-10", syncedAt: Date())
+        verify(quotaDisplay() == "Pro 无限制" && quotaStatusDisplay().contains("累计调用：9893 次"), "Pro unlimited label must keep cumulative usage secondary")
+        for state in [UsageQuota.State.refreshing, .unavailable, .stale] {
+            quota.state = state
+            verify(quotaDisplay() == "Pro 无限制" && quotaStatusDisplay().contains("累计调用：9893 次"), "Pro unlimited label and count must survive \(state.rawValue) status")
+        }
+        quota = savedQuota
         verify(panelConnection?.stringValue == "上次探测成功", "Channel headline must stay concise while time and freshness remain separate")
         verify(panelChat?.stringValue == "连接正常" && panelChatDetail?.isHidden == false && panelChatDetail?.stringValue.hasPrefix("原回答是否完整：无法确认") == true, "ChatGPT connection health must not imply answer completeness")
         verify(panelSectionCount == 3, "Overview must show conclusion, guard controls, and a compact quota/task row")
@@ -5595,8 +5628,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         verify(panelControlCard?.isHidden == false && panelRecoveryToggle?.title == "自动恢复本机 Commander" && panelRecoveryToggle?.toolTip?.contains("不会重试原任务") == true, "Recovery control must explain its local-only action and safeguards")
         verify(panelProbeToggle?.title == "云端主动探测（可能消耗额度）" && panelProbeToggle?.state == .off && panelProbeBudget?.stringValue == activeProbeStatus.display && panelProbeIntervalPicker?.indexOfSelectedItem == ActiveProbeBudget.defaultIntervalIndex && panelProbeIntervalPicker?.numberOfItems == ActiveProbeBudget.intervalOptions.count && panelManualCheck?.isEnabled == false, "Probe switch must default OFF and show the selected cadence")
         verify(panelWakeToggle?.title == "防止闲置睡眠（Guard）" && panelWakeToggle?.toolTip?.contains("其他程序仍可能保持唤醒") == true && panelWakeStatus?.stringValue.contains("保持唤醒：") == true, "Wake control must describe its actual assertion and limits")
-        verify(quotaProgress?.isHidden == false && quotaSynced?.isHidden == false && quotaSynced?.stringValue.range(of: #"\d{2}:\d{2}:\d{2}"#, options: .regularExpression) != nil && (quotaSynced?.font?.pointSize ?? 0) >= 17, "Quota card must show finite progress and a prominent last-success clock")
-        verify(panelHeroes?.isHidden == false && panelConnectionTime?.stringValue.range(of: #"\d{2}:\d{2}:\d{2}"#, options: .regularExpression) != nil && (panelConnectionTime?.font?.pointSize ?? 0) >= 14, "Persistent status strip must show a readable evidence time")
+        verify(quotaProgress?.isHidden == false && quotaSynced?.isHidden == false && quotaSynced?.stringValue.range(of: #"\d{2}:\d{2}:\d{2}"#, options: .regularExpression) != nil && quotaSynced?.font?.pointSize == 12 && quotaSynced?.textColor == .secondaryLabelColor, "Quota sync time must remain visible as secondary evidence")
+        verify(panelHeroes?.isHidden == false && panelConnectionTime?.stringValue.range(of: #"\d{2}:\d{2}:\d{2}"#, options: .regularExpression) != nil && (panelConnectionTime?.font?.pointSize ?? 0) == 12, "Persistent status strip must show a compact evidence time")
         verify(panelManualCheckStatus?.stringValue.contains("暂不可检查") == true, "Disabled manual ping must explain the blocking reason without a tooltip")
         if let menu = quotaIntervalPicker?.menu {
             let savedDocument = panelScroll?.documentView
@@ -5618,7 +5651,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             verify(overviewStack.frame.minY <= 2, "Overview content must start at the top without a blank band")
             if overviewStack.arrangedSubviews.count == 3 {
                 let quotaAndTask = overviewStack.arrangedSubviews[2]
-                verify(overviewRoot.visibleRect.intersects(quotaAndTask.frame) && quotaAndTask.frame.maxY <= scroll.contentView.bounds.height + 2, "Quota and current task must both fit in the default 940x720 overview")
+                let viewport = scroll.contentView.bounds
+                let rowFrame = quotaAndTask.convert(quotaAndTask.bounds, to: scroll.contentView)
+                verify(overviewRoot.frame.height <= viewport.height + 2, "Entire overview must fit the default 940x720 viewport without vertical scrolling (document \(Int(overviewRoot.frame.height)), viewport \(Int(viewport.height)))")
+                verify(rowFrame.minY >= -2 && rowFrame.maxY <= viewport.height + 2, "Quota and current task must fit inside the visible default overview")
             } else {
                 verify(false, "Overview must keep quota and current task together in the third row")
             }
@@ -5651,7 +5687,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         guard let table = recordTable, let tableScroll = recordTableScroll else { fputs("CommanderGuard UI check failed: records are missing\n", stderr); exit(2) }
         verify(tableScroll.frame.width >= scroll.contentView.bounds.width * 0.95, "Operation table must use the available page width (table \(Int(tableScroll.frame.width)), page \(Int(scroll.contentView.bounds.width)))")
         verify(table.tableColumns.reduce(0) { $0 + $1.width } >= tableScroll.contentView.bounds.width * 0.95, "Operation columns must use the available page width")
-        verify(table.tableColumns.allSatisfy { $0.width >= $0.minWidth } && table.rowHeight >= 36, "Record columns and rows must preserve readable minimum sizes")
+        verify(table.tableColumns.allSatisfy { $0.width >= $0.minWidth } && table.rowHeight == 36, "Record rows must fit multiline timestamps and details")
         verify(panelHeroes?.isHidden == false && panelControlCard?.isHidden == true, "Records page must retain the compact status strip and hide repeated controls")
         verify(recordSteps.count == 4 && !recordSteps.contains(where: { $0.tool == "ping" || $0.historical }), "Record page must fold historical records and hide connection checks by default")
         verify(historicalRecordsToggle?.title == "较早记录（时间不详，1条）", "Historical fold must state the unknown time and record count")
