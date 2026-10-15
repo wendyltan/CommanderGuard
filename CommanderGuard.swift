@@ -322,7 +322,7 @@ final class HeadlessQuotaBrowser {
         guard errno == ENOENT else { throw Failure.profile }
         return false
     }
-    /// Called only for the recorded login child after termination, while its profile flock is held.
+    /// Called only for an owned child after termination, while its profile flock is held.
     private static func clearExitedOwnedBrowserLock(_ profile: URL, pid: pid_t) {
         guard pid > 0, kill(pid, 0) == -1, errno == ESRCH else { return }
         let lock = profile.appendingPathComponent("SingletonLock")
@@ -352,6 +352,7 @@ final class HeadlessQuotaBrowser {
 
     private final class PipeBrowser {
         private var pid: pid_t = 0
+        private let profile: URL
         var processID: pid_t { pid }
         private var writeFD: Int32 = -1
         private var readFD: Int32 = -1
@@ -364,7 +365,7 @@ final class HeadlessQuotaBrowser {
         private let cancelled: () -> Bool
         private var finished = false
         init(executable: URL, profile: URL, cancelled: @escaping () -> Bool) throws {
-            self.cancelled = cancelled
+            self.cancelled = cancelled; self.profile = profile
             var commands: [Int32] = [0, 0], replies: [Int32] = [0, 0]
             guard pipe(&commands) == 0 else { throw Failure.unavailable }
             guard pipe(&replies) == 0 else { close(commands[0]); close(commands[1]); throw Failure.unavailable }
@@ -535,7 +536,7 @@ final class HeadlessQuotaBrowser {
                     var exitStatus: Int32 = 0
                     while waitpid(ownedPID, &exitStatus, 0) < 0 && errno == EINTR {}
                 }
-            }
+            } else { HeadlessQuotaBrowser.clearExitedOwnedBrowserLock(profile, pid: pid) }
             if writeFD >= 0 { close(writeFD); writeFD = -1 }
             if readFD >= 0 { close(readFD); readFD = -1 }; pid = 0
         }
@@ -612,6 +613,16 @@ final class HeadlessQuotaBrowser {
             lifetime.worker.sync {}
             let releasedLock = try acquireProfile(scratch); flock(releasedLock, LOCK_UN); close(releasedLock)
         }
+        let fakeChrome = scratch.appendingPathComponent("fake-chrome")
+        try Data("#!/bin/sh\nexec /bin/sleep 30\n".utf8).write(to: fakeChrome)
+        guard chmod(fakeChrome.path, 0o700) == 0 else { throw Failure.profile }
+        let finishingBrowser = HeadlessQuotaBrowser()
+        finishingBrowser.browser = try PipeBrowser(executable: fakeChrome, profile: scratch, cancelled: { false })
+        finishingBrowser.browserLockFD = try acquireProfile(scratch)
+        guard symlink("owned-host-\(finishingBrowser.browser!.processID)", scratch.appendingPathComponent("SingletonLock").path) == 0 else { throw Failure.profile }
+        finishingBrowser.finishBrowser()
+        let abandonedOwnedLock = try hasBrowserLock(scratch)
+        precondition(!abandonedOwnedLock, "headless finish must clear its exited child's lock")
         let link = scratch.appendingPathComponent("linked-profile")
         guard symlink(scratch.path, link.path) == 0 else { throw Failure.profile }
         do { try validateDirectory(link, privateMode: true); preconditionFailure("symlink profile accepted") } catch Failure.profile {}
