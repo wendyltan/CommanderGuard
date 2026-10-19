@@ -1475,6 +1475,11 @@ func recoveryConfirmed(oldPID: Int32, newPID: Int32?, currentPID: Int32?, oldPro
     if case .healthy = probe { return true }
     return false
 }
+func serviceRestartConfirmed(oldPID: Int32, newPID: Int32?, currentPID: Int32?, oldProcessExited: Bool,
+                             newStarted: String?, currentStarted: String?) -> Bool {
+    guard let newPID, let newStarted, let currentStarted else { return false }
+    return newPID != oldPID && currentPID == newPID && oldProcessExited && newStarted == currentStarted
+}
 
 func channelIndicator(service: String, state: String, checked: Date?, now: Date) -> String {
     if service == "未运行" || state == "通道异常" || state == "通道不可用" { return "!" }
@@ -2622,12 +2627,67 @@ struct ChannelWatchdogState {
     }
 }
 
+struct RecoveryAttemptRecord: Codable {
+    let source: String
+    let startedAt: Date
+    let oldPID: Int32
+    let oldStarted: String
+    let affectedCount: Int
+    var finishedAt: Date?
+    var newPID: Int32?
+    var newStarted: String?
+    var execution = "started"
+    var service = "unknown"
+    var channel = "unknown"
+    var tool = "unknown"
+    var verificationStage: String?
+    var business = "unknown"
+
+    var valid: Bool {
+        ["automatic", "manual", "external"].contains(source) && oldPID > 0 && affectedCount >= 0 && affectedCount <= 10000 &&
+        oldStarted.count <= 32 && (newStarted?.count ?? 0) <= 32 &&
+        ["started", "launch_failed", "exit_failed", "pid_unchanged", "changed", "observed"].contains(execution) &&
+        ["unknown", "changed", "unconfirmed"].contains(service) &&
+        ["unknown", "waiting", "healthy", "offline", "failed"].contains(channel) &&
+        ["unknown", "waiting", "verified", "failed"].contains(tool) &&
+        business == "unknown" &&
+        (verificationStage == nil || ["ping", "ping_submitted", "tool", "tool_submitted"].contains(verificationStage!))
+    }
+}
+
 struct ChannelRecoveryLedger: Codable {
     var lastAttempt: Date?
     var autoRecoveryEnabled = true
+    var recent: [RecoveryAttemptRecord] = []
+
+    init(lastAttempt: Date? = nil, autoRecoveryEnabled: Bool = true, recent: [RecoveryAttemptRecord] = []) {
+        self.lastAttempt = lastAttempt; self.autoRecoveryEnabled = autoRecoveryEnabled; self.recent = recent
+    }
+    private enum CodingKeys: String, CodingKey { case lastAttempt, autoRecoveryEnabled, recent }
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        lastAttempt = try values.decodeIfPresent(Date.self, forKey: .lastAttempt)
+        autoRecoveryEnabled = try values.decode(Bool.self, forKey: .autoRecoveryEnabled)
+        recent = try values.decodeIfPresent([RecoveryAttemptRecord].self, forKey: .recent) ?? []
+        guard recent.count <= 5, recent.allSatisfy(\.valid) else { throw DecodingError.dataCorruptedError(forKey: .recent, in: values, debugDescription: "Invalid recovery records") }
+    }
 
     func canAttempt(at now: Date) -> Bool { lastAttempt.map { now.timeIntervalSince($0) >= 300 } ?? true }
     mutating func recordAttempt(at now: Date) { lastAttempt = now }
+    mutating func begin(_ record: RecoveryAttemptRecord) {
+        lastAttempt = record.startedAt
+        recent.insert(record, at: 0)
+        recent = Array(recent.prefix(5))
+    }
+    mutating func finish(_ update: (inout RecoveryAttemptRecord) -> Void) {
+        guard !recent.isEmpty else { return }
+        update(&recent[0])
+    }
+    mutating func updateManual(matching expected: RecoveryAttemptRecord, _ update: (inout RecoveryAttemptRecord) -> Void) -> Bool {
+        guard !recent.isEmpty, recent[0].source == "manual", recent[0].startedAt == expected.startedAt,
+              recent[0].newPID == expected.newPID, recent[0].newStarted == expected.newStarted else { return false }
+        update(&recent[0]); return true
+    }
     static func load(from url: URL) -> ChannelRecoveryLedger {
         guard FileManager.default.fileExists(atPath: url.path) else { return ChannelRecoveryLedger() }
         guard (try? url.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) != true,
@@ -2648,6 +2708,42 @@ struct ChannelRecoveryLedger: Codable {
             return chmod(url.path, S_IRUSR | S_IWUSR) == 0
         } catch { return false }
     }
+}
+
+struct ManualRestartGrant {
+    let identity: String
+    let issuedAt: Date
+    private var used = false
+
+    mutating func consume(matching currentIdentity: String, now: Date) -> Bool {
+        guard !used, currentIdentity == identity, now.timeIntervalSince(issuedAt) >= 0,
+              now.timeIntervalSince(issuedAt) <= 60 else { return false }
+        used = true
+        return true
+    }
+}
+
+enum ManualVerificationStage {
+    static func begin(_ stage: String) -> String? {
+        switch stage { case "ping": return "ping_submitted"; case "tool": return "tool_submitted"; default: return nil }
+    }
+    static func afterResult(_ stage: String, submitted: Bool) -> String? {
+        switch stage {
+        case "ping_submitted": return submitted ? "tool" : "ping"
+        case "tool_submitted": return submitted ? nil : "tool"
+        default: return nil
+        }
+    }
+    static func afterInterruption(_ stage: String) -> String? {
+        afterResult(stage, submitted: true)
+    }
+}
+
+func reserveManualVerification(_ ledger: inout ChannelRecoveryLedger, matching record: RecoveryAttemptRecord, to stage: String, at url: URL) -> Bool {
+    var next = ledger
+    guard next.updateManual(matching: record, { $0.verificationStage = stage }), next.save(to: url) else { return false }
+    ledger = next
+    return true
 }
 
 func prominentStamp(_ date: Date?) -> String { date.map { let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd HH:mm:ss"; return f.string(from: $0) } ?? "暂无" }
@@ -2681,6 +2777,9 @@ final class ActiveProbeBudget {
         var nextAllowedAt: Date? { lastSubmittedAt?.addingTimeInterval(TimeInterval(intervalSeconds)) }
         var blockReason: String? {
             permissionBlockReason ?? nextAllowedAt.flatMap { $0 > now ? "探测间隔未到；下次可检查：\(prominentStamp($0))" : nil }
+        }
+        var manualVerificationBlockReason: String? {
+            error ?? nextAllowedAt.flatMap { $0 > now ? "探测间隔未到；下次可检查：\(prominentStamp($0))" : nil }
         }
         var dailyEstimate: Int { 86400 / intervalSeconds }
         var intervalTitle: String { ActiveProbeBudget.intervalOptions.firstIndex(of: intervalSeconds).map { ActiveProbeBudget.intervalTitles[$0] } ?? "未知频率" }
@@ -2719,12 +2818,12 @@ final class ActiveProbeBudget {
         catch { return false }
     }
     /// Keep the cross-process lock until the request is submitted, so OFF cannot race admission.
-    func submit(now: Date = Date(), _ request: () -> Void) -> String? {
+    func submit(now: Date = Date(), allowWhenDisabled: Bool = false, _ request: () -> Void) -> String? {
         do {
             return try locked { fd in
                 var state = try load(fd, now: now)
                 let status = status(state, now: now)
-                if let reason = status.blockReason { return reason }
+                if let reason = allowWhenDisabled ? status.manualVerificationBlockReason : status.blockReason { return reason }
                 state.lastSubmittedAt = now.timeIntervalSince1970
                 try save(state, fd)
                 request()
@@ -2827,9 +2926,9 @@ final class MCPChannelProbe: NSObject, URLSessionDataDelegate, URLSessionTaskDel
     private var deviceID = ""
     private(set) var submitted = false
 
-    func run(budget: ActiveProbeBudget = .shared, _ done: @escaping (ChannelProbeResult) -> Void) {
+    func run(budget: ActiveProbeBudget = .shared, allowWhenDisabled: Bool = false, _ done: @escaping (ChannelProbeResult) -> Void) {
         completion = done; submitted = false
-        if let reason = budget.status().blockReason { finish(.unknown(reason)); return }
+        if let reason = allowWhenDisabled ? budget.status().manualVerificationBlockReason : budget.status().blockReason { finish(.unknown(reason)); return }
         let file = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".desktop-commander-device/device.json")
         guard let data = try? Data(contentsOf: file), let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
               let id = root["deviceId"] as? String, CloudState.validDeviceID(id),
@@ -2847,7 +2946,7 @@ final class MCPChannelProbe: NSObject, URLSessionDataDelegate, URLSessionTaskDel
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = 8; configuration.timeoutIntervalForResource = 10
         session = URLSession(configuration: configuration, delegate: self, delegateQueue: OperationQueue())
-        if let reason = budget.submit({ self.submitted = true; self.session.dataTask(with: request).resume() }) { finish(.unknown(reason)) }
+        if let reason = budget.submit(allowWhenDisabled: allowWhenDisabled, { self.submitted = true; self.session.dataTask(with: request).resume() }) { finish(.unknown(reason)) }
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) { completionHandler(nil) }
@@ -2880,11 +2979,11 @@ final class MCPChannelProbe: NSObject, URLSessionDataDelegate, URLSessionTaskDel
         guard let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any], root["jsonrpc"] as? String == "2.0", root["id"] as? String == id else {
             return .unknown("MCP 响应格式或请求编号不匹配")
         }
-        let noLive = "This Desktop Commander device has no live connection and cannot receive commands right now."
+        let legacyAttribution = #"^This Desktop Commander device has no live connection and cannot receive commands right now\. Restart the terminal running it, then try again\. \[device: [^\n\[\]]{1,128} \("# + NSRegularExpression.escapedPattern(for: deviceID) + #"\)\]$"#
         if let error = root["error"] as? [String: Any] {
             let code = (error["data"] as? [String: Any])?["error_code"] as? String ?? error["error_code"] as? String
             let message = error["message"] as? String ?? ""
-            return (code == nil || code == "INVALID_ARGUMENT") && message.hasPrefix(noLive) && message.contains("(\(deviceID))")
+            return (code == nil || code == "INVALID_ARGUMENT") && message.range(of: legacyAttribution, options: .regularExpression) != nil
                 ? .noLiveConnection : .unknown("MCP 服务返回错误")
         }
         guard let result = root["result"] as? [String: Any], let content = result["content"] as? [[String: Any]] else {
@@ -2895,7 +2994,10 @@ final class MCPChannelProbe: NSObject, URLSessionDataDelegate, URLSessionTaskDel
         let structured = result["structuredContent"] as? [String: Any]
         let isError = result["isError"] as? Bool == true
         let structuredCode = structured?["error_code"] as? String
-        if isError, first.hasPrefix(noLive), first.contains("(\(deviceID))"), structuredCode == nil || structuredCode == "INVALID_ARGUMENT" {
+        if isError, texts.count == 1, first.range(of: legacyAttribution, options: .regularExpression) != nil, structuredCode == nil || structuredCode == "INVALID_ARGUMENT" {
+            return .noLiveConnection
+        }
+        if isError, texts.count == 1, structuredCode == "INVALID_ARGUMENT", Self.registeredDevicesOffline(first, deviceID: deviceID) {
             return .noLiveConnection
         }
         guard !isError else { return .unknown("MCP 服务返回工具错误") }
@@ -2905,6 +3007,24 @@ final class MCPChannelProbe: NSObject, URLSessionDataDelegate, URLSessionTaskDel
             return .unknown("MCP 未返回有效 ping 时间戳")
         }
         return .healthy
+    }
+
+    private static func registeredDevicesOffline(_ text: String, deviceID: String) -> Bool {
+        let footer = "\n\nStart or restart Desktop Commander Remote on the computer you want to use, then try again.\n\nManage devices: https://mcp.desktopcommander.app/\nYou can view, add, or revoke devices there."
+        let body = text.hasSuffix(footer) ? String(text.dropLast(footer.count)) : text
+        let lines = body.components(separatedBy: "\n")
+        guard lines.count >= 4,
+              lines[0] == "No Desktop Commander device is currently online.",
+              lines[1].isEmpty, lines[2] == "Registered devices:" else { return false }
+        let pattern = #"^- [^\n()]{1,128} \(id: ([0-9a-fA-F-]{36}), last seen [0-9]{1,6}[smhd] ago\)$"#
+        var targetFound = false
+        for line in lines.dropFirst(3) {
+            guard let range = line.range(of: pattern, options: .regularExpression), range == line.startIndex..<line.endIndex,
+                  let idRange = line.range(of: #"(?<=id: )[0-9a-fA-F-]{36}"#, options: .regularExpression),
+                  UUID(uuidString: String(line[idRange])) != nil else { return false }
+            if String(line[idRange]).caseInsensitiveCompare(deviceID) == .orderedSame { targetFound = true }
+        }
+        return targetFound
     }
 }
 
@@ -2927,9 +3047,9 @@ final class MCPToolExecutionProbe: NSObject, URLSessionDataDelegate, URLSessionT
     private var deviceID = ""
     private(set) var submitted = false
 
-    func run(budget: ActiveProbeBudget = .shared, _ done: @escaping (ToolExecutionProbeResult) -> Void) {
+    func run(budget: ActiveProbeBudget = .shared, allowWhenDisabled: Bool = false, _ done: @escaping (ToolExecutionProbeResult) -> Void) {
         completion = done; submitted = false
-        if let reason = budget.status().blockReason { finish(.unknown(reason)); return }
+        if let reason = allowWhenDisabled ? budget.status().manualVerificationBlockReason : budget.status().blockReason { finish(.unknown(reason)); return }
         let file = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".desktop-commander-device/device.json")
         guard let data = try? Data(contentsOf: file), let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
               let id = root["deviceId"] as? String, CloudState.validDeviceID(id),
@@ -2947,7 +3067,7 @@ final class MCPToolExecutionProbe: NSObject, URLSessionDataDelegate, URLSessionT
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = 8; configuration.timeoutIntervalForResource = 10
         session = URLSession(configuration: configuration, delegate: self, delegateQueue: OperationQueue())
-        if let reason = budget.submit({ self.submitted = true; self.session.dataTask(with: request).resume() }) { finish(.unknown(reason)) }
+        if let reason = budget.submit(allowWhenDisabled: allowWhenDisabled, { self.submitted = true; self.session.dataTask(with: request).resume() }) { finish(.unknown(reason)) }
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) { completionHandler(nil) }
@@ -3013,6 +3133,19 @@ enum CommanderProcessTree {
         return process.terminationStatus == 0 && safe(String(data: data, encoding: .utf8) ?? "", servicePID: servicePID, home: home)
     }
 
+    static func managedRoot(servicePID: Int32) -> Bool {
+        let process = Process(); process.executableURL = URL(fileURLWithPath: "/bin/ps")
+        process.environment = ProcessInfo.processInfo.environment.merging(["LC_ALL": "C"]) { _, new in new }
+        process.arguments = ["-p", String(servicePID), "-o", "command="]
+        let output = Pipe(); process.standardOutput = output; process.standardError = FileHandle.nullDevice
+        do { try process.run() } catch { return false }
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 3) { if process.isRunning { process.terminate() } }
+        let data = output.fileHandleForReading.readDataToEndOfFile(); process.waitUntilExit()
+        guard process.terminationStatus == 0, data.count < 4096,
+              let command = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) else { return false }
+        return validRoot(command, home: FileManager.default.homeDirectoryForCurrentUser.path)
+    }
+
     static func safe(_ text: String, servicePID: Int32, home: String) -> Bool {
         guard text.utf8.count <= 1024 * 1024 else { return false }
         var entries: [Int32: Entry] = [:]
@@ -3054,6 +3187,84 @@ enum CommanderProcessTree {
         let args = command.split(whereSeparator: \.isWhitespace).map(String.init)
         return (args.first == "caffeinate" || args.first == "/usr/bin/caffeinate") && args.count == 3 && args[1] == "-w" && args[2] == String(parent)
     }
+}
+
+struct RestartImpact {
+    private struct Entry {
+        let pid: Int32
+        let parent: Int32
+        let group: Int32
+        let started: String
+        let command: String
+        var signature: String { "\(pid)|\(parent)|\(group)|\(started)|\(command)" }
+    }
+    let servicePID: Int32
+    let started: String
+    let affectedCount: Int
+    let descendantCount: Int
+    let groupPeerCount: Int
+    let labels: String
+    let fingerprint: String
+
+    static func capture(servicePID: Int32) -> RestartImpact? {
+        guard servicePID > 1, CommanderProcessTree.managedRoot(servicePID: servicePID) else { return nil }
+        let process = Process(); process.executableURL = URL(fileURLWithPath: "/bin/ps")
+        process.environment = ProcessInfo.processInfo.environment.merging(["LC_ALL": "C"]) { _, new in new }
+        process.arguments = ["-axo", "pid=,ppid=,pgid=,lstart=,comm="]
+        let output = Pipe(); process.standardOutput = output; process.standardError = FileHandle.nullDevice
+        do { try process.run() } catch { return nil }
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 3) { if process.isRunning { process.terminate() } }
+        let data = output.fileHandleForReading.readDataToEndOfFile(); process.waitUntilExit()
+        guard process.terminationStatus == 0, data.count <= 2 * 1024 * 1024,
+              let text = String(data: data, encoding: .utf8) else { return nil }
+        guard let impact = parse(text, servicePID: servicePID), CommanderProcessTree.managedRoot(servicePID: servicePID) else { return nil }
+        return impact
+    }
+
+    static func parse(_ text: String, servicePID: Int32) -> RestartImpact? {
+        var entries: [Int32: Entry] = [:]
+        for line in text.split(separator: "\n") {
+            let fields = line.split(maxSplits: 8, whereSeparator: \.isWhitespace).map(String.init)
+            guard fields.count == 9, let pid = Int32(fields[0]), let parent = Int32(fields[1]),
+                  let group = Int32(fields[2]), pid > 0, group > 0,
+                  fields[6].range(of: #"^\d\d:\d\d:\d\d$"#, options: .regularExpression) != nil,
+                  fields[7].range(of: #"^\d{4}$"#, options: .regularExpression) != nil,
+                  entries[pid] == nil else { return nil }
+            entries[pid] = Entry(pid: pid, parent: parent, group: group,
+                                 started: fields[3...7].joined(separator: " "), command: fields[8])
+        }
+        guard let root = entries[servicePID] else { return nil }
+        var descendants: Set<Int32> = [], frontier = [servicePID]
+        while let parent = frontier.popLast() {
+            for entry in entries.values where entry.parent == parent {
+                guard descendants.insert(entry.pid).inserted else { return nil }
+                frontier.append(entry.pid)
+            }
+        }
+        let peers = Set(entries.values.filter { $0.group == root.group && $0.pid != servicePID }.map(\.pid))
+        let affected = descendants.union(peers).union([servicePID])
+        let signatures = affected.compactMap { entries[$0]?.signature }.sorted()
+        guard signatures.count == affected.count else { return nil }
+        let digest = SHA256.hash(data: Data(signatures.joined(separator: "\n").utf8)).map { String(format: "%02x", $0) }.joined()
+        var counts: [String: Int] = [:]
+        for pid in affected {
+            guard let command = entries[pid]?.command else { return nil }
+            let name = String(command.split(separator: "/").last ?? "")
+            let label: String
+            if name == "node" { label = "node" }
+            else if name == "caffeinate" { label = "防休眠" }
+            else if name.range(of: #"^python[0-9]*(?:\.[0-9]+)?$"#, options: .regularExpression) != nil { label = "Python" }
+            else if ["bash", "zsh", "sh"].contains(name) { label = "Shell" }
+            else { label = "其他程序" }
+            counts[label, default: 0] += 1
+        }
+        let labels = counts.keys.sorted().map { "\($0) ×\(counts[$0]!)" }.joined(separator: " · ")
+        return RestartImpact(servicePID: servicePID, started: root.started, affectedCount: affected.count,
+                             descendantCount: descendants.count, groupPeerCount: peers.subtracting(descendants).count,
+                             labels: labels, fingerprint: digest)
+    }
+
+    var identity: String { "\(servicePID)|\(started)|\(fingerprint)" }
 }
 
 extension ISO8601DateFormatter {
@@ -3207,6 +3418,12 @@ private func selfTestActiveProbeBudget(dir: URL, now: Date) {
     waitingPing.run(budget: waiting) { if case .unknown(let reason) = $0 { pingTimingDenied = reason.contains("探测间隔未到") } }
     waitingTool.run(budget: waiting) { if case .unknown(let reason) = $0 { toolTimingDenied = reason.contains("探测间隔未到") } }
     precondition(pingTimingDenied && toolTimingDenied && !waitingPing.submitted && !waitingTool.submitted)
+    let manualBudget = ActiveProbeBudget(directory: physicalDir.appendingPathComponent("manual-budget"))
+    precondition(!manualBudget.status(now: now).enabled)
+    precondition(manualBudget.submit(now: now, allowWhenDisabled: true, { submitted += 1 }) == nil)
+    precondition(manualBudget.submit(now: now.addingTimeInterval(3599), allowWhenDisabled: true, { submitted += 1 }) != nil)
+    precondition(manualBudget.submit(now: now.addingTimeInterval(3600), allowWhenDisabled: true, { submitted += 1 }) == nil)
+    precondition(!manualBudget.status(now: now.addingTimeInterval(3600)).enabled, "One-shot authorization must not persistently enable probing")
 
 }
 
@@ -3258,6 +3475,33 @@ func selfTest() {
     precondition(classifyProbe(["jsonrpc": "2.0", "id": "request", "error": ["code": -32602, "message": noLive]]) == 1)
     precondition(classifyProbe(["jsonrpc": "2.0", "id": "request", "error": ["code": -32602, "message": noLive, "data": ["error_code": "OTHER"]]]) == 2)
     precondition(classifyProbe(["jsonrpc": "2.0", "id": "request", "result": ["isError": true, "content": [["type": "text", "text": noLive]], "structuredContent": ["error_code": "INVALID_ARGUMENT"]]]) == 1)
+    let offline = "No Desktop Commander device is currently online.\n\nRegistered devices:\n- Example Mac (id: \(device), last seen 41m ago)"
+    let offlineFooter = "\n\nStart or restart Desktop Commander Remote on the computer you want to use, then try again.\n\nManage devices: https://mcp.desktopcommander.app/\nYou can view, add, or revoke devices there."
+    func offlineResult(_ message: String, code: String = "INVALID_ARGUMENT") -> [String: Any] {
+        ["jsonrpc": "2.0", "id": "request", "result": ["isError": true, "content": [["type": "text", "text": message]], "structuredContent": ["error_code": code]]]
+    }
+    precondition(classifyProbe(offlineResult(offline)) == 1, "Observed registered-device offline response must count as explicit disconnect")
+    precondition(classifyProbe(offlineResult(offline + offlineFooter)) == 1, "Full observed response with fixed footer must classify")
+    precondition(classifyProbe(offlineResult(offline, code: "OTHER")) == 2)
+    precondition(classifyProbe(offlineResult("No Desktop Commander device is currently online.\n\nRegistered devices:\n- Example Mac (id: 00000000-0000-4000-8000-000000000099, last seen 41m ago)")) == 2)
+    precondition(classifyProbe(offlineResult("No Desktop Commander device is currently online.\n\nRegistered devices:\nother \(device)")) == 2)
+    precondition(classifyProbe(offlineResult(offline + "\nrandom trailing text")) == 2)
+    precondition(classifyProbe(["jsonrpc": "2.0", "id": "request", "result": ["isError": true, "content": [["type": "text", "text": offline], ["type": "text", "text": "contradictory"]], "structuredContent": ["error_code": "INVALID_ARGUMENT"]]]) == 2)
+    var manualGrant = ManualRestartGrant(identity: "101|start|impact", issuedAt: now)
+    precondition(!manualGrant.consume(matching: "101|changed|impact", now: now.addingTimeInterval(1)))
+    precondition(manualGrant.consume(matching: "101|start|impact", now: now.addingTimeInterval(59)))
+    precondition(!manualGrant.consume(matching: "101|start|impact", now: now.addingTimeInterval(59)), "Consent is one use")
+    var expiredGrant = ManualRestartGrant(identity: "101|start|impact", issuedAt: now)
+    precondition(!expiredGrant.consume(matching: "101|start|impact", now: now.addingTimeInterval(61)))
+    let processRows = " 101 1 101 Fri Oct  9 20:10:50 2026 /usr/local/bin/node\n 102 101 101 Fri Oct  9 20:10:51 2026 /usr/local/bin/node\n 103 102 103 Fri Oct  9 20:10:52 2026 /usr/bin/python3\n 104 1 101 Fri Oct  9 20:10:53 2026 /usr/bin/sleep\n"
+    let impact = RestartImpact.parse(processRows, servicePID: 101)
+    precondition(impact?.affectedCount == 4 && impact?.descendantCount == 2 && impact?.groupPeerCount == 1)
+    precondition(RestartImpact.parse(processRows.replacingOccurrences(of: "20:10:50", with: "20:10:59"), servicePID: 101)?.identity != impact?.identity)
+    precondition(RestartImpact.parse(processRows + "bad line\n", servicePID: 101) == nil)
+    precondition(serviceRestartConfirmed(oldPID: 101, newPID: 201, currentPID: 201, oldProcessExited: true, newStarted: "new", currentStarted: "new"))
+    precondition(!serviceRestartConfirmed(oldPID: 101, newPID: 201, currentPID: 201, oldProcessExited: false, newStarted: "new", currentStarted: "new"))
+    precondition(!serviceRestartConfirmed(oldPID: 101, newPID: 201, currentPID: 202, oldProcessExited: true, newStarted: "new", currentStarted: "new"))
+    precondition(!serviceRestartConfirmed(oldPID: 101, newPID: 201, currentPID: 201, oldProcessExited: true, newStarted: "new", currentStarted: "replaced"))
     func toolProbeKind(_ value: ToolExecutionProbeResult) -> Int {
         switch value { case .verified: return 0; case .failed: return 1; case .unknown: return 2 }
     }
@@ -3500,6 +3744,38 @@ func selfTest() {
     defer { try? FileManager.default.removeItem(at: dir) }
     selfTestActiveProbeBudget(dir: dir, now: now)
     let ledgerFile = dir.appendingPathComponent("recovery.json")
+    let recordFile = dir.appendingPathComponent("recovery-record.json")
+    var recordLedger = ChannelRecoveryLedger()
+    var recordSample = RecoveryAttemptRecord(source: "manual", startedAt: now, oldPID: 101,
+                                             oldStarted: "Fri Oct  9 20:10:50 2026", affectedCount: 4)
+    recordSample.business = "unknown"
+    recordLedger.begin(recordSample)
+    precondition(recordLedger.save(to: recordFile))
+    let reloadedRecord = ChannelRecoveryLedger.load(from: recordFile)
+    precondition(reloadedRecord.recent.first?.source == "manual" && reloadedRecord.recent.first?.affectedCount == 4)
+    precondition(reloadedRecord.recent.first?.verificationStage == nil && reloadedRecord.recent.first?.business == "unknown")
+    precondition(ManualVerificationStage.begin("ping") == "ping_submitted")
+    precondition(ManualVerificationStage.afterResult("ping_submitted", submitted: true) == "tool")
+    precondition(ManualVerificationStage.begin("tool") == "tool_submitted")
+    precondition(ManualVerificationStage.afterResult("tool_submitted", submitted: true) == nil)
+    precondition(ManualVerificationStage.afterInterruption("ping_submitted") == "tool" && ManualVerificationStage.afterInterruption("tool_submitted") == nil)
+    precondition(ManualVerificationStage.afterResult("ping_submitted", submitted: false) == "ping")
+    recordSample.newPID = 201; recordSample.newStarted = "Fri Oct  9 20:11:02 2026"; recordSample.verificationStage = "ping"
+    var queued = ChannelRecoveryLedger(recent: [recordSample])
+    let queueFile = dir.appendingPathComponent("manual-queue.json")
+    precondition(reserveManualVerification(&queued, matching: recordSample, to: "ping_submitted", at: queueFile))
+    precondition(queued.recent.first?.verificationStage == "ping_submitted" && ChannelRecoveryLedger.load(from: queueFile).recent.first?.verificationStage == "ping_submitted")
+    var newer = RecoveryAttemptRecord(source: "manual", startedAt: now.addingTimeInterval(1), oldPID: 201,
+                                      oldStarted: "Fri Oct  9 20:11:02 2026", affectedCount: 2)
+    newer.newPID = 301; newer.newStarted = "Fri Oct  9 20:12:02 2026"; newer.verificationStage = "ping"
+    queued.begin(newer)
+    precondition(!queued.updateManual(matching: recordSample, { $0.verificationStage = "tool" }))
+    precondition(queued.recent.first?.startedAt == newer.startedAt && queued.recent.first?.verificationStage == "ping")
+    let deniedQueue = dir.appendingPathComponent("denied-queue.json")
+    try! FileManager.default.createSymbolicLink(at: deniedQueue, withDestinationURL: dir.appendingPathComponent("missing-queue.json"))
+    var denied = ChannelRecoveryLedger(recent: [recordSample])
+    precondition(!reserveManualVerification(&denied, matching: recordSample, to: "ping_submitted", at: deniedQueue))
+    precondition(denied.recent.first?.verificationStage == "ping", "Failed durable reservation must not advance or send")
     precondition(ledgerTest.save(to: ledgerFile))
     precondition(!ChannelRecoveryLedger.load(from: ledgerFile).canAttempt(at: now.addingTimeInterval(299)))
     var disabledLedger = ledgerTest; disabledLedger.autoRecoveryEnabled = false
@@ -4051,6 +4327,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private var panelManualCheck: NSButton?
     private var panelRecoveryToggle: NSButton?
     private var panelRecoveryStatus: NSTextField?
+    private var panelManualRestart: NSButton?
+    private var manualPreparing = false
+    private var manualVerificationBusy = false
     private var panelWakeStatus: NSTextField?
     private var panelWakeToggle: NSButton?
     private var recordSearch: NSSearchField?
@@ -4069,6 +4348,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private var lastToolHistoryPoll = Date.distantPast
     private var verifiedRestart: (old: Int32, new: Int32)?
     private var pendingRecoveryVerification: (old: Int32, new: Int32)?
+    private var ownRestartObserved: (old: Int32, new: Int32)?
     private var lastActivityPIDCheck = Date.distantPast
     private let timelineReader = TimelineReader()
     private var activityBusy = false
@@ -4108,6 +4388,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         if previewMode {
             loadPreviewSnapshot(); openPanel()
             if CommandLine.arguments.contains("--verify-ui") { verifyPanelLayout(); exit(0) }
+            if CommandLine.arguments.contains("--preview-confirm") {
+                panelPage = 2; renderPanelPage()
+                DispatchQueue.main.async {
+                    let impact = RestartImpact(servicePID: 1234, started: "Fri Oct  9 20:10:50 2026", affectedCount: 8,
+                                                descendantCount: 6, groupPeerCount: 1,
+                                                labels: "Python ×5 · node ×2 · 其他程序 ×1", fingerprint: "preview")
+                    _ = self.manualRestartAlert(impact: impact, local: "本机有 1 次正在执行的调用", cloud: "云端待执行调用状态未知").runModal()
+                }
+            }
             return
         }
         DistributedNotificationCenter.default().addObserver(self, selector: #selector(openPanel), name: NSNotification.Name("com.wuwendi.commander-guard.open-panel"), object: nil)
@@ -4253,8 +4542,99 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private var activeProbeStatus: ActiveProbeBudget.Status {
         previewMode ? ActiveProbeBudget.Status(enabled: false, intervalSeconds: ActiveProbeBudget.defaultIntervalSeconds, lastSubmittedAt: nil, now: Date(), error: nil) : ActiveProbeBudget.shared.status()
     }
+    /// A confirmed manual choice owns the next two distinct shared probe slots.
+    private func continueManualVerification() -> Bool {
+        guard let record = recoveryLedger.recent.first, record.source == "manual",
+              let stage = record.verificationStage else { return false }
+        guard !manualVerificationBusy, !watchdog.recovering, !channelBusy, !manualPingBusy else { return true }
+        if stage == "ping_submitted" || stage == "tool_submitted" {
+            var next = recoveryLedger
+            if next.updateManual(matching: record, {
+                $0.verificationStage = ManualVerificationStage.afterInterruption(stage)
+                if stage == "ping_submitted" { $0.channel = "unknown" } else { $0.tool = "unknown" }
+            }),
+               next.save(to: recoveryURL) { recoveryLedger = next }
+            lastRecoveryOutcome = "上次探测结果未知；不会重复发送同一请求"
+            render(); return true
+        }
+        if let reason = activeProbeStatus.manualVerificationBlockReason {
+            lastRecoveryOutcome = "授权验证等待中：\(reason)"
+            render(); return true
+        }
+        guard let current = servicePID(), current == record.newPID,
+              let impact = RestartImpact.capture(servicePID: current), impact.started == record.newStarted else {
+            var next = recoveryLedger
+            _ = next.updateManual(matching: record) { $0.verificationStage = nil; $0.channel = "unknown"; $0.tool = "unknown"; $0.service = "unconfirmed" }
+            if next.save(to: recoveryURL) { recoveryLedger = next }
+            lastRecoveryOutcome = "待验证服务身份已变化；未继续发送探测"
+            render(); return true
+        }
+        guard let reserved = ManualVerificationStage.begin(stage),
+              reserveManualVerification(&recoveryLedger, matching: record, to: reserved, at: recoveryURL) else {
+            lastRecoveryOutcome = "无法保存验证阶段；未发送云端请求"; render(); return true
+        }
+        manualVerificationBusy = true
+        if stage == "ping" {
+            let probe = MCPChannelProbe()
+            probe.run(allowWhenDisabled: true) { result in DispatchQueue.main.async {
+                self.manualVerificationBusy = false
+                guard self.recoveryLedger.recent.first?.source == "manual",
+                      self.recoveryLedger.recent.first?.startedAt == record.startedAt,
+                      self.recoveryLedger.recent.first?.newPID == record.newPID,
+                      self.recoveryLedger.recent.first?.newStarted == record.newStarted,
+                      self.servicePID() == record.newPID,
+                      RestartImpact.capture(servicePID: current)?.started == record.newStarted else {
+                    self.lastRecoveryOutcome = "服务身份或恢复记录已变化；探测结果未归入本次恢复"; self.render(); return
+                }
+                var updated = self.recoveryLedger
+                _ = updated.updateManual(matching: record) { item in
+                    item.verificationStage = ManualVerificationStage.afterResult("ping_submitted", submitted: probe.submitted)
+                    if probe.submitted {
+                        switch result { case .healthy: item.channel = "healthy"; case .noLiveConnection: item.channel = "offline"; case .unknown: item.channel = "failed" }
+                    }
+                }
+                if updated.save(to: self.recoveryURL) { self.recoveryLedger = updated }
+                else { self.lastRecoveryOutcome = "ping 结果已观察，但记录写入失败" }
+                if probe.submitted { self.recordProbe(result, now: Date(), manual: true) }
+                self.render()
+            } }
+        } else {
+            let probe = MCPToolExecutionProbe()
+            probe.run(allowWhenDisabled: true) { result in DispatchQueue.main.async {
+                self.manualVerificationBusy = false
+                guard self.recoveryLedger.recent.first?.source == "manual",
+                      self.recoveryLedger.recent.first?.startedAt == record.startedAt,
+                      self.recoveryLedger.recent.first?.newPID == record.newPID,
+                      self.recoveryLedger.recent.first?.newStarted == record.newStarted,
+                      self.servicePID() == record.newPID,
+                      RestartImpact.capture(servicePID: current)?.started == record.newStarted else {
+                    self.lastRecoveryOutcome = "服务身份或恢复记录已变化；工具结果未归入本次恢复"; self.render(); return
+                }
+                var updated = self.recoveryLedger
+                _ = updated.updateManual(matching: record) { item in
+                    item.verificationStage = ManualVerificationStage.afterResult("tool_submitted", submitted: probe.submitted)
+                    if probe.submitted {
+                        switch result { case .verified: item.tool = "verified"; case .failed, .unknown: item.tool = "failed" }
+                    }
+                }
+                if updated.save(to: self.recoveryURL) { self.recoveryLedger = updated }
+                else { self.lastRecoveryOutcome = "工具检查结果已观察，但记录写入失败" }
+                if probe.submitted {
+                    self.snapshot.toolExecutionChecked = Date()
+                    switch result {
+                    case .verified: self.snapshot.toolExecutionState = "已验证"; self.snapshot.toolExecutionDetail = "一次授权的 list_sessions 已执行"
+                    case .failed: self.snapshot.toolExecutionState = "失败"; self.snapshot.toolExecutionDetail = "一次授权的 list_sessions 返回错误"
+                    case .unknown: self.snapshot.toolExecutionState = "未确认"; self.snapshot.toolExecutionDetail = "一次授权的 list_sessions 结果未知"
+                    }
+                }
+                self.render()
+            } }
+        }
+        return true
+    }
     private func pollChannel() {
         let now = Date()
+        if continueManualVerification() { return }
         if let reason = activeProbeStatus.blockReason {
             deferredReason = reason
             if snapshot.channelChecked == nil {
@@ -4394,8 +4774,73 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }
     }
     private func manualCheckBlocked(_ reason: String) { manualNotice = reason; render() }
+    private func manualActivityIdentity() -> String {
+        "\(snapshot.activity.state)|\(snapshot.activity.activeCount)|\(snapshot.activity.coverageGap)|\(snapshot.activity.pendingLine)|\(snapshot.activity.catchingUp)"
+    }
+    @objc private func manualRestart() {
+        guard !previewMode, !manualPreparing, !watchdog.recovering, !recoveryLaunched else { return }
+        guard !manualVerificationBusy, !channelBusy, !manualPingBusy else {
+            manualCheckBlocked("已有云端检查进行中；暂不重复重启"); return
+        }
+        guard recoveryLedger.canAttempt(at: Date()) else { manualCheckBlocked("上次重启后仍在五分钟冷却期"); return }
+        manualPreparing = true; render()
+        DispatchQueue.global(qos: .utility).async {
+            let impact = self.servicePID().flatMap(RestartImpact.capture(servicePID:))
+            DispatchQueue.main.async {
+                guard self.manualPreparing else { return }
+                guard let impact else {
+                    self.manualPreparing = false
+                    self.manualCheckBlocked("无法确认固定 LaunchAgent 的进程身份或受影响进程；未重启")
+                    return
+                }
+                Monitor.shared.checkOutstandingCalls { idle, _ in
+                    guard self.manualPreparing else { return }
+                    self.confirmManualRestart(impact: impact, cloudIdle: idle)
+                }
+            }
+        }
+    }
+    private func confirmManualRestart(impact: RestartImpact, cloudIdle: Bool?) {
+        guard !watchdog.recovering, recoveryLedger.canAttempt(at: Date()) else {
+            manualPreparing = false; manualCheckBlocked("恢复状态或冷却期已变化；未重启"); return
+        }
+        let activityIdentity = manualActivityIdentity()
+        let local = snapshot.activity.activeCount > 0 ? "本机有 \(snapshot.activity.activeCount) 次正在执行的调用" :
+            activitySafeForRecovery(snapshot.activity) ? "本机日志未显示正在执行的调用" : "本机调用或日志状态未知"
+        let cloud = cloudIdle == true ? "云端未查询到待执行调用" : cloudIdle == false ? "云端有待执行或执行中的调用" : "云端待执行调用状态未知"
+        let alert = manualRestartAlert(impact: impact, local: local, cloud: cloud)
+        let displayedAt = Date()
+        let choice = alert.runModal()
+        let verify = alert.suppressionButton?.state == .on
+        guard choice == .alertSecondButtonReturn else { manualPreparing = false; render(); return }
+        let grant = ManualRestartGrant(identity: impact.identity + "|" + activityIdentity, issuedAt: displayedAt)
+        guard let currentPID = servicePID(), currentPID == impact.servicePID,
+              let fresh = RestartImpact.capture(servicePID: currentPID),
+              grant.identity == fresh.identity + "|" + manualActivityIdentity(),
+              Date().timeIntervalSince(displayedAt) <= 60,
+              recoveryLedger.canAttempt(at: Date()), !watchdog.recovering else {
+            manualPreparing = false; manualCheckBlocked("确认后服务、进程组或本机调用状态已变化；未重启"); return
+        }
+        manualPreparing = false
+        watchdog.recovering = true
+        startRecovery(oldPID: currentPID, source: "manual", approvedImpact: fresh, manualGrant: grant, verifyManually: verify)
+    }
+    private func manualRestartAlert(impact: RestartImpact, local: String, cloud: String) -> NSAlert {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "重启本机 Commander 服务？"
+        alert.informativeText = "固定服务 PID \(impact.servicePID)，启动于 \(impact.started)。预计影响 \(impact.affectedCount) 个进程：后代 \(impact.descendantCount)，同进程组额外成员 \(impact.groupPeerCount)。\n\(impact.labels)；监听端口未确认。\n\(local)；\(cloud)。\n\n重启会中断这些进程及可能仍在进行的本机或云端任务；未知状态也可能包含未完成工作。确认有效期为 60 秒，原任务不会自动恢复。"
+        alert.addButton(withTitle: "取消")
+        alert.addButton(withTitle: "确认中断并重启")
+        alert.showsSuppressionButton = true
+        alert.suppressionButton?.title = "重启后各执行一次 ping 和 list_sessions（可能消耗额度；共用探测间隔）"
+        alert.suppressionButton?.state = .off
+        return alert
+    }
     private func considerRecovery() {
         let now = Date()
+        guard !manualPreparing else { return }
+        guard !manualVerificationBusy else { return }
         if let reason = activeProbeStatus.permissionBlockReason { snapshot.channelDetail = "自动恢复已暂停：\(reason)"; render(); return }
         if localRestartSuppressed(for: channelIncident, at: now) {
             snapshot.channelDetail = "云端实时服务连接池异常；本机重启不会修复该容量问题"
@@ -4444,7 +4889,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }
     }
     private func recoveryGateOpen(oldPID: Int32) -> Bool {
-        activeProbeStatus.permissionBlockReason == nil && watchdog.recovering && recoveryLedger.autoRecoveryEnabled && recoveryLedger.canAttempt(at: Date()) &&
+        !manualPreparing && !manualVerificationBusy && activeProbeStatus.permissionBlockReason == nil && watchdog.recovering && recoveryLedger.autoRecoveryEnabled && recoveryLedger.canAttempt(at: Date()) &&
         snapshot.service == "运行中" && activitySafeForRecovery(snapshot.activity) && !activityBusy &&
         Date().timeIntervalSince(lastActivityPoll) < 3
     }
@@ -4455,41 +4900,90 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         auditChannel(kind: "recovery_decision", result: auditCode, action: "no_restart")
         render()
     }
-    private func startRecovery(oldPID: Int32) {
-        guard recoveryGateOpen(oldPID: oldPID) else { abortRecovery("恢复前状态已变化；未重启", auditCode: "deferred_gate_changed"); return }
-        guard servicePID() == oldPID else { abortRecovery("Commander 进程已变化；未重启", auditCode: "deferred_pid_changed"); return }
+    private func startRecovery(oldPID: Int32, source: String = "automatic", approvedImpact: RestartImpact? = nil,
+                               manualGrant: ManualRestartGrant? = nil, verifyManually: Bool = false) {
+        guard source == "manual" || recoveryGateOpen(oldPID: oldPID) else { abortRecovery("恢复前状态已变化；未重启", auditCode: "deferred_gate_changed"); return }
+        guard servicePID() == oldPID, let impact = RestartImpact.capture(servicePID: oldPID),
+              source == "manual" ? (approvedImpact?.identity == impact.identity) : (impact.groupPeerCount == 0 && CommanderProcessTree.safe(servicePID: oldPID)),
+              recoveryLedger.canAttempt(at: Date()) else {
+            abortRecovery("服务身份、进程组或冷却状态已变化；未重启", auditCode: "deferred_process_or_activity_changed"); return
+        }
+        if source == "manual" {
+            guard var grant = manualGrant,
+                  grant.consume(matching: impact.identity + "|" + manualActivityIdentity(), now: Date()) else {
+                abortRecovery("一次授权已过期或影响范围变化；未重启", auditCode: "deferred_manual_consent_expired"); return
+            }
+        }
         let attemptAt = Date()
-        recoveryLedger.recordAttempt(at: attemptAt)
-        guard recoveryLedger.save(to: recoveryURL) else { abortRecovery("无法安全保存冷却记录；未重启", auditCode: "deferred_cooldown_persist_failed"); return }
-        auditChannel(kind: "recovery", result: "restart_started", action: "local_commander_restart", at: attemptAt)
+        var next = recoveryLedger
+        let initial = RecoveryAttemptRecord(source: source, startedAt: attemptAt, oldPID: oldPID,
+                                            oldStarted: impact.started, affectedCount: impact.affectedCount)
+        next.begin(initial)
+        guard next.save(to: recoveryURL) else { abortRecovery("无法安全保存恢复记录；未重启", auditCode: "deferred_cooldown_persist_failed"); return }
+        recoveryLedger = next
+        auditChannel(kind: "recovery", result: "restart_started", action: source == "manual" ? "manual_local_restart" : "automatic_local_restart", at: attemptAt)
         lastRecoveryOutcome = "恢复进行中"
-        snapshot.channelState = "正在恢复通道"; snapshot.channelDetail = "冷却已保存，正在重启固定的 Commander 服务"; render()
+        snapshot.channelState = "正在恢复通道"; snapshot.channelDetail = "恢复尝试已保存，正在重启固定的 Commander 服务"; render()
         let p = Process(); p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
         p.arguments = ["kickstart", "-k", "gui/\(getuid())/com.wuwendi.remote-desktop-commander"]
         p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice
-        do { try p.run() } catch { recoveryFinished(oldPID: oldPID, newPID: nil, result: .unknown("launchctl 无法启动")); return }
+        do { try p.run() } catch { recoveryFinished(oldPID: oldPID, newPID: nil, result: .unknown("launchctl 无法启动"), source: source, execution: "launch_failed"); return }
         recoveryLaunched = true
         DispatchQueue.global(qos: .utility).async {
             DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 5) { if p.isRunning { p.terminate() } }
             p.waitUntilExit()
-            guard p.terminationStatus == 0 else { DispatchQueue.main.async { self.recoveryFinished(oldPID: oldPID, newPID: nil, result: .unknown("launchctl 重启失败")) }; return }
+            guard p.terminationStatus == 0 else { DispatchQueue.main.async { self.recoveryFinished(oldPID: oldPID, newPID: nil, result: .unknown("launchctl 重启失败"), source: source, execution: "exit_failed") }; return }
             var newPID: Int32?
             for _ in 0..<10 {
                 Thread.sleep(forTimeInterval: 1)
                 if let current = self.servicePID(), current != oldPID { newPID = current; break }
             }
-            guard let newPID else { DispatchQueue.main.async { self.recoveryFinished(oldPID: oldPID, newPID: nil, result: .unknown("重启后服务 PID 未变化")) }; return }
+            guard let newPID else { DispatchQueue.main.async { self.recoveryFinished(oldPID: oldPID, newPID: nil, result: .unknown("重启后服务 PID 未变化"), source: source, execution: "pid_unchanged") }; return }
+            if source == "manual" {
+                let started = RestartImpact.capture(servicePID: newPID)?.started
+                DispatchQueue.main.async {
+                    self.recoveryFinished(oldPID: oldPID, newPID: newPID,
+                                          result: .unknown(verifyManually ? "等待下一次可用探测时段" : "仅本机重启，未请求云端验证"),
+                                          source: source, newStarted: started, verifyManually: verifyManually)
+                }
+                return
+            }
             let probe = MCPChannelProbe()
-            probe.run { result in DispatchQueue.main.async { self.recoveryFinished(oldPID: oldPID, newPID: newPID, result: result, submitted: probe.submitted) } }
+            probe.run { result in DispatchQueue.main.async { self.recoveryFinished(oldPID: oldPID, newPID: newPID, result: result, submitted: probe.submitted, source: source, newStarted: RestartImpact.capture(servicePID: newPID)?.started) } }
         }
     }
-    private func recoveryFinished(oldPID: Int32, newPID: Int32?, result: ChannelProbeResult, submitted: Bool = false) {
+    private func recoveryFinished(oldPID: Int32, newPID: Int32?, result: ChannelProbeResult, submitted: Bool = false,
+                                  source: String = "automatic", execution: String = "changed", newStarted: String? = nil,
+                                  verifyManually: Bool = false) {
         let finishedAt = Date()
         watchdog.recovering = false; recoveryLaunched = false
+        if let newPID { ownRestartObserved = (oldPID, newPID) }
+        let currentPID = servicePID()
+        let currentStarted = currentPID.flatMap { RestartImpact.capture(servicePID: $0)?.started }
+        let oldExited = kill(oldPID, 0) == -1 && errno == ESRCH
+        let serviceChanged = serviceRestartConfirmed(oldPID: oldPID, newPID: newPID, currentPID: currentPID,
+                                                     oldProcessExited: oldExited, newStarted: newStarted, currentStarted: currentStarted)
+        var next = recoveryLedger
+        next.finish { record in
+            guard record.source == source && record.oldPID == oldPID else { return }
+            record.finishedAt = finishedAt; record.execution = execution
+            record.newPID = newPID; record.newStarted = newStarted
+            record.service = serviceChanged ? "changed" : "unconfirmed"
+            if verifyManually && serviceChanged { record.channel = "waiting" }
+            else if submitted {
+                switch result { case .healthy: record.channel = "healthy"; case .noLiveConnection: record.channel = "offline"; case .unknown: record.channel = "failed" }
+            } else { record.channel = "unknown" }
+            record.tool = verifyManually && serviceChanged ? "waiting" : "unknown"
+            record.verificationStage = verifyManually && serviceChanged ? "ping" : nil
+        }
+        if next.save(to: recoveryURL) { recoveryLedger = next }
+        else { lastRecoveryOutcome = "服务执行结果已观察，但恢复记录写入失败" }
         if submitted { lastPingAt = finishedAt; lastPingResult = probeDescription(result); snapshot.channelChecked = lastPingAt }
-        if let newPID, newPID != oldPID { pendingRecoveryVerification = (oldPID, newPID) }
-        lastRecoveryOutcome = newPID == nil ? resultMessageForMissingRecoveryProbe(result) : probeDescription(result)
-        if submitted && recoveryConfirmed(oldPID: oldPID, newPID: newPID, currentPID: servicePID(), oldProcessExited: kill(oldPID, 0) == -1 && errno == ESRCH, probe: result) {
+        if let newPID, serviceChanged { pendingRecoveryVerification = (oldPID, newPID) }
+        if lastRecoveryOutcome != "服务执行结果已观察，但恢复记录写入失败" {
+            lastRecoveryOutcome = newPID == nil ? resultMessageForMissingRecoveryProbe(result) : probeDescription(result)
+        }
+        if submitted && serviceChanged && recoveryConfirmed(oldPID: oldPID, newPID: newPID, currentPID: currentPID, oldProcessExited: oldExited, probe: result) {
             pendingRecoveryVerification = nil
             watchdog.failures = 0; snapshot.channelState = "通道已恢复"; snapshot.channelDetail = "服务 PID 已变化，后续 MCP ping 成功"
             auditChannel(kind: "recovery", result: "restart_confirmed", action: "channel_recovered", at: finishedAt)
@@ -4499,7 +4993,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                 pollActivity()
             }
         } else {
-            snapshot.channelState = "恢复尚未确认"; snapshot.channelDetail = newPID == nil ? (watchdog.detail + "；" + probeDescription(result)) : submitted ? "服务已重启，但后续 MCP ping 未成功（\(probeDescription(result))）" : "服务已重启，等待下次实际 ping 确认（\(probeDescription(result))）"
+            snapshot.channelState = "恢复尚未确认"; snapshot.channelDetail = !serviceChanged ? "服务变化尚未确认；\(probeDescription(result))" : submitted ? "服务已重启，但后续 MCP ping 未成功（\(probeDescription(result))）" : "服务已重启，等待下次实际 ping 确认（\(probeDescription(result))）"
             auditChannel(kind: "recovery", result: "restart_unconfirmed", action: "retain_fault_history", at: finishedAt)
             if channelIncident.activeCategory != nil { channelIncident.scheduleAfterCheck(now: finishedAt); saveChannelIncident() }
         }
@@ -4522,6 +5016,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
               let pidRange = text[match].range(of: #"[0-9]+"#, options: .regularExpression) else { return nil }
         return Int32(text[pidRange])
     }
+    private func recordExternalRestart(oldPID: Int32, newPID: Int32) {
+        guard !watchdog.recovering, !recoveryLaunched,
+              !(ownRestartObserved.map { $0.old == oldPID && $0.new == newPID } ?? false),
+              !(recoveryLedger.recent.first.map { $0.source != "external" && $0.oldPID == oldPID && $0.newPID == newPID } ?? false),
+              !(recoveryLedger.recent.first.map { $0.source == "external" && $0.oldPID == oldPID && $0.newPID == newPID } ?? false),
+              let impact = RestartImpact.capture(servicePID: newPID) else { return }
+        var next = recoveryLedger
+        var record = RecoveryAttemptRecord(source: "external", startedAt: Date(), oldPID: oldPID, oldStarted: "", affectedCount: 0)
+        record.finishedAt = Date(); record.newPID = newPID; record.newStarted = impact.started
+        record.execution = "observed"; record.service = "changed"
+        next.recent.insert(record, at: 0); next.recent = Array(next.recent.prefix(5))
+        if next.save(to: recoveryURL) { recoveryLedger = next; lastRecoveryOutcome = "观察到外部服务重启；未归功于 Guard" }
+        else { lastRecoveryOutcome = "观察到外部服务变化，恢复记录写入失败" }
+    }
     private func pollActivity() {
         guard !activityBusy else { return }
         let restart = verifiedRestart; verifiedRestart = nil
@@ -4531,6 +5039,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         if pollHistory { lastToolHistoryPoll = now }
         activityBusy = true
         DispatchQueue.global(qos: .utility).async {
+            var externalChanges: [(Int32, Int32)] = []
             if let restart {
                 self.activityReader.confirmedProcessRestart(oldPID: restart.old, newPID: restart.new, oldProcessExited: true)
                 self.activityObservedPID = restart.new
@@ -4540,6 +5049,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                isConfirmedExternalProcessRestart(oldPID: old, newPID: pid, oldProcessExited: kill(old, 0) == -1 && errno == ESRCH) {
                 self.activityReader.confirmedProcessRestart(oldPID: old, newPID: pid, oldProcessExited: true)
                 self.activityObservedPID = pid
+                externalChanges.append((old, pid))
             } else if self.activityObservedPID == nil, let pid = pidBeforeReplay {
                 self.activityObservedPID = pid
             }
@@ -4549,6 +5059,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                isConfirmedExternalProcessRestart(oldPID: old, newPID: pid, oldProcessExited: kill(old, 0) == -1 && errno == ESRCH) {
                 self.activityReader.confirmedProcessRestart(oldPID: old, newPID: pid, oldProcessExited: true)
                 self.activityObservedPID = pid
+                externalChanges.append((old, pid))
             }
             if pollHistory { self.toolHistoryReader.poll() }
             self.timelineReader.poll()
@@ -4556,6 +5067,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             let history = self.toolHistoryReader.summary
             let timeline = self.timelineReader.summary
             DispatchQueue.main.async {
+                for (old, new) in externalChanges { self.recordExternalRestart(oldPID: old, newPID: new) }
                 self.snapshot.activity = value; self.snapshot.toolHistory = history; self.snapshot.timeline = timeline; self.lastActivityPoll = Date(); self.activityBusy = false
                 self.processChannelTimeline(timeline, now: Date())
                 self.refreshToolExecutionFromActivity(value)
@@ -4849,6 +5361,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let diagnosis = currentDiagnosis()
         var object: [String: Any] = ["chatgpt": ["answer": chat.answer, "update_connection": chat.connection, "recent_issue": chat.history as Any? ?? NSNull(), "coverage": snapshot.timeline.coverage, "delivery_timeout_directly_observable": false, "limitation": chat.deliveryLimit], "service": snapshot.service, "cloud": snapshot.cloud, "last_seen": snapshot.lastSeen.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "checked_at": ISO8601DateFormatter.flex.string(from: snapshot.checked), "error_count": snapshot.errorCount, "paused": paused, "idle_prevention": assertion != 0, "message": snapshot.message, "channel": ["state": snapshot.channelState, "detail": snapshot.channelDetail, "consecutive_no_live": snapshot.channelFailures, "checked_at": snapshot.channelChecked.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "auto_recovery_enabled": recoveryLedger.autoRecoveryEnabled, "last_recovery_attempt": recoveryLedger.lastAttempt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "last_ping_at": lastPingAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "last_ping_result": lastPingResult, "check_deferred_reason": deferredReason, "recovery_status": recoveryAvailability(), "last_recovery_result": lastRecoveryOutcome as Any? ?? NSNull()], "menu": ["menubar_title": item.button?.title ?? "", "menubar_has_icon": item.button?.image != nil, "connection": summaryLines[0].title, "channel": summaryLines[0].title, "tool_execution": summaryLines[1].title, "action": summaryLines[2].title, "recovery": summaryLines[3].title, "chatgpt": summaryLines[4].title, "execution_step_rows": rows, "execution_steps": safeSteps, "tool_call_elapsed_seconds": callElapsed as Any? ?? NSNull(), "tool_call_state": currentState, "recent_actions": snapshot.activity.recent], "activity": ["state": snapshot.activity.state, "tool": CommanderActivity.safeToolIdentifier(snapshot.activity.tool), "active_count": snapshot.activity.activeCount, "observed_at": snapshot.activity.observed.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "recent": snapshot.activity.recent, "error": snapshot.activity.error, "coverage_gap": snapshot.activity.coverageGap, "gap_reason": snapshot.activity.gapReason, "gap_first_at": snapshot.activity.gapFirstAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "gap_last_at": snapshot.activity.gapLastAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "backlog_bytes": snapshot.activity.backlogBytes, "catching_up": snapshot.activity.catchingUp, "pending_line": snapshot.activity.pendingLine, "idle_proven": snapshot.activity.idleProven], "timeline": ["coverage": snapshot.timeline.coverage, "commander_errors_this_run": snapshot.timeline.commanderErrors, "conversation_labels_verified_at": snapshot.timeline.conversationLabelsVerifiedAt as Any? ?? NSNull(), "last_chatgpt_app_event": lastAppEvent, "events": timelineRows]]
         let probeBudget = activeProbeStatus
+        object["recovery_attempts"] = recoveryLedger.recent.map { record in
+            ["source": record.source, "started_at": ISO8601DateFormatter.flex.string(from: record.startedAt),
+             "finished_at": record.finishedAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(),
+             "old_pid": record.oldPID, "old_started": record.oldStarted,
+             "new_pid": record.newPID as Any? ?? NSNull(), "new_started": record.newStarted as Any? ?? NSNull(),
+             "affected_process_count": record.affectedCount, "execution": record.execution,
+             "service": record.service, "channel": record.channel, "tool": record.tool,
+             "business": record.business] as [String: Any]
+        }
         object["active_probing"] = ["enabled": probeBudget.enabled, "interval_seconds": probeBudget.intervalSeconds, "estimated_calls_per_day": probeBudget.dailyEstimate, "last_submitted_at": probeBudget.lastSubmittedAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "next_allowed_at": probeBudget.nextAllowedAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "blocked_reason": probeBudget.blockReason as Any? ?? NSNull(), "billing_confirmed_free": false]
         object["tool_execution"] = ["state": snapshot.toolExecutionState, "detail": snapshot.toolExecutionDetail, "checked_at": snapshot.toolExecutionChecked.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "fresh": toolExecutionFresh(snapshot, now: Date()), "evidence_ttl_seconds": Int(toolExecutionEvidenceTTL), "probe_deferred_reason": toolProbeDeferredReason]
         object["usage_quota"] = ["state": quota.state.rawValue, "used": quota.used as Any? ?? NSNull(), "total": quota.total as Any? ?? NSNull(), "remaining": quota.remaining as Any? ?? NSNull(), "plan": quota.plan.isEmpty ? NSNull() : quota.plan as Any, "month": quota.month.isEmpty ? NSNull() : quota.month as Any, "last_successful_sync": quota.syncedAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "last_error": quotaFailureReason as Any? ?? NSNull(), "refresh_interval_seconds": quotaRefreshSeconds, "backend": "chrome_headless_private_profile"]
@@ -5244,6 +5765,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
         var datedSections: [(Date, NSView)] = []
 
+        let restart = NSButton(title: "人工授权重启本机服务…", target: self, action: #selector(manualRestart))
+        restart.bezelStyle = .rounded
+        restart.toolTip = "先读取固定服务和受影响进程，再逐次确认中断；无需开启自动恢复或常规云端探测。"
+        let manualBlock: String?
+        if manualPreparing { manualBlock = "正在核对影响范围" }
+        else if watchdog.recovering || recoveryLaunched { manualBlock = "已有恢复进行中" }
+        else if manualVerificationBusy || channelBusy || manualPingBusy { manualBlock = "已有云端检查进行中" }
+        else if !recoveryLedger.canAttempt(at: Date()) { manualBlock = "五分钟冷却中" }
+        else if snapshot.service != "运行中" { manualBlock = "等待固定 Commander 服务运行" }
+        else { manualBlock = nil }
+        restart.isEnabled = !previewMode && manualBlock == nil
+        panelManualRestart = restart
+        let localBarrier = snapshot.activity.activeCount > 0 ? "本机调用进行中 \(snapshot.activity.activeCount) 次" :
+            activitySafeForRecovery(snapshot.activity) ? "本机日志可判断近期调用已结束" : "本机调用或日志状态未知：\(activityDeferralReason(snapshot.activity))"
+        let manualHint = label("明确断链 \(watchdog.failures)/3；未知结果不计入自动重启。自动恢复：\(recoveryAvailability())。\n\(localBarrier)；后台进程需另行核对，点击按钮读取影响范围。\n共享探测：\(activeProbeStatus.display)。\n\(manualBlock ?? "逐次确认中断范围；可选择仅本机重启或再各检查一次通道与工具。")", size: 12, color: .secondaryLabelColor)
+        let manualContent = vertical(8)
+        manualContent.addArrangedSubview(restart); manualContent.addArrangedSubview(manualHint)
+        let manualCard = card(manualContent, padding: 16)
+
+        if let record = recoveryLedger.recent.first {
+            let source = ["automatic": "自动恢复", "manual": "人工授权", "external": "外部变化"][record.source] ?? "未知来源"
+            let execution = ["started": "执行结果未知", "launch_failed": "启动失败", "exit_failed": "命令失败", "pid_unchanged": "未确认进程变化", "changed": "命令完成并观察到新 PID", "observed": "观察到外部变化"][record.execution] ?? "未知"
+            let service = record.service == "changed" ? "固定服务新实例已确认" : "固定服务变化未确认"
+            let channel = ["healthy": "ping 成功", "offline": "设备仍离线", "failed": "检查失败或未知", "waiting": "等待共享探测间隔", "unknown": "未验证"][record.channel] ?? "未知"
+            let tool = ["verified": "list_sessions 已执行", "failed": "检查失败或未知", "waiting": "等待后续共享探测间隔", "unknown": "未验证"][record.tool] ?? "未知"
+            datedSections.append((record.startedAt, section("最近恢复 · \(source)", rows: [
+                ("开始", displayEvidenceTime(record.startedAt)),
+                ("进程", "原 PID \(record.oldPID) → \(record.newPID.map(String.init) ?? "未确认") · 预计影响 \(record.affectedCount) 个进程"),
+                ("执行", execution), ("本机服务", service), ("消息通道", channel), ("工具执行", tool),
+                ("原业务", "状态未知；Guard 不会自动重放原任务，请人工核对")
+            ])))
+        }
+
         if let recentCategory = channelIncident.recentCategory {
             let result = channelIncident.activeCategory == nil ? "已恢复" : "恢复尚未确认"
             var issueRows: [(String, String)] = [
@@ -5281,7 +5835,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         if datedSections.isEmpty {
             datedSections.append((.distantPast, section("故障记录", rows: [("状态", "近期未记录到故障")])) )
         }
-        setSections(datedSections.sorted { $0.0 > $1.0 }.map(\.1))
+        setSections([manualCard] + datedSections.sorted { $0.0 > $1.0 }.map(\.1))
     }
     private func renderLogPage() {
         guard let scroll = panelScroll else { return }
@@ -5509,6 +6063,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
     private func loadPreviewSnapshot() {
         let now = Date(), uptime = ProcessInfo.processInfo.systemUptime
+        var previewRecovery = RecoveryAttemptRecord(source: "manual", startedAt: now.addingTimeInterval(-720), oldPID: 1200,
+                                                    oldStarted: "Fri Oct  9 20:10:50 2026", affectedCount: 8)
+        previewRecovery.finishedAt = now.addingTimeInterval(-700); previewRecovery.newPID = 1234
+        previewRecovery.newStarted = "Fri Oct  9 20:11:02 2026"; previewRecovery.execution = "changed"
+        previewRecovery.service = "changed"; previewRecovery.channel = "healthy"; previewRecovery.tool = "waiting"
+        recoveryLedger = ChannelRecoveryLedger(lastAttempt: now.addingTimeInterval(-720), recent: [previewRecovery])
         quota = UsageQuota(state: .fresh, used: 4200, total: 10000, plan: "free", month: "2026-10", syncedAt: now.addingTimeInterval(-35))
         snapshot.service = "运行中"; snapshot.cloud = "已连接"
         snapshot.channelState = "通道畅通"; snapshot.channelDetail = "最近一次检查通过 · 示例"
@@ -5626,6 +6186,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         verify(panelSectionCount == 3, "Overview must show conclusion, guard controls, and a compact quota/task row")
         verify(panelControlCard?.layer?.backgroundColor != nil, "Cards must paint their distinct background on initial attachment")
         verify(panelControlCard?.isHidden == false && panelRecoveryToggle?.title == "自动恢复本机 Commander" && panelRecoveryToggle?.toolTip?.contains("不会重试原任务") == true, "Recovery control must explain its local-only action and safeguards")
+        panelPage = 2; renderPanel()
+        verify(panelManualRestart?.title == "人工授权重启本机服务…" && panelManualRestart?.isEnabled == false, "Fault page must show inert manual restart action in preview")
+        panelPage = 0; renderPanel()
         verify(panelProbeToggle?.title == "云端主动探测（可能消耗额度）" && panelProbeToggle?.state == .off && panelProbeBudget?.stringValue == activeProbeStatus.display && panelProbeIntervalPicker?.indexOfSelectedItem == ActiveProbeBudget.defaultIntervalIndex && panelProbeIntervalPicker?.numberOfItems == ActiveProbeBudget.intervalOptions.count && panelManualCheck?.isEnabled == false, "Probe switch must default OFF and show the selected cadence")
         verify(panelWakeToggle?.title == "防止闲置睡眠（Guard）" && panelWakeToggle?.toolTip?.contains("其他程序仍可能保持唤醒") == true && panelWakeStatus?.stringValue.contains("保持唤醒：") == true, "Wake control must describe its actual assertion and limits")
         verify(quotaProgress?.isHidden == false && quotaSynced?.isHidden == false && quotaSynced?.stringValue.range(of: #"\d{2}:\d{2}:\d{2}"#, options: .regularExpression) != nil && quotaSynced?.font?.pointSize == 12 && quotaSynced?.textColor == .secondaryLabelColor, "Quota sync time must remain visible as secondary evidence")

@@ -19,6 +19,7 @@ This project is for macOS users who already use [Remote Desktop Commander](https
 | Live status | Menu bar icon and text show channel status; the panel tracks the message channel, tool execution, and ChatGPT answer state separately |
 | Optional active probes | OFF by default; choose a device `ping` every 5, 10, 15, or 30 minutes, or 1, 2, 3, or 6 hours; all entry points share that interval |
 | Automatic recovery | After repeated explicit disconnects, checks tasks, logs, processes, and cooldown before deciding whether to restart the managed Commander service |
+| One-time restart | Review interruption impact and authorize one restart of the managed service; recurring settings remain unchanged |
 | Activity records | Up to 100 recent local calls, with search, filters, redacted details, and anonymous session attribution when reliable upstream metadata exists |
 | Cloud usage | Uses the official usage page in Chrome to display used, included, and remaining calls, progress, and the last successful sync time |
 | ChatGPT observation | Reads local logs for some stream, resume, and update-connection events, separating current status from past incidents |
@@ -37,7 +38,7 @@ The current version expects the following layout. There are no settings for cust
 | Item | Expected location |
 |---|---|
 | Device credentials | `~/.desktop-commander-device/device.json` |
-| Managed LaunchAgent | `com.wuwendi.remote-desktop-commander` |
+| Managed LaunchAgent | The managed service expected by the bundled installer |
 | Commander logs | `~/Library/Logs/RemoteDesktopCommander/stdout.log`, `stderr.log` |
 | Commander program | `~/.local/share/remote-desktop-commander/node_modules/@wonderwhy-er/desktop-commander/dist/index.js` |
 | ChatGPT App logs | `~/Library/Logs/com.openai.codex` |
@@ -69,7 +70,7 @@ OFF blocks new `tools/call` requests and pauses automatic recovery. Submitted re
 
 ### Optional: use the existing installer
 
-**`install.sh` currently depends on `/Volumes/ExtSSD/Projects/CommanderGuard` and requires `/Volumes/ExtSSD/Projects` to exist. If you use a different directory layout, use the source build above first.**
+**`install.sh` is currently tied to a maintainer-specific deployment layout and is not a general-purpose installer. For other environments, use the source build above; do not run this script unchanged.**
 
 Once your setup matches that layout, run:
 
@@ -133,6 +134,16 @@ Guard can observe some answer-resume, refresh-failure, and update-connection eve
 
 An update connection reopening establishes only that connection's recovery; a resume-completed event applies to its corresponding recovery path. Guard cannot control or resume the original ChatGPT answer stream, resend messages, restart ChatGPT, or switch networks. See [CHAT-LIVENESS-REVIEW.md](CHAT-LIVENESS-REVIEW.md) for the technical review in Chinese.
 
+## Authorize one restart
+
+Click “人工授权重启本机服务…” (Authorize one local-service restart) on “故障与恢复” (Incidents and recovery). Guard checks the managed service instance, presents affected background processes, local calls and cloud-check results, then asks for this restart only. A completed tool call does not establish that the background service it launched has stopped.
+
+- Canceling does not restart anything or change preferences. Consent expires after 60 seconds and applies only to the displayed service instance and impact. Guard rechecks before execution; a changed scope requires new consent.
+- This local action does not require automatic recovery or recurring active probes, and does not enable either preference. Failed identity or impact checks, concurrent execution and failed evidence storage cannot be overridden.
+- Cloud verification is a separate choice and may consume tool quota. It respects the shared probe interval; waiting is shown as unverified rather than causing back-to-back calls.
+- Results distinguish service restart, channel responsiveness, real tool execution and business state. Background services may stop; Guard does not relaunch them or replay business calls.
+- Evidence distinguishes automatic, one-time manual and external restarts. Saved evidence never authorizes another restart. Optional verification remains bound to the new service instance across Guard relaunches; a submitted check with an unknown result is never resubmitted.
+
 ## When automatic recovery runs
 
 Both active probes and automatic recovery must be enabled, and the probe ledger must be readable and safely writable. Turning probes OFF preserves the saved recovery permission but pauses new recovery attempts; the panel explains why.
@@ -141,7 +152,7 @@ Guard starts evaluating recovery after automatic probes accumulate three explici
 
 Enabling this toggle permits Guard to restart the managed local Commander service. Turning it off keeps observation and alerts running but prevents new automatic restarts; a restart already launched cannot be undone. The setting is saved. It does not unconditionally start a stopped service, repair the cloud, or sign you in again.
 
-Before a restart, automatic recovery must be enabled and all of the following must be established:
+The following rules apply to unattended automatic recovery. One-time manual consent does not change them. Before an automatic restart, recovery must be enabled and all of the following must be established:
 
 - Local calls have ended, with complete, readable log coverage.
 - The Commander process tree matches the expected layout and has no extra child processes.
@@ -175,7 +186,7 @@ State files live in `~/Library/Application Support/CommanderGuard/`:
 | `timeline.jsonl` | Redacted events, capped at 1 MiB with one rotated copy |
 | `channel-incident.json` | Current and recent channel categories, timestamps, backoff, and recovery state |
 | `channel-decisions.jsonl` | Probe and recovery decisions, capped at 512 KiB with one rotated copy |
-| `channel-recovery.json` | Recovery toggle and last attempt time, without credentials |
+| `channel-recovery.json` | Automatic-recovery preference, cooldown and up to five sanitized recovery records; no replayable restart consent |
 | `active-probe-budget.json` | Probe permission, interval and last request time, without credentials; relaunches do not reset it; upgrading an old ledger switches probing OFF |
 
 Session attribution accepts only upstream `_meta["openai/session"]` or `origin_context_id`. Raw identifiers are SHA-256 hashed into short anonymous fingerprints. Missing fields produce no attribution label; conflicting fields still show “归属冲突” (attribution conflict). Timing, the foreground chat, terminal processes, and `origin_instance` are not attribution evidence.
