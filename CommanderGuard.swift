@@ -1517,7 +1517,7 @@ func activityOverviewText(_ activity: ActivitySummary) -> String {
 
 func chatOverviewTitle(_ summary: ChatMonitorSummary) -> String {
     if summary.answer.hasPrefix("回答异常") { return "回答异常" }
-    if summary.connection.contains("已建立") { return "连接正常" }
+    if summary.connection.contains("已建立") { return "后续连接已恢复" }
     if summary.connection.contains("准备重连") { return "正在重连" }
     if ["失败", "已关闭", "耗尽"].contains(where: summary.connection.contains) { return "连接异常" }
     return summary.connection.contains("未知") ? "连接未知" : "连接状态未确认"
@@ -3561,7 +3561,7 @@ func selfTest() {
     precondition(activityOverviewText(ActivitySummary(state: "未观察到新调用")) == "尚无法确认空闲")
     precondition(activityOverviewText(ActivitySummary(state: "未观察到新调用", idleProven: true)) == "已确认空闲")
     let chatOverview = ChatMonitorSummary(answer: "当前未见异常", connection: "更新连接已建立", history: nil)
-    precondition(chatOverviewTitle(chatOverview) == "连接正常" && chatOverviewDetail(chatOverview).contains("原回答是否完整：无法确认"))
+    precondition(chatOverviewTitle(chatOverview) == "后续连接已恢复" && chatOverviewDetail(chatOverview).contains("原回答是否完整：无法确认"))
     precondition(chatOverviewTitle(ChatMonitorSummary(answer: "回答异常（恢复未确认）", connection: "更新连接已建立", history: nil)) == "回答异常")
     precondition(chatOverviewDetail(ChatMonitorSummary(answer: "回答恢复已记录", connection: "更新连接已建立", history: nil)) == "记录到回答恢复完成")
     precondition(wakePreventionSummary(enabled: true, serviceRunning: true, assertionActive: true) == "Guard 正在防止闲置睡眠")
@@ -4271,7 +4271,7 @@ final class TopAlignedPanelDocumentView: NSView {
     override var isFlipped: Bool { true }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTableViewDelegate, NSMenuDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSplitViewDelegate, NSTableViewDataSource, NSTableViewDelegate, NSMenuDelegate {
     private var item: NSStatusItem!
     private var timer: Timer?
     private var channelTimer: Timer?
@@ -4306,11 +4306,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private var panelNav: NSSegmentedControl?
     private var panelSectionCount = 0
     private var panelSectionWidths: [NSLayoutConstraint] = []
+    private var panelLayout: NSStackView?
     private var panelHeading: NSStackView?
     private var panelHeroes: NSStackView?
+    private var panelHeroShellWidth: NSLayoutConstraint?
     private var panelControlCard: NSView?
+    private var panelQuotaSection: NSView?
     private var panelManualCheckStatus: NSTextField?
-    private var panelHeroMinimum: NSLayoutConstraint?
     private var panelConnection: NSTextField?
     private var panelConnectionTime: NSTextField?
     private var panelConnectionDetail: NSTextField?
@@ -4338,6 +4340,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private var recordTableScroll: NSScrollView?
     private var recordDocument: NSView?
     private var recordDetail: NSTextField?
+    private var recordDetailScroll: NSScrollView?
+    private var recordDetailCard: NSView?
+    private var recordSplitView: NSSplitView?
+    private var recordSplitInitialized = false
     private var recordSteps: [ActivityStep] = []
     private var selectedRecordID: String?
     private var historicalRecordsExpanded = false
@@ -4362,7 +4368,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private var quotaValue: NSTextField?
     private var quotaStatus: NSTextField?
     private var quotaSynced: NSTextField?
+    private var quotaOverviewValue: NSTextField?
+    private var quotaOverviewStatus: NSTextField?
+    private var quotaOverviewSynced: NSTextField?
     private var quotaProgress: NSProgressIndicator?
+    private var quotaOverviewProgress: NSProgressIndicator?
     private var quotaRefreshButton: NSButton?
     private var quotaIntervalPicker: NSPopUpButton?
     private var quotaIntervalMenuOpen = false
@@ -5192,9 +5202,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private func renderQuota() {
         ageQuota()
         quotaValue?.stringValue = quotaDisplay()
+        quotaOverviewValue?.stringValue = quotaDisplay()
         quotaValue?.textColor = quotaIsStale(quota, now: Date(), refreshSeconds: quotaRefreshSeconds) ? .systemOrange : .labelColor
+        quotaOverviewValue?.textColor = quotaValue?.textColor
         quotaStatus?.stringValue = quotaStatusDisplay()
+        quotaOverviewStatus?.stringValue = quotaStatusDisplay()
+        let quotaNeedsAttention = quota.state == .unavailable || quotaIsStale(quota, now: Date(), refreshSeconds: quotaRefreshSeconds)
+        quotaStatus?.textColor = quotaNeedsAttention ? .systemOrange : .secondaryLabelColor
+        quotaOverviewStatus?.textColor = quotaNeedsAttention ? .systemOrange : .secondaryLabelColor
         quotaSynced?.stringValue = "上次成功同步：\(displayEvidenceTime(quota.syncedAt))"
+        quotaOverviewSynced?.stringValue = "上次成功同步：\(displayEvidenceTime(quota.syncedAt))"
         quotaButton?.title = quotaEnabled ? "登录" : "连接"
         quotaButton?.isEnabled = !previewMode && !quotaRequestInFlight && quota.state != .refreshing
         quotaRefreshButton?.title = quotaBrowser.hasOwnedLogin ? "完成登录" : "刷新"
@@ -5202,6 +5219,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         quotaPauseButton?.isEnabled = !previewMode && quotaEnabled
         if !quotaIntervalMenuOpen { quotaIntervalPicker?.selectItem(at: quotaRefreshOptions.firstIndex(of: quotaRefreshSeconds) ?? 3) }
         if let progress = quotaProgress {
+            let finite = quota.total.flatMap { total in quota.used.map { (total, $0) } }
+            progress.isHidden = finite == nil
+            if let (total, used) = finite { progress.doubleValue = total == 0 ? 0 : min(1, Double(used) / Double(total)) }
+        }
+        if let progress = quotaOverviewProgress {
             let finite = quota.total.flatMap { total in quota.used.map { (total, $0) } }
             progress.isHidden = finite == nil
             if let (total, used) = finite { progress.doubleValue = total == 0 ? 0 : min(1, Double(used) / Double(total)) }
@@ -5232,14 +5254,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let stack = vertical(6)
         [actions, intervalRow, value, progress, status, synced].forEach { stack.addArrangedSubview($0); $0.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true }
         quotaButton = connect; quotaPauseButton = pause; quotaRefreshButton = refresh; quotaIntervalPicker = interval; quotaValue = value; quotaStatus = status; quotaSynced = synced; quotaProgress = progress
-        return card(stack, padding: 16)
+        return stack
     }
-    private func quotaAndTaskSection(_ taskRows: [(String, String)]) -> NSView {
-        let quota = quotaSection(), task = section("当前任务", rows: taskRows)
-        let row = NSStackView(views: [quota, task])
-        task.heightAnchor.constraint(equalTo: quota.heightAnchor).isActive = true
-        row.orientation = .horizontal; row.alignment = .top; row.distribution = .fillEqually; row.spacing = 16
-        return row
+    private func quotaSummarySection() -> NSView {
+        let value = label(quotaDisplay(), size: 15, weight: .semibold)
+        let progress = NSProgressIndicator(); progress.isIndeterminate = false; progress.minValue = 0; progress.maxValue = 1; progress.style = .bar; progress.heightAnchor.constraint(equalToConstant: 5).isActive = true
+        let status = label(quotaStatusDisplay(), size: 12, color: .secondaryLabelColor)
+        let synced = label("上次成功同步：\(displayEvidenceTime(quota.syncedAt))", size: 12, color: .secondaryLabelColor)
+        synced.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+        let summary = vertical(4)
+        [label("账户用量", size: 12, weight: .medium, color: .secondaryLabelColor), value, progress, status, synced].forEach { summary.addArrangedSubview($0) }
+        [value, progress, status, synced].forEach { $0.widthAnchor.constraint(equalTo: summary.widthAnchor).isActive = true }
+        if let total = quota.total, let used = quota.used { progress.doubleValue = total == 0 ? 0 : min(1, Double(used) / Double(total)) }
+        else { progress.isHidden = true }
+        quotaOverviewValue = value; quotaOverviewStatus = status; quotaOverviewSynced = synced; quotaOverviewProgress = progress
+        return summary
     }
     private func clearQuota(_ state: UsageQuota.State) {
         quotaFailureReason = nil
@@ -5454,19 +5483,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         ])
         return card
     }
-    private func heroCard(_ eyebrow: String, value: NSTextField, time: NSTextField, detail: NSTextField) -> NSView {
+    private func evidenceRow(_ title: String, value: NSTextField, time: NSTextField, detail: NSTextField) -> NSView {
+        let titleField = label(title, size: 12, weight: .medium, color: .secondaryLabelColor)
+        titleField.widthAnchor.constraint(equalToConstant: 88).isActive = true
+        let summary = NSStackView(views: [titleField, value, time])
+        summary.orientation = .horizontal; summary.alignment = .centerY; summary.spacing = 8
+        summary.heightAnchor.constraint(equalToConstant: 20).isActive = true
+        time.widthAnchor.constraint(equalToConstant: 190).isActive = true
+        time.maximumNumberOfLines = 1
+        time.lineBreakMode = .byTruncatingTail
+        time.setContentHuggingPriority(.required, for: .horizontal)
+        time.setContentCompressionResistancePriority(.required, for: .horizontal)
+        value.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        value.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         let stack = vertical(2)
-        stack.addArrangedSubview(label(eyebrow, size: 12, weight: .medium, color: .secondaryLabelColor))
-        stack.addArrangedSubview(value); stack.addArrangedSubview(time)
+        stack.setHuggingPriority(.required, for: .vertical)
+        stack.addArrangedSubview(summary)
         stack.addArrangedSubview(detail)
+        summary.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        detail.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
         value.font = .systemFont(ofSize: 14, weight: .semibold)
         value.maximumNumberOfLines = 1
         time.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
         time.textColor = .secondaryLabelColor
         detail.font = .systemFont(ofSize: 12, weight: .regular)
         detail.textColor = .secondaryLabelColor
-        detail.maximumNumberOfLines = 2
-        return card(stack, padding: 12)
+        detail.maximumNumberOfLines = 1
+        detail.lineBreakMode = .byTruncatingTail
+        return stack
     }
     private func buildPanel() {
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 940, height: 720), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
@@ -5474,8 +5518,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         if previewMode && CommandLine.arguments.contains("--preview-dark") { window.appearance = NSAppearance(named: .darkAqua) }
         if previewMode && CommandLine.arguments.contains("--preview-light") { window.appearance = NSAppearance(named: .aqua) }
         window.isReleasedWhenClosed = false; window.minSize = NSSize(width: 760, height: 560); window.center()
+        window.delegate = self
         let root = PanelBackgroundView(); root.wantsLayer = true; window.contentView = root
-        let layout = vertical(16); layout.edgeInsets = NSEdgeInsets(top: 24, left: 24, bottom: 24, right: 24)
+        let layout = vertical(16); layout.distribution = .fill; layout.edgeInsets = NSEdgeInsets(top: 24, left: 24, bottom: 24, right: 24)
+        panelLayout = layout
         root.addSubview(layout); layout.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([layout.leadingAnchor.constraint(equalTo: root.leadingAnchor), layout.trailingAnchor.constraint(equalTo: root.trailingAnchor), layout.topAnchor.constraint(equalTo: root.topAnchor), layout.bottomAnchor.constraint(equalTo: root.bottomAnchor)])
 
@@ -5490,18 +5536,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         panelConnection = commandValue; panelConnectionTime = commandTime; panelConnectionDetail = commandDetail
         panelToolExecution = toolValue; panelToolExecutionTime = toolTime; panelToolExecutionDetail = toolDetail
         panelChat = chatValue; panelChatTime = chatTime; panelChatDetail = chatDetail
-        let heroes = NSStackView(); heroes.orientation = .horizontal; heroes.spacing = 10; heroes.distribution = .fillEqually
+        let heroes = vertical(8)
+        heroes.distribution = .fill
+        heroes.setHuggingPriority(.required, for: .vertical)
         panelHeroes = heroes
-        let commandCard = heroCard("消息通道", value: commandValue, time: commandTime, detail: commandDetail)
-        let toolCard = heroCard("工具执行", value: toolValue, time: toolTime, detail: toolDetail)
-        let chatCard = heroCard("ChatGPT 观察", value: chatValue, time: chatTime, detail: chatDetail)
-        [commandCard, toolCard, chatCard].forEach { heroes.addArrangedSubview($0) }
-        toolCard.heightAnchor.constraint(equalTo: commandCard.heightAnchor).isActive = true
-        chatCard.heightAnchor.constraint(equalTo: commandCard.heightAnchor).isActive = true
-        panelHeroMinimum = heroes.heightAnchor.constraint(greaterThanOrEqualToConstant: 56)
-        panelHeroMinimum?.isActive = true
+        [evidenceRow("消息通道", value: commandValue, time: commandTime, detail: commandDetail),
+         evidenceRow("工具执行", value: toolValue, time: toolTime, detail: toolDetail),
+         evidenceRow("ChatGPT 观察", value: chatValue, time: chatTime, detail: chatDetail)].forEach {
+            heroes.addArrangedSubview($0)
+            $0.widthAnchor.constraint(equalTo: heroes.widthAnchor).isActive = true
+        }
         layout.addArrangedSubview(heroes)
-        heroes.widthAnchor.constraint(equalTo: layout.widthAnchor, constant: -48).isActive = true
+        panelHeroShellWidth = heroes.widthAnchor.constraint(equalTo: layout.widthAnchor, constant: -48)
+        panelHeroShellWidth?.isActive = true
 
         let recovery = NSButton(checkboxWithTitle: "自动恢复本机 Commander", target: self, action: #selector(toggleAutoRecovery))
         recovery.toolTip = "云端主动探测关闭时自动恢复暂停；开启后自动探测累计 3 次明确断链，且日志完整并确认没有本机任务时，才重启本机 Commander。恢复后确认需等待所选探测间隔；不会重试原任务或修复云端问题。"
@@ -5522,10 +5569,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         panelWakeStatus = wakeStatus
         let wakeRow = NSStackView(views: [wake, wakeStatus]); wakeRow.orientation = .horizontal; wakeRow.alignment = .centerY; wakeRow.spacing = 12
         let manualCheckStatus = label("", size: 12, color: .secondaryLabelColor)
-        manualCheckStatus.maximumNumberOfLines = 2
+        manualCheckStatus.maximumNumberOfLines = 0
         panelManualCheckStatus = manualCheckStatus
         let manualCheckRow = NSStackView(views: [check, manualCheckStatus]); manualCheckRow.orientation = .horizontal; manualCheckRow.alignment = .centerY; manualCheckRow.spacing = 8
-        let controlContent = vertical(5)
+        let controlContent = vertical(12)
         let probeToggle = NSButton(checkboxWithTitle: "云端主动探测（可能消耗额度）", target: self, action: #selector(toggleActiveProbing))
         probeToggle.toolTip = "默认关闭，计费关系未确认。开启后按所选间隔发送一次 ping；自动、手动、命令行及恢复后检查共用持久间隔，失败也开始计时，不自动附加工具检查。关闭阻止新的云端工具请求并暂停自动恢复；已提交请求可能仍计费。本机观察、设备状态与额度同步继续。"
         probeToggle.isEnabled = !previewMode
@@ -5543,15 +5590,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let probeIntervalRow = NSStackView(views: [probeToggle, NSView(), label("探测频率", size: 12), probeInterval])
         probeIntervalRow.orientation = .horizontal; probeIntervalRow.alignment = .centerY; probeIntervalRow.spacing = 8
         panelProbeBudget = probeBudget
-        controlContent.addArrangedSubview(probeIntervalRow)
-        controlContent.addArrangedSubview(probeBudget)
-        controlContent.addArrangedSubview(recoveryRow)
-        controlContent.addArrangedSubview(wakeRow)
-        controlContent.addArrangedSubview(manualCheckRow)
-        let controlCard = card(controlContent, padding: 12)
+        func settingsGroup(_ title: String, _ content: [NSView]) -> NSView {
+            let group = vertical(5)
+            group.addArrangedSubview(label(title, size: 14, weight: .semibold))
+            content.forEach {
+                group.addArrangedSubview($0)
+                $0.widthAnchor.constraint(equalTo: group.widthAnchor).isActive = true
+            }
+            return group
+        }
+        let probeSettings = settingsGroup("连接检查", [probeIntervalRow, probeBudget, manualCheckRow])
+        let recoverySettings = settingsGroup("自动恢复", [recoveryRow])
+        let wakeSettings = settingsGroup("保持唤醒", [wakeRow])
+        [probeSettings, recoverySettings, wakeSettings].enumerated().forEach { index, group in
+            if index > 0 { let separator = NSBox(); separator.boxType = .separator; separator.heightAnchor.constraint(equalToConstant: 1).isActive = true; controlContent.addArrangedSubview(separator) }
+            controlContent.addArrangedSubview(group)
+            group.widthAnchor.constraint(equalTo: controlContent.widthAnchor).isActive = true
+        }
+        let controlCard = controlContent
         panelControlCard = controlCard
+        panelQuotaSection = quotaSection()
 
-        let nav = NSSegmentedControl(labels: ["概览", "操作记录", "故障与恢复"], trackingMode: .selectOne, target: self, action: #selector(panelPageChanged(_:)))
+        let nav = NSSegmentedControl(labels: ["概览", "操作记录", "故障与恢复", "设置"], trackingMode: .selectOne, target: self, action: #selector(panelPageChanged(_:)))
         nav.selectedSegment = panelPage; nav.segmentStyle = .rounded; nav.heightAnchor.constraint(equalToConstant: 30).isActive = true
         panelNav = nav; layout.addArrangedSubview(nav)
         let scroll = NSScrollView(); scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true; scroll.drawsBackground = false
@@ -5627,7 +5687,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         panelChat?.stringValue = chatOverviewTitle(chat)
         if panelChat?.stringValue == "回答异常" || panelChat?.stringValue == "连接异常" {
             panelChat?.textColor = .systemOrange
-        } else if panelChat?.stringValue == "连接正常" {
+        } else if panelChat?.stringValue == "后续连接已恢复" {
             panelChat?.textColor = .systemGreen
         } else {
             panelChat?.textColor = .secondaryLabelColor
@@ -5649,12 +5709,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             ?? (channelBusy || manualPingBusy ? "已有检查进行中" : nil)
             ?? (snapshot.service != "运行中" ? "Commander 服务未运行" : nil)
             ?? (channelIncident.activeCategory == nil && Date().timeIntervalSince(watchdog.startedAt) < 90 ? "启动等待中，暂不能检查" : nil)
-        panelManualCheckStatus?.stringValue = manualReason.map { "暂不可检查：\($0)" } ?? "手动 ping 会占用一次所选检查间隔"
+        let checkGuidance = manualReason.map { "暂不可检查：\($0)" } ?? "手动 ping 会占用一次所选检查间隔"
+        panelManualCheckStatus?.stringValue = [manualNotice.map(displayPingResult), checkGuidance].compactMap { $0 }.joined(separator: "\n")
         panelManualCheckStatus?.textColor = manualReason?.contains("失败") == true || manualReason?.contains("异常") == true ? .systemOrange : .secondaryLabelColor
         panelRecoveryToggle?.state = recoveryLedger.autoRecoveryEnabled ? .on : .off
         panelWakeToggle?.state = paused ? .off : .on
         let recoveryState = recoveryAvailability()
-        let recoveryBlocked = recoveryState.hasPrefix("已暂停") || recoveryState.hasPrefix("云端容量") || recoveryState.contains("暂缓")
+        let recoveryBlocked = recoveryState.hasPrefix("云端容量异常")
         let effectiveRecovery = recoveryState.hasPrefix("已开启 · ") ? String(recoveryState.dropFirst("已开启 · ".count)) : recoveryState
         panelRecoveryStatus?.stringValue = recoveryLedger.autoRecoveryEnabled ? "自动恢复：开 · \(middleTruncate(effectiveRecovery, limit: 78))" : "自动恢复：关"
         panelRecoveryStatus?.font = .systemFont(ofSize: 13, weight: .bold)
@@ -5676,7 +5737,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         stack.addArrangedSubview(label(title, size: 15, weight: .semibold))
         if let subtitle { stack.addArrangedSubview(label(subtitle, size: 12, color: .secondaryLabelColor)) }
         for (key, value) in rows { let item = row(key, value); stack.addArrangedSubview(item); item.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true }
-        return card(stack)
+        return stack
     }
     private func setSections(_ sections: [NSView]) {
         guard let scroll = panelScroll else { return }
@@ -5724,23 +5785,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         guard panelWindow != nil, !quotaIntervalMenuOpen, !probeIntervalMenuOpen else { return }
         let recordsPage = panelPage == 1
         panelHeading?.isHidden = panelPage != 0
-        panelHeroes?.isHidden = false
+        if panelPage == 0 {
+            panelHeroShellWidth?.isActive = false
+            panelHeroes?.isHidden = true
+        } else if let panelHeroes {
+            if panelHeroes.superview !== panelLayout {
+                NSLayoutConstraint.deactivate(panelSectionWidths); panelSectionWidths = []
+                if let panelLayout, let panelNav, let index = panelLayout.arrangedSubviews.firstIndex(of: panelNav) {
+                    panelLayout.insertArrangedSubview(panelHeroes, at: index)
+                } else {
+                    panelLayout?.addArrangedSubview(panelHeroes)
+                }
+            }
+            panelHeroShellWidth?.isActive = true
+            panelHeroes.isHidden = false
+        }
         panelControlCard?.isHidden = true
         panelConnectionDetail?.isHidden = panelPage != 0
         panelToolExecutionDetail?.isHidden = panelPage != 0
         panelChatDetail?.isHidden = panelPage != 0
-        panelHeroMinimum?.constant = 56
         panelScroll?.hasVerticalScroller = !recordsPage
         if recordsPage { renderLogPage(); return }
 
         if panelPage == 0 {
-            panelControlCard?.isHidden = false
             let activity = snapshot.activity
             let diagnosis = currentDiagnosis()
             var activityRows: [(String, String)] = []
             if let active = currentCallStep(activity) {
                 activityRows.append(("状态", activityOverviewText(activity)))
-                activityRows.append(("操作", active.detail))
+                activityRows.append(("当前工具", CommanderActivity.safeToolIdentifier(active.tool)))
                 activityRows.append(("已运行", durationText(active.elapsed(at: ProcessInfo.processInfo.systemUptime))))
             } else {
                 activityRows.append(("状态", activityOverviewText(activity)))
@@ -5752,14 +5825,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             } else if activity.catchingUp || activity.pendingLine {
                 activityRows.append(("注意", "本机操作日志仍在追赶；Guard 暂不判断为空闲"))
             }
-            var statusRows = [("当前结论", diagnosis.title), ("下一步", diagnosis.nextAction)]
-            if let notice = manualNotice { statusRows.append(("操作提示", displayPingResult(notice))) }
-            else if manualPingBusy || channelBusy { statusRows.append(("链路检查", "正在检查消息通道…")) }
-            setSections([
-                section("当前状态", rows: statusRows),
-                panelControlCard!,
-                quotaAndTaskSection(activityRows)
-            ])
+            activityRows.append(("自动恢复", recoveryAvailability()))
+            let conclusion = vertical(8)
+            conclusion.addArrangedSubview(label(diagnosis.title, size: 18, weight: .semibold))
+            conclusion.addArrangedSubview(label(diagnosis.nextAction, color: .secondaryLabelColor))
+            if let notice = manualNotice { conclusion.addArrangedSubview(label(displayPingResult(notice))) }
+            else if manualPingBusy || channelBusy { conclusion.addArrangedSubview(label("正在检查消息通道…")) }
+            for view in conclusion.arrangedSubviews { view.widthAnchor.constraint(equalTo: conclusion.widthAnchor).isActive = true }
+            panelHeroes?.isHidden = false
+            setSections([conclusion, panelHeroes!, section("当前任务", rows: activityRows), quotaSummarySection()])
+            return
+        }
+
+        if panelPage == 3 {
+            panelControlCard?.isHidden = false
+            setSections([panelControlCard!, panelQuotaSection!])
             return
         }
 
@@ -5835,10 +5915,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         if datedSections.isEmpty {
             datedSections.append((.distantPast, section("故障记录", rows: [("状态", "近期未记录到故障")])) )
         }
-        setSections([manualCard] + datedSections.sorted { $0.0 > $1.0 }.map(\.1))
+        let diagnosis = currentDiagnosis()
+        let diagnosisSection = section("诊断与建议", rows: [("当前情况", diagnosis.title), ("建议操作", diagnosis.nextAction), ("依据", diagnosis.evidence)])
+        setSections([diagnosisSection] + datedSections.sorted { $0.0 > $1.0 }.map(\.1) + [manualCard])
     }
     private func renderLogPage() {
         guard let scroll = panelScroll else { return }
+        panelWindow?.contentView?.layoutSubtreeIfNeeded()
+        scroll.layoutSubtreeIfNeeded()
         let doc: NSView
         if let document = recordDocument {
             doc = document
@@ -5878,12 +5962,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             controls.spacing = 10
             controls.translatesAutoresizingMaskIntoConstraints = false
             [search, filter, historicalToggle].forEach { $0.heightAnchor.constraint(equalToConstant: 28).isActive = true }
+            controls.heightAnchor.constraint(equalToConstant: 28).isActive = true
 
             let detail = label("选择一条记录查看详情", size: 13)
             detail.isSelectable = true
             recordDetail = detail
-            let detailCard = card(detail, padding: 16)
-            detailCard.translatesAutoresizingMaskIntoConstraints = false
+            let detailCard = TopAlignedPanelDocumentView()
+            detailCard.autoresizingMask = [.width]
+            detailCard.addSubview(detail); detail.translatesAutoresizingMaskIntoConstraints = false
+            NSLayoutConstraint.activate([
+                detail.leadingAnchor.constraint(equalTo: detailCard.leadingAnchor, constant: 12),
+                detail.trailingAnchor.constraint(equalTo: detailCard.trailingAnchor, constant: -12),
+                detail.topAnchor.constraint(equalTo: detailCard.topAnchor, constant: 12)
+            ])
+            recordDetailCard = detailCard
+
+            let detailScroll = NSScrollView()
+            detailScroll.hasVerticalScroller = true
+            detailScroll.hasHorizontalScroller = false
+            detailScroll.autohidesScrollers = true
+            detailScroll.drawsBackground = false
+            detailScroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 100).isActive = true
+            detailScroll.documentView = detailCard
+            recordDetailScroll = detailScroll
 
             let table = NSTableView()
             table.rowHeight = 36
@@ -5905,12 +6006,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             tableScroll.hasVerticalScroller = true
             tableScroll.hasHorizontalScroller = true
             tableScroll.autohidesScrollers = true
+            tableScroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 100).isActive = true
             tableScroll.documentView = table
             tableScroll.translatesAutoresizingMaskIntoConstraints = false
             recordTable = table
             recordTableScroll = tableScroll
 
-            [title, hint, controls, detailCard, tableScroll].forEach { root.addSubview($0) }
+            let split = NSSplitView()
+            split.isVertical = false
+            split.dividerStyle = .thin
+            split.delegate = self
+            split.addSubview(tableScroll)
+            split.addSubview(detailScroll)
+            split.translatesAutoresizingMaskIntoConstraints = false
+            recordSplitView = split
+
+            [title, hint, controls, split].forEach { root.addSubview($0) }
             NSLayoutConstraint.activate([
                 title.topAnchor.constraint(equalTo: root.topAnchor),
                 title.leadingAnchor.constraint(equalTo: root.leadingAnchor),
@@ -5924,14 +6035,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                 controls.leadingAnchor.constraint(equalTo: root.leadingAnchor),
                 controls.trailingAnchor.constraint(equalTo: root.trailingAnchor),
 
-                detailCard.topAnchor.constraint(equalTo: controls.bottomAnchor, constant: 12),
-                detailCard.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-                detailCard.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-
-                tableScroll.topAnchor.constraint(equalTo: detailCard.bottomAnchor, constant: 12),
-                tableScroll.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-                tableScroll.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-                tableScroll.bottomAnchor.constraint(equalTo: root.bottomAnchor)
+                split.topAnchor.constraint(equalTo: controls.bottomAnchor, constant: 12),
+                split.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+                split.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+                split.bottomAnchor.constraint(equalTo: root.bottomAnchor)
             ])
         }
 
@@ -5939,6 +6046,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         doc.frame = scroll.contentView.bounds
         let oldOrigin = scroll.contentView.bounds.origin
         let oldTableOrigin = recordTableScroll?.contentView.bounds.origin ?? .zero
+        let oldDetailOrigin = recordDetailScroll?.contentView.bounds.origin ?? .zero
         let query = recordSearch?.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
         let mode = recordFilter?.indexOfSelectedItem ?? 0
 
@@ -5974,6 +6082,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                 column.width = [CGFloat(104), CGFloat(240) + extra, CGFloat(82), CGFloat(92), CGFloat(144)][index]
             }
             table.setFrameSize(NSSize(width: width, height: max(tableScroll.contentView.bounds.height, CGFloat(recordSteps.count) * table.rowHeight)))
+        }
+        if let split = recordSplitView, let detailScroll = recordDetailScroll {
+            split.layoutSubtreeIfNeeded()
+            split.adjustSubviews()
+            if !recordSplitInitialized && split.bounds.height > 240 {
+                recordSplitInitialized = true
+                split.setPosition(split.bounds.height - 140, ofDividerAt: 0)
+            }
+            layoutRecordDetail()
+            let detailCard = detailScroll.documentView!
+            let maxDetailY = max(0, detailCard.frame.height - detailScroll.contentView.bounds.height)
+            detailScroll.contentView.scroll(to: NSPoint(x: 0, y: min(max(0, oldDetailOrigin.y), maxDetailY)))
+            detailScroll.reflectScrolledClipView(detailScroll.contentView)
         }
 
         scroll.contentView.scroll(to: oldOrigin)
@@ -6046,7 +6167,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         guard let table = recordTable, table.selectedRow >= 0, recordSteps.indices.contains(table.selectedRow) else { return }
         selectedRecordID = recordSteps[table.selectedRow].id; updateRecordDetail()
     }
+    private func layoutRecordDetail() {
+        guard let scroll = recordDetailScroll, let document = recordDetailCard, let detail = recordDetail else { return }
+        scroll.layoutSubtreeIfNeeded()
+        document.setFrameSize(NSSize(width: scroll.contentView.bounds.width, height: document.frame.height))
+        document.layoutSubtreeIfNeeded()
+        let textHeight = detail.cell?.cellSize(forBounds: NSRect(x: 0, y: 0, width: max(1, document.frame.width - 24), height: .greatestFiniteMagnitude)).height ?? 0
+        document.setFrameSize(NSSize(width: document.frame.width, height: max(scroll.contentView.bounds.height, ceil(textHeight) + 24)))
+        scroll.reflectScrolledClipView(scroll.contentView)
+    }
+    func splitViewDidResizeSubviews(_ notification: Notification) {
+        layoutRecordDetail()
+    }
+    func windowDidResize(_ notification: Notification) {
+        guard notification.object as? NSWindow === panelWindow, panelPage == 1 else { return }
+        renderLogPage()
+    }
     private func updateRecordDetail() {
+        defer { layoutRecordDetail() }
         guard let step = recordSteps.first(where: { $0.id == selectedRecordID }) else {
             let query = recordSearch?.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             let hasFoldedHistory = snapshot.activity.steps.contains(where: \.historical) && !historicalRecordsExpanded && query.isEmpty && (recordFilter?.indexOfSelectedItem ?? 0) != 3
@@ -6137,28 +6275,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         render()
         recoveryLedger.autoRecoveryEnabled = true
         renderPanel()
-        verify(panelRecoveryStatus?.stringValue.contains("开 · 已暂停") == true && panelRecoveryStatus?.textColor == .systemOrange, "Enabled but blocked auto recovery must show its effective state and reason")
+        verify(panelRecoveryStatus?.stringValue.contains("开 · 已暂停") == true && panelRecoveryStatus?.textColor == .secondaryLabelColor, "Ordinary protective recovery deferral must use a neutral status color")
         recoveryLedger = savedRecoveryLedger
         renderPanel()
         verify(middleTruncate("云端实时服务连接池异常", limit: 12).count <= 12, "small-limit middle truncation overflowed")
         verify(middleTruncate("abcdef", limit: 1) == "…", "single-character truncation must stay bounded")
         verify(item.button?.image != nil && item.button?.title.contains("…") == false, "menu bar keeps its icon and avoids clipped-word ellipses")
+        verify(panelNav?.segmentCount == 4 && panelNav?.label(forSegment: 3) == "设置", "The panel must have a separate fourth Settings tab")
+        verify(panelHeroes?.orientation == .vertical && panelHeroes?.distribution != .fillEqually, "Evidence states must stack instead of using equal-width cards")
         for size in [NSSize(width: 940, height: 720), NSSize(width: 760, height: 560)] {
-            window.setContentSize(size)
-            for page in 0...2 {
+            if size.width == 760 {
+                window.setFrame(NSRect(origin: window.frame.origin, size: window.minSize), display: false)
+                verify(window.frame.size == window.minSize, "Minimum-window checks must use the actual outer frame size")
+            } else {
+                window.setContentSize(size)
+            }
+            for page in 0...3 {
                 panelPage = page; renderPanel()
                 root.layoutSubtreeIfNeeded()
-                verify(window.isVisible && scroll.frame.width > 650 && scroll.frame.height > 80, "panel content is clipped at \(Int(size.width))x\(Int(size.height)), page \(page)")
+                verify(window.isVisible && scroll.frame.width > 650 && scroll.frame.height > 80, "panel content is clipped at \(Int(window.contentView?.bounds.width ?? 0))x\(Int(window.contentView?.bounds.height ?? 0)), page \(page)")
                 if let heroes = panelHeroes {
                     let frame = heroes.convert(heroes.bounds, to: root)
                     verify(frame.minX >= 23 && frame.maxX <= root.bounds.width - 23, "Status strip must honor the 24px outer inset at \(Int(size.width))px")
+                    for value in [panelConnection, panelToolExecution, panelChat].compactMap({ $0 }) {
+                        let textWidth = (value.stringValue as NSString).size(withAttributes: [.font: value.font!]).width
+                        verify(value.frame.width + 2 >= ceil(textWidth) && value.frame.height >= 16, "Each evidence headline must be readable on page \(page): \(value.stringValue), frame \(value.frame)")
+                    }
+                    if page != 0 { verify(frame.height <= 100, "Shared status must leave space for page content (height \(frame.height))") }
                 }
                 if let scroll = panelScroll {
                     let frame = scroll.convert(scroll.bounds, to: root)
                     verify(frame.minX >= 23 && frame.maxX <= root.bounds.width - 23, "Page content must honor the 24px outer inset at \(Int(size.width))px")
                 }
                 verify(scroll.documentView != nil, "panel page \(page) is empty")
-                verify(panelHeroes?.isHidden == false && panelNav?.isHidden == false, "Status strip and navigation must stay visible on page \(page)")
+                verify(panelNav?.isHidden == false && (page == 0 ? panelHeroes?.isHidden == false : panelHeroes?.superview === panelLayout && panelHeroes?.isHidden == false), "Evidence and navigation must stay visible on page \(page)")
+                if page == 1, let split = recordSplitView, let tableScroll = recordTableScroll, let detailScroll = recordDetailScroll {
+                    verify(scroll.frame.minY >= 23 && scroll.frame.minY <= 25 && tableScroll.frame.height > 50 && detailScroll.frame.height > 50,
+                           "Records must use the available height while keeping both panes visible at \(Int(window.frame.width))px (scroll \(scroll.frame), split \(split.frame), table \(tableScroll.frame), detail \(detailScroll.frame))")
+                }
+                if page == 0, let overviewRoot = scroll.documentView as? TopAlignedPanelDocumentView,
+                   let overviewStack = overviewRoot.subviews.first as? NSStackView {
+                    let viewport = scroll.contentView.bounds
+                    if size.width == 940 {
+                        verify(overviewRoot.frame.height <= viewport.height + 2, "Default Overview must fit without scrolling (document \(Int(overviewRoot.frame.height)), viewport \(Int(viewport.height)))")
+                    } else if let conclusion = overviewStack.arrangedSubviews.first {
+                        let frame = conclusion.convert(conclusion.bounds, to: scroll.contentView)
+                        verify(frame.minY >= -2 && frame.maxY <= viewport.height + 2, "The conclusion and next action must remain visible at minimum window size")
+                    } else { verify(false, "Overview must put its conclusion first") }
+                }
                 if size.width == 940 && page == 1, let table = recordTable, let tableScroll = recordTableScroll {
                     let columnsWidth = table.tableColumns.reduce(0) { $0 + $1.width }
                     let effectiveWidth = columnsWidth + table.intercellSpacing.width * CGFloat(max(0, table.tableColumns.count - 1))
@@ -6167,6 +6331,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                     guard let sessionRow = recordSteps.firstIndex(where: { $0.sessionKey != nil }), let sessionColumn = table.tableColumns.first(where: { $0.identifier.rawValue == "session" }) else { preconditionFailure("Verified session row or column is missing at 940px") }
                     let badge = tableView(table, viewFor: sessionColumn, row: sessionRow)
                     verify((badge?.subviews.first?.subviews.first as? NSTextField)?.stringValue.contains("会话") == true, "940px session column must contain its verified-session badge")
+                    if let split = recordSplitView, let detailScroll = recordDetailScroll {
+                        let tableFrame = tableScroll.convert(tableScroll.bounds, to: split)
+                        let detailFrame = detailScroll.convert(detailScroll.bounds, to: split)
+                        let tableAboveDetail = split.isFlipped ? tableFrame.minY < detailFrame.minY : tableFrame.maxY > detailFrame.maxY
+                        verify(!split.isVertical && tableAboveDetail && tableFrame.height > 50 && detailFrame.height > 50 && detailScroll.hasVerticalScroller, "Records split geometry is wrong (vertical=\(split.isVertical), flipped=\(split.isFlipped), table=\(tableFrame), detail=\(detailFrame), detail scroll=\(detailScroll.hasVerticalScroller))")
+                        verify(tableFrame.height >= 180, "Default records list must show several rows (split \(split.frame), table \(tableFrame), document \(recordDocument!.frame), viewport \(scroll.contentView.bounds))")
+                        let savedDetail = recordDetail!.stringValue
+                        recordDetail?.stringValue = Array(repeating: "固定脱敏的长操作详情，用于验证独立滚动与换行。", count: 80).joined(separator: "\n")
+                        layoutRecordDetail()
+                        verify(recordDetailCard!.frame.height > detailScroll.contentView.bounds.height && abs(recordDetailCard!.frame.width - detailScroll.contentView.bounds.width) <= 1, "Long detail must fill its pane width and scroll independently")
+                        recordDetail?.stringValue = savedDetail; layoutRecordDetail()
+                        split.setPosition(split.bounds.height * 0.6, ofDividerAt: 0)
+                        let chosenTableHeight = tableScroll.frame.height
+                        renderLogPage(); root.layoutSubtreeIfNeeded()
+                        verify(abs(tableScroll.frame.height - chosenTableHeight) <= 2, "Refreshing records must preserve the chosen divider position")
+                    } else { verify(false, "Records page must use a native split view") }
                 }
             }
         }
@@ -6174,24 +6354,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         panelPage = 0; renderPanel(); root.layoutSubtreeIfNeeded(); scroll.layoutSubtreeIfNeeded()
         scroll.contentView.scroll(to: .zero); scroll.reflectScrolledClipView(scroll.contentView)
         let savedQuota = quota
-        quota = UsageQuota(state: .unlimited, used: 9893, total: nil, plan: "pro", month: "2026-10", syncedAt: Date())
+        quota = UsageQuota(state: .unlimited, used: 9893, total: nil, plan: "pro", month: "2026-10", syncedAt: Date()); renderQuota()
         verify(quotaDisplay() == "Pro 无限制" && quotaStatusDisplay().contains("累计调用：9893 次"), "Pro unlimited label must keep cumulative usage secondary")
         for state in [UsageQuota.State.refreshing, .unavailable, .stale] {
             quota.state = state
             verify(quotaDisplay() == "Pro 无限制" && quotaStatusDisplay().contains("累计调用：9893 次"), "Pro unlimited label and count must survive \(state.rawValue) status")
         }
-        quota = savedQuota
+        quota = savedQuota; renderQuota()
         verify(panelConnection?.stringValue == "上次探测成功", "Channel headline must stay concise while time and freshness remain separate")
-        verify(panelChat?.stringValue == "连接正常" && panelChatDetail?.isHidden == false && panelChatDetail?.stringValue.hasPrefix("原回答是否完整：无法确认") == true, "ChatGPT connection health must not imply answer completeness")
-        verify(panelSectionCount == 3, "Overview must show conclusion, guard controls, and a compact quota/task row")
-        verify(panelControlCard?.layer?.backgroundColor != nil, "Cards must paint their distinct background on initial attachment")
-        verify(panelControlCard?.isHidden == false && panelRecoveryToggle?.title == "自动恢复本机 Commander" && panelRecoveryToggle?.toolTip?.contains("不会重试原任务") == true, "Recovery control must explain its local-only action and safeguards")
+        verify(panelChat?.stringValue == "后续连接已恢复" && panelChatDetail?.isHidden == false && panelChatDetail?.stringValue.hasPrefix("原回答是否完整：无法确认") == true, "Reconnected status must stay distinct from original-answer completeness")
+        verify(panelSectionCount == 4 && panelControlCard?.isHidden == true, "Overview must order conclusion, evidence, activity, then account summary")
+        verify(panelRecoveryToggle?.title == "自动恢复本机 Commander" && panelRecoveryToggle?.toolTip?.contains("不会重试原任务") == true, "Recovery control must explain its local-only action and safeguards")
         panelPage = 2; renderPanel()
         verify(panelManualRestart?.title == "人工授权重启本机服务…" && panelManualRestart?.isEnabled == false, "Fault page must show inert manual restart action in preview")
+        if let faultRoot = scroll.documentView as? TopAlignedPanelDocumentView,
+           let faultStack = faultRoot.subviews.first as? NSStackView {
+            func contains(_ target: NSView, in view: NSView) -> Bool { view === target || view.subviews.contains { contains(target, in: $0) } }
+            let manualIndex = faultStack.arrangedSubviews.firstIndex { contains(panelManualRestart!, in: $0) }
+            verify(manualIndex == faultStack.arrangedSubviews.count - 1 && faultStack.arrangedSubviews.count >= 3, "Manual recovery must follow diagnosis and incident history")
+        } else { verify(false, "Fault page must keep diagnosis and history in a readable stack") }
         panelPage = 0; renderPanel()
         verify(panelProbeToggle?.title == "云端主动探测（可能消耗额度）" && panelProbeToggle?.state == .off && panelProbeBudget?.stringValue == activeProbeStatus.display && panelProbeIntervalPicker?.indexOfSelectedItem == ActiveProbeBudget.defaultIntervalIndex && panelProbeIntervalPicker?.numberOfItems == ActiveProbeBudget.intervalOptions.count && panelManualCheck?.isEnabled == false, "Probe switch must default OFF and show the selected cadence")
         verify(panelWakeToggle?.title == "防止闲置睡眠（Guard）" && panelWakeToggle?.toolTip?.contains("其他程序仍可能保持唤醒") == true && panelWakeStatus?.stringValue.contains("保持唤醒：") == true, "Wake control must describe its actual assertion and limits")
-        verify(quotaProgress?.isHidden == false && quotaSynced?.isHidden == false && quotaSynced?.stringValue.range(of: #"\d{2}:\d{2}:\d{2}"#, options: .regularExpression) != nil && quotaSynced?.font?.pointSize == 12 && quotaSynced?.textColor == .secondaryLabelColor, "Quota sync time must remain visible as secondary evidence")
+        verify(quotaOverviewProgress?.isHidden == false && quotaOverviewSynced?.isHidden == false && quotaOverviewSynced?.stringValue.range(of: #"\d{2}:\d{2}:\d{2}"#, options: .regularExpression) != nil && quotaOverviewSynced?.font?.pointSize == 12 && quotaOverviewSynced?.textColor == .secondaryLabelColor, "Overview quota sync time must remain visible as secondary evidence")
         verify(panelHeroes?.isHidden == false && panelConnectionTime?.stringValue.range(of: #"\d{2}:\d{2}:\d{2}"#, options: .regularExpression) != nil && (panelConnectionTime?.font?.pointSize ?? 0) == 12, "Persistent status strip must show a compact evidence time")
         verify(panelManualCheckStatus?.stringValue.contains("暂不可检查") == true, "Disabled manual ping must explain the blocking reason without a tooltip")
         if let menu = quotaIntervalPicker?.menu {
@@ -6208,19 +6393,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             menuDidClose(menu)
             verify(!probeIntervalMenuOpen, "Closing the probe frequency menu must resume updates")
         }
-        verify(quotaIntervalPicker?.numberOfItems == quotaRefreshOptions.count && quotaIntervalPicker?.indexOfSelectedItem == (quotaRefreshOptions.firstIndex(of: quotaRefreshSeconds) ?? 3), "Quota card must show the configured background sync interval")
+        panelPage = 3; renderPanel(); root.layoutSubtreeIfNeeded()
+        verify(panelControlCard?.isHidden == false && panelProbeToggle?.superview != nil && panelRecoveryToggle?.superview != nil && panelWakeToggle?.superview != nil && quotaIntervalPicker?.numberOfItems == quotaRefreshOptions.count && quotaIntervalPicker?.indexOfSelectedItem == (quotaRefreshOptions.firstIndex(of: quotaRefreshSeconds) ?? 3), "Settings must contain probe, recovery, wake, and account controls")
+        verify(quotaProgress?.isHidden == false && quotaSynced?.isHidden == false, "Account settings must retain the account usage and sync evidence")
+        panelPage = 0; renderPanel(); root.layoutSubtreeIfNeeded(); scroll.layoutSubtreeIfNeeded()
         if let overviewRoot = scroll.documentView as? TopAlignedPanelDocumentView,
            let overviewStack = overviewRoot.subviews.first as? NSStackView {
             verify(overviewStack.frame.minY <= 2, "Overview content must start at the top without a blank band")
-            if overviewStack.arrangedSubviews.count == 3 {
-                let quotaAndTask = overviewStack.arrangedSubviews[2]
-                let viewport = scroll.contentView.bounds
-                let rowFrame = quotaAndTask.convert(quotaAndTask.bounds, to: scroll.contentView)
-                verify(overviewRoot.frame.height <= viewport.height + 2, "Entire overview must fit the default 940x720 viewport without vertical scrolling (document \(Int(overviewRoot.frame.height)), viewport \(Int(viewport.height)))")
-                verify(rowFrame.minY >= -2 && rowFrame.maxY <= viewport.height + 2, "Quota and current task must fit inside the visible default overview")
-            } else {
-                verify(false, "Overview must keep quota and current task together in the third row")
-            }
+            verify(overviewStack.arrangedSubviews.count == 4, "Overview must contain conclusion, evidence, activity, and account summary in order")
         } else {
             verify(false, "Overview document must use the top-aligned container")
         }
@@ -6233,10 +6413,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             pendingViews.append(contentsOf: view.subviews)
         }
         verify(noticeVisible, "Manual check deferral and setting errors must be visible on Overview")
+        panelPage = 3; renderPanel()
+        verify(panelManualCheckStatus?.stringValue.contains(manualNotice!) == true, "Settings must display the result or deferral of the check initiated there")
         manualNotice = savedNotice
 
         panelPage = 2; renderPanel(); root.layoutSubtreeIfNeeded(); scroll.layoutSubtreeIfNeeded()
-        verify(panelSectionCount <= 3, "Connection status must not become a feature inventory")
+        verify(panelSectionCount <= 5, "Connection status must not become a feature inventory")
         if let connectionRoot = scroll.documentView as? TopAlignedPanelDocumentView,
            let connectionStack = connectionRoot.subviews.first as? NSStackView {
             verify(connectionStack.frame.minY <= 2, "Connection content must start at the top without a blank band")

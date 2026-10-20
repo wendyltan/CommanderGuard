@@ -60,7 +60,7 @@ Open `build/CommanderGuard.app` in Finder after the build completes. Click its m
 
 ### 3. Decide whether to enable active probes
 
-By default, Guard observes local logs, real calls and device registration without sending MCP tool probes. To test device responsiveness, enable active probes and click “手动 ping（1次）” (one manual ping). The button sends one request. A device ping does not prove local tool execution works.
+By default, Guard observes local logs, real calls and device registration without sending MCP tool probes. To test device responsiveness, open Settings, enable active probes and click “手动 ping（1次）” (one manual ping). The button sends one request. A device ping does not prove local tool execution works.
 
 Choose **5, 10, 15, or 30 minutes, or 1, 2, 3, or 6 hours** under “探测频率” (probe interval). The default is 1 hour. Use 15 minutes for regular active checks, 1 hour for light ongoing observation, and 5 minutes for temporary diagnosis. Automatic, manual, command-line and post-recovery probes all wait the selected interval since the last submitted request. Failed and timed-out requests also start that wait; they do not trigger rapid retries. Relaunches, toggles and interval changes retain the last request time. Changing the interval does not itself submit a request.
 
@@ -82,13 +82,14 @@ The script builds the app, installs it to `~/Applications/CommanderGuard.app`, c
 
 ## Everyday use
 
-The panel has three pages, a resizable window, and support for system light and dark appearance. A compact status strip and navigation remain visible across pages. Overview groups the current conclusion, guard controls, usage and local activity; important times include both the clock time and the age of the evidence.
+The panel has four pages, a resizable window, and support for system light and dark appearance. Overview puts the conclusion and next step first, followed by separate evidence, local activity and a compact usage summary. Persistent controls and account management live in Settings. Important times include both the clock time and the age of the evidence.
 
 | Page | What to look for |
 |---|---|
-| 概览 (Overview) | The status needing attention, local task activity, usage, main toggles, probe interval, next allowed time, and the one-ping button |
-| 操作记录 (Activity) | Columns show time, action, result, duration and session. `ping` is hidden by default; older records with unknown times can be expanded separately. Search and filters retain access to records, and selection shows sanitized details. Reliable session identifiers use stable accent colors |
-| 故障与恢复 (Incidents and recovery) | A compact status strip, followed by chronological incidents, probes and recovery evidence, without repeating the guard controls |
+| 概览 (Overview) | The conclusion and next step; separate channel, tool and ChatGPT evidence with times; local activity, recovery deferral reason and a usage summary |
+| 操作记录 (Activity) | Columns show time, action, result, duration and session. `ping` is hidden by default; older records with unknown times can be expanded separately. Search and filters retain access to records. Selection shows sanitized details in an independently scrollable, adjustable region below the table. Reliable session identifiers use stable accent colors |
+| 故障与恢复 (Incidents and recovery) | Diagnosis and guidance first, then incident and recovery evidence; local recovery follows the explanation and retains impact checks and per-attempt confirmation |
+| 设置 (Settings) | Probe permission, interval and manual ping; automatic recovery permission and effective state; keep-awake controls; account sign-in, refresh, pause and sync interval |
 
 The menu bar keeps updating a short status. The channel shows the last actual probe result and its time. “上次探测成功” (last probe succeeded) records past evidence; it does not guarantee a live connection now. The internal marker `●` means the message channel recently responded, `!` means the service is not running or the channel explicitly failed, and `?` means the result is unconfirmed, stale, or lacks evidence. Waiting for the next check is not a new failure.
 
@@ -98,7 +99,7 @@ A toggle records your permission; its adjacent status explains whether Guard can
 
 This shows Desktop Commander cloud tool calls usage, separate from your ChatGPT subscription limits. It is optional and requires Google Chrome to be installed. Used and included totals come from the official account response. The progress bar shows the used share of the included total, so 100% means the period's included calls are used, not a fixed count of 100. UI previews use sample data.
 
-1. Click “连接” (connect) in the Overview usage card. If the account is already connected but needs sign-in, the button says “登录” (sign in). Sign in on the official site in Guard's dedicated browser window; Google sign-in is supported.
+1. Click “连接” (connect) in the Settings account usage section. If the account is already connected but needs sign-in, the button says “登录” (sign in). Sign in on the official site in Guard's dedicated browser window; Google sign-in is supported.
 2. While Guard's login window is open, the card button says “完成登录” (finish sign-in). Click it after signing in; Guard closes the login process it started and reads usage. You may also close the dedicated window and click “刷新” (refresh). At other times, this button reads usage. Guard does not edit everyday Chrome tabs or terminate its process. Guard will not force-close an unowned browser holding the dedicated profile.
 3. Under “自动同步” (automatic sync), choose “手动” (manual) or 1, 2, 5, 10, 30, or 60 minutes. The default is five minutes. The choice survives Guard relaunches; changing it does not immediately send a request. Click “暂停” (pause) to stop future syncs and cancel an active usage read.
 
