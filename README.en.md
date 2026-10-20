@@ -82,14 +82,14 @@ The script builds the app, installs it to `~/Applications/CommanderGuard.app`, c
 
 ## Everyday use
 
-The compact menu bar overview shows the three status layers, local activity and account summary, with entries for the full panel and “恢复与重启…” (Recovery and restart). The resizable full panel uses sidebar navigation for Overview, Activity records, Incidents and recovery, and Settings, supporting system light and dark appearance. Overview puts the conclusion and next step first, followed by separate evidence, local activity and a compact usage summary; other pages show relevant content only. Persistent controls and account management live in Settings. Important times include both the clock time and the age of the evidence.
+The compact menu bar overview shows the three status layers, local activity and account summary, with entries for the full panel and “恢复与重启…” (Recovery and restart). The resizable full panel uses sidebar navigation for Overview, Activity records, Incidents and recovery, and Settings, supporting system light and dark appearance. Overview uses a concise summary and three verification rows, with results and check times stacked on the right. Local activity and usage stay compact. Expand “查看证据与限制” (Evidence and limits) for the full diagnosis and evidence; other pages show relevant content only. Persistent controls and account management live in Settings. Important times include both the clock time and the age of the evidence.
 
 | Page | What to look for |
 |---|---|
 | 概览 (Overview) | The conclusion and next step; separate channel, tool and ChatGPT evidence with times; local activity, recovery deferral reason and a usage summary |
-| 操作记录 (Activity) | Columns show time, action, result, duration and session. `ping` is hidden by default; older records with unknown times can be expanded separately. Search and filters retain access to records. Selection shows sanitized details in an independently scrollable, adjustable region below the table. Reliable session identifiers use stable accent colors |
+| 操作记录 (Activity) | The table shows time, action and result; duration and anonymous session attribution appear in the selected detail, retaining stable session colors. `ping` is hidden by default; older records with unknown times can be expanded separately. Search, filters and the independently scrollable, adjustable detail region remain available |
 | 故障与恢复 (Incidents and recovery) | Diagnosis and guidance first, then incident and recovery evidence; local recovery follows the explanation and retains impact checks and per-attempt confirmation |
-| 设置 (Settings) | Probe permission, interval and manual ping; automatic recovery permission and effective state; keep-awake controls; account sign-in, refresh, pause and sync interval |
+| 设置 (Settings) | Grouped switches show probe permission, automatic recovery permission and effective state, and keep-awake status. “更多选项” (More options) provides interval, manual ping and account sign-in/refresh/pause controls; account and sync status form their own group |
 
 The menu bar keeps updating a short status. The channel shows the last actual probe result and its time. “上次探测成功” (last probe succeeded) records past evidence; it does not guarantee a live connection now. The internal marker `●` means the message channel recently responded, `!` means the service is not running or the channel explicitly failed, and `?` means the result is unconfirmed, stale, or lacks evidence. Waiting for the next check is not a new failure.
 

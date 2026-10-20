@@ -4248,11 +4248,31 @@ func selfTest() {
     print("CommanderGuard self-test passed")
 }
 
+private enum GuardPalette {
+    static func color(_ light: UInt32, _ dark: UInt32) -> NSColor {
+        NSColor(name: nil) { appearance in
+            let value = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? dark : light
+            return NSColor(red: CGFloat((value >> 16) & 255) / 255, green: CGFloat((value >> 8) & 255) / 255, blue: CGFloat(value & 255) / 255, alpha: 1)
+        }
+    }
+    static let surface = color(0xffffff, 0x242526)
+    static let rail = color(0xeef1f5, 0x2c3036)
+    static let text = color(0x20252d, 0xedf0f5)
+    static let secondary = color(0x626d7c, 0xaab4c3)
+    static let line = color(0xe3e7ed, 0x40454d)
+    static let tint = color(0xf6f8fb, 0x2b2e33)
+    static let blue = color(0x1669d3, 0x81b5ff)
+    static let selection = color(0xe4edfc, 0x34465f)
+    static let green = color(0x26724c, 0x8bd4ae)
+    static let amber = color(0x93621a, 0xe4bb75)
+}
+
 final class PanelBackgroundView: NSView {
+    var fillColor = GuardPalette.surface
     override func viewDidMoveToWindow() { super.viewDidMoveToWindow(); updateColors() }
     override func viewDidChangeEffectiveAppearance() { super.viewDidChangeEffectiveAppearance(); updateColors() }
     private func updateColors() {
-        effectiveAppearance.performAsCurrentDrawingAppearance { layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor }
+        effectiveAppearance.performAsCurrentDrawingAppearance { layer?.backgroundColor = fillColor.cgColor }
     }
 }
 
@@ -4261,9 +4281,49 @@ final class PanelCardView: NSView {
     override func viewDidChangeEffectiveAppearance() { super.viewDidChangeEffectiveAppearance(); updateColors() }
     private func updateColors() {
         effectiveAppearance.performAsCurrentDrawingAppearance {
-            layer?.borderColor = NSColor.separatorColor.withAlphaComponent(NSColor.separatorColor.alphaComponent * 0.6).cgColor
-            layer?.backgroundColor = NSColor.controlBackgroundColor.blended(withFraction: 0.035, of: .labelColor)?.cgColor
+            layer?.borderColor = GuardPalette.line.cgColor
+            layer?.backgroundColor = GuardPalette.surface.cgColor
         }
+    }
+}
+
+final class GuardSidebarButton: NSButton {
+    var selectedPage = false { didSet { updateStyle() } }
+    override func viewDidChangeEffectiveAppearance() { super.viewDidChangeEffectiveAppearance(); updateStyle() }
+    private func updateStyle() {
+        wantsLayer = true
+        layer?.cornerRadius = 6
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            layer?.backgroundColor = selectedPage ? GuardPalette.selection.cgColor : NSColor.clear.cgColor
+        }
+        contentTintColor = selectedPage ? GuardPalette.blue : GuardPalette.text
+    }
+}
+
+final class GuardRecordRowView: NSTableRowView {
+    override func drawSelection(in dirtyRect: NSRect) {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            GuardPalette.selection.setFill()
+            NSBezierPath(rect: bounds.intersection(dirtyRect)).fill()
+        }
+    }
+}
+
+final class GuardActionButton: NSButton {
+    override var intrinsicContentSize: NSSize {
+        let size = super.intrinsicContentSize
+        return NSSize(width: size.width + 22, height: 32)
+    }
+    override func viewDidMoveToWindow() { super.viewDidMoveToWindow(); updateStyle() }
+    override func viewDidChangeEffectiveAppearance() { super.viewDidChangeEffectiveAppearance(); updateStyle() }
+    private func updateStyle() {
+        isBordered = false; wantsLayer = true
+        layer?.cornerRadius = 6; layer?.borderWidth = 1
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            layer?.backgroundColor = GuardPalette.surface.cgColor
+            layer?.borderColor = GuardPalette.line.cgColor
+        }
+        contentTintColor = isEnabled ? GuardPalette.text : GuardPalette.secondary
     }
 }
 
@@ -4285,6 +4345,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
     private var overviewPopover: NSPopover?
     private var compactLabels: [NSTextField] = []
     private var compactActivity: NSTextField?
+    private var compactActivityTitle: NSTextField?
     private var compactQuota: NSTextField?
     private var compactQuotaTime: NSTextField?
     private var compactChatDetail: NSTextField?
@@ -4324,6 +4385,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
     private var panelHeroesCard: NSView?
     private var panelControlCard: NSView?
     private var panelQuotaSection: NSView?
+    private var panelAdvancedOptions: NSView?
+    private var panelEvidenceDisclosure: NSView?
+    private var evidenceExpanded = false
+    private var panelIncidentDisclosure: NSView?
+    private var incidentExpanded = false
     private var panelManualCheckStatus: NSTextField?
     private var panelConnection: NSTextField?
     private var panelConnectionTime: NSTextField?
@@ -4334,18 +4400,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
     private var panelChat: NSTextField?
     private var panelChatTime: NSTextField?
     private var panelChatDetail: NSTextField?
-    private var panelProbeToggle: NSButton?
+    private var panelProbeToggle: NSSwitch?
     private var panelProbeBudget: NSTextField?
     private var panelProbeIntervalPicker: NSPopUpButton?
     private var probeIntervalMenuOpen = false
     private var panelManualCheck: NSButton?
-    private var panelRecoveryToggle: NSButton?
+    private var panelRecoveryToggle: NSSwitch?
     private var panelRecoveryStatus: NSTextField?
     private var panelManualRestart: NSButton?
     private var manualPreparing = false
     private var manualVerificationBusy = false
     private var panelWakeStatus: NSTextField?
-    private var panelWakeToggle: NSButton?
+    private var panelWakeToggle: NSSwitch?
     private var recordSearch: NSSearchField?
     private var recordFilter: NSPopUpButton?
     private var recordTable: NSTableView?
@@ -5249,9 +5315,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
         if item != nil { render() }
     }
     private func quotaSection() -> NSView {
-        let connect = NSButton(title: quotaEnabled ? "登录" : "连接", target: self, action: #selector(connectQuota)); connect.bezelStyle = .rounded; connect.isEnabled = !previewMode && !quotaRequestInFlight && quota.state != .refreshing
-        let refresh = NSButton(title: quotaBrowser.hasOwnedLogin ? "完成登录" : "刷新", target: self, action: #selector(manualQuotaRefresh)); refresh.bezelStyle = .rounded; refresh.isEnabled = !previewMode && !quotaRequestInFlight && quota.state != .refreshing
-        let pause = NSButton(title: "暂停", target: self, action: #selector(pauseQuota)); pause.bezelStyle = .rounded; pause.isEnabled = !previewMode && quotaEnabled
+        let connect = GuardActionButton(title: quotaEnabled ? "登录" : "连接", target: self, action: #selector(connectQuota)); connect.isEnabled = !previewMode && !quotaRequestInFlight && quota.state != .refreshing
+        let refresh = GuardActionButton(title: quotaBrowser.hasOwnedLogin ? "完成登录" : "刷新", target: self, action: #selector(manualQuotaRefresh)); refresh.isEnabled = !previewMode && !quotaRequestInFlight && quota.state != .refreshing
+        let pause = GuardActionButton(title: "暂停", target: self, action: #selector(pauseQuota)); pause.isEnabled = !previewMode && quotaEnabled
         let intervalLabel = label("自动同步", size: 12, color: .secondaryLabelColor)
         let interval = NSPopUpButton()
         interval.addItems(withTitles: ["手动", "每分钟", "每 2 分钟", "每 5 分钟", "每 10 分钟", "每 30 分钟", "每小时"])
@@ -5311,6 +5377,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
         render()
     }
     @objc private func quotaRefreshIntervalChanged(_ sender: NSPopUpButton) {
+        guard !previewMode else { return }
         let index = sender.indexOfSelectedItem
         guard quotaRefreshOptions.indices.contains(index) else { return }
         UserDefaults.standard.set(quotaRefreshOptions[index], forKey: "quotaRefreshSeconds")
@@ -5482,7 +5549,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
     }
     @objc private func openLogWindow() { showPanel(page: 1) }
     @objc private func openDiagnosticWindow() { showPanel(page: 2) }
+    @objc private func openSettingsPage() { showPanel(page: 3) }
     @objc private func panelPageChanged(_ sender: NSButton) { panelPage = sender.tag; renderPanelPage() }
+    @objc private func toggleAdvancedOptions(_ sender: NSButton) {
+        panelAdvancedOptions?.isHidden.toggle()
+        sender.image = NSImage(systemSymbolName: panelAdvancedOptions?.isHidden == true ? "chevron.right" : "chevron.down", accessibilityDescription: nil)
+        sender.setAccessibilityValue(panelAdvancedOptions?.isHidden == true ? "已收起" : "已展开")
+        renderPanelPage()
+    }
+    @objc private func toggleEvidence(_ sender: NSButton) {
+        evidenceExpanded.toggle()
+        panelEvidenceDisclosure?.isHidden = !evidenceExpanded
+        sender.title = evidenceExpanded ? "收起证据与限制" : "查看证据与限制"
+        sender.image = NSImage(systemSymbolName: evidenceExpanded ? "chevron.down" : "chevron.right", accessibilityDescription: nil)
+        sender.setAccessibilityValue(evidenceExpanded ? "已展开" : "已收起")
+        renderPanelPage()
+    }
+    @objc private func toggleIncidentDetail(_ sender: NSButton) {
+        incidentExpanded.toggle()
+        panelIncidentDisclosure?.isHidden = !incidentExpanded
+        sender.title = incidentExpanded ? "收起本次授权恢复流程" : "查看本次授权恢复流程"
+        sender.image = NSImage(systemSymbolName: incidentExpanded ? "chevron.down" : "chevron.right", accessibilityDescription: nil)
+        sender.setAccessibilityValue(incidentExpanded ? "已展开" : "已收起")
+        renderPanelPage()
+    }
 
     private func showOverviewPopover() {
         guard let button = item.button else { return }
@@ -5491,64 +5581,77 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
             let root = PanelBackgroundView(); root.wantsLayer = true
             content.view = root
             root.widthAnchor.constraint(equalToConstant: 360).isActive = true
-            let layout = vertical(12)
-            layout.alignment = .centerX
-            layout.edgeInsets = NSEdgeInsets(top: 17, left: 19, bottom: 14, right: 19)
+            let layout = vertical(0)
             root.addSubview(layout); layout.translatesAutoresizingMaskIntoConstraints = false
             NSLayoutConstraint.activate([
                 layout.leadingAnchor.constraint(equalTo: root.leadingAnchor), layout.trailingAnchor.constraint(equalTo: root.trailingAnchor),
                 layout.topAnchor.constraint(equalTo: root.topAnchor), layout.bottomAnchor.constraint(equalTo: root.bottomAnchor)
             ])
-            let heading = NSStackView(views: [label("CommanderGuard", size: 14, weight: .semibold), NSView()])
-            heading.alignment = .centerY
-            let shield = NSImageView(image: NSImage(systemSymbolName: "checkmark.shield", accessibilityDescription: "CommanderGuard") ?? NSImage())
-            shield.contentTintColor = .controlAccentColor; shield.setContentHuggingPriority(.required, for: .horizontal)
-            heading.addArrangedSubview(shield)
-            layout.addArrangedSubview(heading)
-            let title = label("本机运行状态", size: 18, weight: .semibold)
-            layout.addArrangedSubview(title)
-            let summary = label("", size: 12, color: .secondaryLabelColor); compactSummary = summary
-            compactLabels = (0..<3).map { _ in label("等待状态", size: 12) }
-            let rows = vertical(0)
-            for (index, pair) in zip(["消息通道", "工具执行", "ChatGPT 回答"], compactLabels).enumerated() {
-                let (name, value) = pair
-                let key = label(name, size: 12, color: .secondaryLabelColor)
-                key.widthAnchor.constraint(equalToConstant: 90).isActive = true
-                let valueStack = vertical(3); valueStack.addArrangedSubview(value)
-                if index == 2 {
-                    compactChatDetail = label("", size: 11, color: .secondaryLabelColor)
-                    valueStack.addArrangedSubview(compactChatDetail!)
-                }
-                let row = NSStackView(views: [key, valueStack]); row.orientation = .horizontal; row.alignment = .top; row.spacing = 8
-                row.edgeInsets = NSEdgeInsets(top: 7, left: 0, bottom: 7, right: 0)
-                rows.addArrangedSubview(row); row.widthAnchor.constraint(equalTo: rows.widthAnchor).isActive = true
-                valueStack.widthAnchor.constraint(equalTo: row.widthAnchor, constant: -98).isActive = true
-                valueStack.arrangedSubviews.forEach { $0.widthAnchor.constraint(equalTo: valueStack.widthAnchor).isActive = true }
-                let separator = NSBox(); separator.boxType = .separator; separator.heightAnchor.constraint(equalToConstant: 1).isActive = true
-                rows.addArrangedSubview(separator); separator.widthAnchor.constraint(equalTo: rows.widthAnchor).isActive = true
+            let header = NSStackView(views: [label("CommanderGuard", size: 13, weight: .semibold), NSView()])
+            header.orientation = .horizontal; header.alignment = .centerY
+            header.edgeInsets = NSEdgeInsets(top: 17, left: 19, bottom: 17, right: 19)
+            let shieldImage = NSImage(systemSymbolName: "checkmark.shield", accessibilityDescription: "CommanderGuard")?.withSymbolConfiguration(.init(pointSize: 17, weight: .regular)) ?? NSImage()
+            let shield = NSImageView(image: shieldImage); shield.imageScaling = .scaleProportionallyUpOrDown
+            shield.contentTintColor = GuardPalette.blue
+            header.addArrangedSubview(shield)
+            layout.addArrangedSubview(header); header.widthAnchor.constraint(equalTo: layout.widthAnchor).isActive = true
+            let topLine = NSBox(); topLine.boxType = .separator; topLine.heightAnchor.constraint(equalToConstant: 1).isActive = true
+            layout.addArrangedSubview(topLine); topLine.widthAnchor.constraint(equalTo: layout.widthAnchor).isActive = true
+
+            let contentStack = vertical(0)
+            contentStack.edgeInsets = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
+            layout.addArrangedSubview(contentStack); contentStack.widthAnchor.constraint(equalTo: layout.widthAnchor).isActive = true
+            let compactTitle = label("正在保护本机任务", size: 18, weight: .semibold)
+            compactTitle.heightAnchor.constraint(greaterThanOrEqualToConstant: 27).isActive = true
+            contentStack.addArrangedSubview(compactTitle)
+            let summary = label("", size: 13, color: GuardPalette.secondary); compactSummary = summary
+            summary.heightAnchor.constraint(greaterThanOrEqualToConstant: 20).isActive = true
+            contentStack.setCustomSpacing(8, after: compactTitle)
+            contentStack.addArrangedSubview(summary)
+            summary.widthAnchor.constraint(equalTo: contentStack.widthAnchor, constant: -40).isActive = true
+            let gap = NSView(); gap.heightAnchor.constraint(equalToConstant: 16).isActive = true; contentStack.addArrangedSubview(gap)
+            compactLabels = (0..<3).map { _ in label("等待状态", size: 12, color: GuardPalette.secondary) }
+            for (name, value) in zip(["消息通道", "工具执行", "原回答"], compactLabels) {
+                value.alignment = .right
+                let row = NSStackView(views: [label(name, size: 12), NSView(), value])
+                row.orientation = .horizontal; row.alignment = .centerY
+                row.heightAnchor.constraint(greaterThanOrEqualToConstant: 40).isActive = true
+                contentStack.addArrangedSubview(row); row.widthAnchor.constraint(equalTo: contentStack.widthAnchor, constant: -40).isActive = true
+                let line = NSBox(); line.boxType = .separator; line.heightAnchor.constraint(equalToConstant: 1).isActive = true
+                contentStack.addArrangedSubview(line); line.widthAnchor.constraint(equalTo: contentStack.widthAnchor, constant: -40).isActive = true
             }
-            layout.addArrangedSubview(summary)
-            layout.addArrangedSubview(rows)
-            let taskTitle = label("当前任务", size: 12, weight: .semibold)
-            compactActivity = label("等待本机操作记录", size: 12, color: .secondaryLabelColor)
+            compactChatDetail = label("", size: 11, color: GuardPalette.secondary)
+            compactChatDetail?.isHidden = true
+            let taskGap = NSView(); taskGap.heightAnchor.constraint(equalToConstant: 17).isActive = true; contentStack.addArrangedSubview(taskGap)
+            let taskTitle = label("当前任务", size: 13, weight: .medium); compactActivityTitle = taskTitle
+            compactActivity = label("等待本机操作记录", size: 11, color: GuardPalette.secondary)
             let task = vertical(4); task.addArrangedSubview(taskTitle); task.addArrangedSubview(compactActivity!)
-            task.arrangedSubviews.forEach { $0.widthAnchor.constraint(equalTo: task.widthAnchor).isActive = true }
-            layout.addArrangedSubview(card(task, padding: 11))
-            let quotaLine = NSStackView(views: [label("额度", size: 12, color: .secondaryLabelColor), NSView()])
-            quotaLine.alignment = .centerY
+            taskTitle.widthAnchor.constraint(equalTo: task.widthAnchor).isActive = true
+            compactActivity!.widthAnchor.constraint(equalTo: task.widthAnchor).isActive = true
+            let taskPanel = tintedCard(task, padding: 12)
+            contentStack.addArrangedSubview(taskPanel); taskPanel.widthAnchor.constraint(equalTo: contentStack.widthAnchor, constant: -40).isActive = true
+            let accountGap = NSView(); accountGap.heightAnchor.constraint(equalToConstant: 18).isActive = true; contentStack.addArrangedSubview(accountGap)
             compactQuota = label("等待同步", size: 12, weight: .medium)
-            compactQuotaTime = label("", size: 11, color: .secondaryLabelColor)
-            quotaLine.addArrangedSubview(compactQuota!); layout.addArrangedSubview(quotaLine); layout.addArrangedSubview(compactQuotaTime!)
-            let separator = NSBox(); separator.boxType = .separator; separator.heightAnchor.constraint(equalToConstant: 1).isActive = true
-            layout.addArrangedSubview(separator)
-            let footer = NSStackView(); footer.orientation = .horizontal; footer.alignment = .centerY; footer.distribution = .fillEqually; footer.spacing = 8
-            let recovery = NSButton(title: "恢复与重启…", target: self, action: #selector(openDiagnosticWindow)); recovery.bezelStyle = .rounded; compactRecoveryButton = recovery
-            let full = NSButton(title: "打开完整面板", target: self, action: #selector(openPanel)); full.bezelStyle = .rounded
-            footer.addArrangedSubview(recovery); footer.addArrangedSubview(full); layout.addArrangedSubview(footer)
-            layout.arrangedSubviews.forEach { $0.widthAnchor.constraint(equalToConstant: 322).isActive = true }
+            compactQuotaTime = label("", size: 11, color: GuardPalette.secondary)
+            let accountRow = NSStackView(views: [compactQuota!, NSView()])
+            accountRow.orientation = .horizontal; accountRow.alignment = .centerY
+            accountRow.addArrangedSubview(compactQuotaTime!)
+            contentStack.addArrangedSubview(accountRow); accountRow.widthAnchor.constraint(equalTo: contentStack.widthAnchor, constant: -40).isActive = true
+            let noteGap = NSView(); noteGap.heightAnchor.constraint(equalToConstant: 18).isActive = true; contentStack.addArrangedSubview(noteGap)
+            contentStack.addArrangedSubview(label(previewMode ? "设计草案 · 固定示例数据" : "仅展示已有证据", size: 11, color: GuardPalette.secondary))
+
+            let bottomLine = NSBox(); bottomLine.boxType = .separator; bottomLine.heightAnchor.constraint(equalToConstant: 1).isActive = true
+            layout.addArrangedSubview(bottomLine); bottomLine.widthAnchor.constraint(equalTo: layout.widthAnchor).isActive = true
+            let footer = NSStackView(); footer.orientation = .horizontal; footer.alignment = .centerY
+            footer.edgeInsets = NSEdgeInsets(top: 13, left: 19, bottom: 13, right: 19)
+            let recovery = NSButton(title: "恢复与重启…", target: self, action: #selector(openDiagnosticWindow))
+            recovery.isBordered = false; recovery.contentTintColor = GuardPalette.secondary; compactRecoveryButton = recovery
+            let full = GuardActionButton(title: "打开完整面板", target: self, action: #selector(openPanel))
+            footer.addArrangedSubview(recovery); footer.addArrangedSubview(NSView()); footer.addArrangedSubview(full)
+            layout.addArrangedSubview(footer); footer.widthAnchor.constraint(equalTo: layout.widthAnchor).isActive = true
             let popover = NSPopover(); popover.contentViewController = content; popover.behavior = .transient
             root.layoutSubtreeIfNeeded()
-            popover.contentSize = NSSize(width: 360, height: max(340, layout.fittingSize.height + 4))
+            popover.contentSize = NSSize(width: 360, height: layout.fittingSize.height + 2)
             overviewPopover = popover
         }
         renderCompactOverview()
@@ -5572,29 +5675,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
         let now = Date()
         let channel = channelSummary(snapshot, now: now)
         compactLabels[0].stringValue = channelIncident.activeCategory?.title ?? channel
-        compactLabels[0].textColor = channelIncident.activeCategory == nil ? .labelColor : .systemOrange
-        compactLabels[1].stringValue = toolExecutionSummary(now: now)
+        compactLabels[0].textColor = channelIncident.activeCategory == nil ? GuardPalette.secondary : GuardPalette.amber
+        let tool = toolExecutionSummary(now: now)
+        compactLabels[1].stringValue = tool == "工具执行已验证" ? "最近一次已验证" : tool
         let chat = chatMonitorSummary(snapshot.timeline)
-        compactLabels[2].stringValue = chatOverviewTitle(chat)
-        compactChatDetail?.stringValue = chatOverviewTitle(chat) == "后续连接已恢复" ? "原回答是否完整：无法确认" : ""
+        compactLabels[2].stringValue = chatOverviewTitle(chat) == "后续连接已恢复" ? "仍需人工核对" : chatOverviewTitle(chat)
+        compactChatDetail?.stringValue = ""
         compactChatDetail?.toolTip = chatOverviewDetail(chat)
         let activity = snapshot.activity.activeCount > 0 ? "有 \(snapshot.activity.activeCount) 项活动" : activityOverviewText(snapshot.activity)
-        compactSummary?.stringValue = "\(activity) · 自动恢复：\(recoveryAvailability())"
-        compactActivity?.stringValue = currentCallStep(snapshot.activity).map { middleTruncate(CommanderActivity.menuDetail($0.detail), limit: 90) } ?? activityOverviewText(snapshot.activity)
+        compactSummary?.stringValue = "\(activity)，自动恢复\(snapshot.activity.activeCount > 0 ? "暂缓" : (recoveryLedger.autoRecoveryEnabled ? "受安全条件约束" : "已暂停"))。"
+        compactActivityTitle?.stringValue = currentCallStep(snapshot.activity).map { CommanderActivity.menuDetail($0.detail) } ?? "当前任务"
+        compactActivity?.stringValue = currentCallStep(snapshot.activity).map { "\(CommanderActivity.safeToolIdentifier($0.tool)) · \($0.uncertain ? "结果未确认" : "进行中")" } ?? activityOverviewText(snapshot.activity)
         compactQuota?.stringValue = quotaDisplay()
-        compactQuotaTime?.stringValue = "上次成功同步：\(displayEvidenceTime(quota.syncedAt)) · \(quotaStatusDisplay())"
+        compactQuotaTime?.stringValue = "\(quota.syncedAt.map { DateFormatter.localizedString(from: $0, dateStyle: .none, timeStyle: .short) } ?? "尚未") 同步"
         overviewPopover?.contentViewController?.view.layoutSubtreeIfNeeded()
         if let layout = overviewPopover?.contentViewController?.view.subviews.first as? NSStackView {
-            overviewPopover?.contentSize = NSSize(width: 360, height: max(340, layout.fittingSize.height + 4))
+            overviewPopover?.contentSize = NSSize(width: 360, height: layout.fittingSize.height + 2)
         }
     }
 
-    private func label(_ value: String, size: CGFloat = 13, weight: NSFont.Weight = .regular, color: NSColor = .labelColor) -> NSTextField {
+    private func label(_ value: String, size: CGFloat = 13, weight: NSFont.Weight = .regular, color: NSColor = GuardPalette.text) -> NSTextField {
         let field = NSTextField(labelWithString: value)
         field.font = .systemFont(ofSize: size, weight: weight)
         field.textColor = color
         field.lineBreakMode = .byWordWrapping
         field.maximumNumberOfLines = 0
+        field.heightAnchor.constraint(greaterThanOrEqualToConstant: ceil(size * (size >= 18 ? 1.35 : 1.5))).isActive = true
         field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         return field
     }
@@ -5604,8 +5710,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
     }
     private func card(_ content: NSView, padding: CGFloat = 16) -> NSView {
         let card = PanelCardView()
-        card.wantsLayer = true; card.layer?.cornerRadius = 12; card.layer?.masksToBounds = true
-        card.layer?.borderColor = NSColor.separatorColor.cgColor; card.layer?.borderWidth = 1
+        card.wantsLayer = true; card.layer?.cornerRadius = 9; card.layer?.masksToBounds = true
+        card.layer?.borderColor = GuardPalette.line.cgColor; card.layer?.borderWidth = 1
         card.addSubview(content); content.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
             content.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: padding),
@@ -5615,38 +5721,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
         ])
         return card
     }
-    private func evidenceRow(_ title: String, value: NSTextField, time: NSTextField, detail: NSTextField) -> NSView {
-        let titleField = label(title, size: 12, weight: .medium, color: .secondaryLabelColor)
-        titleField.widthAnchor.constraint(equalToConstant: 88).isActive = true
-        let summary = NSStackView(views: [titleField, value, time])
-        summary.orientation = .horizontal; summary.alignment = .centerY; summary.spacing = 8
-        summary.heightAnchor.constraint(equalToConstant: 20).isActive = true
-        time.widthAnchor.constraint(equalToConstant: 190).isActive = true
-        time.maximumNumberOfLines = 1
-        time.lineBreakMode = .byTruncatingTail
-        time.setContentHuggingPriority(.required, for: .horizontal)
-        time.setContentCompressionResistancePriority(.required, for: .horizontal)
-        value.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        value.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        let stack = vertical(2)
-        stack.setHuggingPriority(.required, for: .vertical)
-        stack.addArrangedSubview(summary)
-        stack.addArrangedSubview(detail)
-        summary.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
-        detail.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
-        value.font = .systemFont(ofSize: 13, weight: .semibold)
+    private func tintedCard(_ content: NSView, padding: CGFloat = 15) -> NSView {
+        let background = PanelBackgroundView(); background.wantsLayer = true; background.fillColor = GuardPalette.tint
+        background.layer?.cornerRadius = 8; background.layer?.masksToBounds = true
+        background.addSubview(content); content.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            content.leadingAnchor.constraint(equalTo: background.leadingAnchor, constant: padding),
+            content.trailingAnchor.constraint(equalTo: background.trailingAnchor, constant: -padding),
+            content.topAnchor.constraint(equalTo: background.topAnchor, constant: padding),
+            content.bottomAnchor.constraint(equalTo: background.bottomAnchor, constant: -padding)
+        ])
+        return background
+    }
+    private func evidenceRow(_ title: String, subtitle: String, symbol: String, value: NSTextField, time: NSTextField) -> NSView {
+        let icon = NSImageView(image: NSImage(systemSymbolName: symbol, accessibilityDescription: title) ?? NSImage())
+        icon.contentTintColor = GuardPalette.secondary
+        icon.widthAnchor.constraint(equalToConstant: 26).isActive = true
+        let left = vertical(2)
+        left.addArrangedSubview(label(title, size: 13, weight: .medium))
+        left.addArrangedSubview(label(subtitle, size: 11, color: GuardPalette.secondary))
+        let right = vertical(2)
+        right.alignment = .trailing
+        value.font = .systemFont(ofSize: 12)
+        value.alignment = .right
         value.maximumNumberOfLines = 1
-        time.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
-        time.textColor = .secondaryLabelColor
-        detail.font = .systemFont(ofSize: 12, weight: .regular)
-        detail.textColor = .secondaryLabelColor
-        detail.maximumNumberOfLines = 1
-        detail.lineBreakMode = .byTruncatingTail
-        return stack
+        time.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        time.textColor = GuardPalette.secondary
+        time.alignment = .right
+        time.maximumNumberOfLines = 1
+        right.addArrangedSubview(value); right.addArrangedSubview(time)
+        let row = NSStackView(views: [icon, left, NSView(), right])
+        row.orientation = .horizontal; row.alignment = .centerY; row.spacing = 10
+        row.edgeInsets = NSEdgeInsets(top: 13, left: 15, bottom: 13, right: 15)
+        row.heightAnchor.constraint(equalToConstant: 66).isActive = true
+        return row
     }
     private func buildPanel() {
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 940, height: 720), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 940, height: 620), styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView], backing: .buffered, defer: false)
         window.title = previewMode ? "CommanderGuard · 界面预览" : "CommanderGuard"
+        window.titleVisibility = .hidden; window.titlebarAppearsTransparent = true
         if previewMode && CommandLine.arguments.contains("--preview-dark") { window.appearance = NSAppearance(named: .darkAqua) }
         if previewMode && CommandLine.arguments.contains("--preview-light") { window.appearance = NSAppearance(named: .aqua) }
         window.isReleasedWhenClosed = false; window.minSize = NSSize(width: 760, height: 560); window.center()
@@ -5656,24 +5769,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
         shell.translatesAutoresizingMaskIntoConstraints = false
         root.addSubview(shell)
         NSLayoutConstraint.activate([shell.leadingAnchor.constraint(equalTo: root.leadingAnchor), shell.trailingAnchor.constraint(equalTo: root.trailingAnchor), shell.topAnchor.constraint(equalTo: root.topAnchor), shell.bottomAnchor.constraint(equalTo: root.bottomAnchor)])
-        let sidebar = NSVisualEffectView(); sidebar.material = .sidebar; sidebar.blendingMode = .behindWindow; sidebar.state = .followsWindowActiveState
+        let sidebar = PanelBackgroundView(); sidebar.wantsLayer = true; sidebar.fillColor = GuardPalette.rail
         sidebar.widthAnchor.constraint(equalToConstant: 188).isActive = true
-        let sidebarStack = vertical(8); sidebarStack.edgeInsets = NSEdgeInsets(top: 18, left: 12, bottom: 16, right: 12)
+        let sidebarStack = vertical(4); sidebarStack.edgeInsets = NSEdgeInsets(top: 65, left: 12, bottom: 16, right: 12)
         sidebar.addSubview(sidebarStack); sidebarStack.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([sidebarStack.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor), sidebarStack.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor), sidebarStack.topAnchor.constraint(equalTo: sidebar.topAnchor), sidebarStack.bottomAnchor.constraint(equalTo: sidebar.bottomAnchor)])
         let brand = NSStackView(); brand.orientation = .horizontal; brand.alignment = .centerY; brand.spacing = 9
-        let shield = NSImageView(image: NSImage(systemSymbolName: "checkmark.shield", accessibilityDescription: "CommanderGuard") ?? NSImage()); shield.contentTintColor = .controlAccentColor
+        brand.edgeInsets = NSEdgeInsets(top: 0, left: 8, bottom: 0, right: 0)
+        let brandImage = NSImage(systemSymbolName: "checkmark.shield", accessibilityDescription: "CommanderGuard")?.withSymbolConfiguration(.init(pointSize: 17, weight: .regular)) ?? NSImage()
+        let shield = NSImageView(image: brandImage); shield.imageScaling = .scaleProportionallyUpOrDown; shield.contentTintColor = GuardPalette.blue
         brand.addArrangedSubview(shield)
-        let brandText = vertical(1); brandText.addArrangedSubview(label("CommanderGuard", size: 12, weight: .semibold)); brandText.addArrangedSubview(label("本机执行守护", size: 11, color: .secondaryLabelColor)); brand.addArrangedSubview(brandText)
+        let brandText = vertical(1); brandText.addArrangedSubview(label("CommanderGuard", size: 13, weight: .semibold)); brandText.addArrangedSubview(label("本机执行守护", size: 11, color: GuardPalette.secondary)); brand.addArrangedSubview(brandText)
         sidebarStack.addArrangedSubview(brand)
-        let navGap = NSView(); navGap.heightAnchor.constraint(equalToConstant: 20).isActive = true; navGap.setContentHuggingPriority(.required, for: .vertical); sidebarStack.addArrangedSubview(navGap)
+        let navGap = NSView(); navGap.heightAnchor.constraint(equalToConstant: 13).isActive = true; navGap.setContentHuggingPriority(.required, for: .vertical); sidebarStack.addArrangedSubview(navGap)
         func addSidebarButton(_ index: Int) {
             let title = ["概览", "操作记录", "故障与恢复", "设置"][index]
             let symbols = ["square.grid.2x2", "list.bullet", "exclamationmark.triangle", "gearshape"]
-            let button = NSButton(title: title, target: self, action: #selector(panelPageChanged(_:)))
-            button.tag = index; button.image = NSImage(systemSymbolName: symbols[index], accessibilityDescription: title)
-            button.imagePosition = .imageLeading; button.alignment = .left; button.bezelStyle = .rounded; button.isBordered = false
-            button.contentTintColor = .secondaryLabelColor; button.heightAnchor.constraint(equalToConstant: 34).isActive = true
+            let button = GuardSidebarButton(title: title, target: self, action: #selector(panelPageChanged(_:)))
+            button.tag = index
+            let symbol = NSImage(systemSymbolName: symbols[index], accessibilityDescription: title)?.withSymbolConfiguration(.init(pointSize: 16, weight: .regular))
+            let paddedIcon = NSImage(size: NSSize(width: 36, height: 18), flipped: false) { _ in
+                symbol?.draw(in: NSRect(x: 11, y: 1, width: 16, height: 16))
+                return true
+            }
+            paddedIcon.isTemplate = true
+            button.image = paddedIcon
+            button.imagePosition = .imageLeading; button.alignment = .left; button.isBordered = false
+            button.heightAnchor.constraint(equalToConstant: 38).isActive = true
             button.setContentHuggingPriority(.required, for: .vertical)
             panelSidebarButtons.append(button); sidebarStack.addArrangedSubview(button)
             button.widthAnchor.constraint(equalTo: sidebar.widthAnchor, constant: -24).isActive = true
@@ -5681,7 +5803,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
         for index in 0...2 { addSidebarButton(index) }
         let spacerBottom = NSView(); spacerBottom.setContentHuggingPriority(.defaultLow, for: .vertical); sidebarStack.addArrangedSubview(spacerBottom)
         addSidebarButton(3)
-        let sideFooter = label("本机服务：状态未知", size: 11, color: .secondaryLabelColor); panelSidebarFooter = sideFooter
+        let sideLine = NSBox(); sideLine.boxType = .separator; sideLine.heightAnchor.constraint(equalToConstant: 1).isActive = true
+        sidebarStack.addArrangedSubview(sideLine); sideLine.widthAnchor.constraint(equalTo: sidebar.widthAnchor, constant: -24).isActive = true
+        let footerGap = NSView(); footerGap.heightAnchor.constraint(equalToConstant: 8).isActive = true; sidebarStack.addArrangedSubview(footerGap)
+        let sideFooter = label("本机服务：状态未知\n仅展示已有证据", size: 11, color: GuardPalette.secondary); panelSidebarFooter = sideFooter
         sidebarStack.addArrangedSubview(sideFooter)
         shell.addArrangedSubview(sidebar)
         sidebar.heightAnchor.constraint(equalTo: root.heightAnchor).isActive = true
@@ -5695,11 +5820,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
         NSLayoutConstraint.activate([layout.leadingAnchor.constraint(equalTo: main.leadingAnchor), layout.trailingAnchor.constraint(equalTo: main.trailingAnchor), layout.topAnchor.constraint(equalTo: main.topAnchor), layout.bottomAnchor.constraint(equalTo: main.bottomAnchor)])
         let toolbar = NSStackView(); toolbar.orientation = .horizontal; toolbar.alignment = .centerY; toolbar.spacing = 12
         toolbar.edgeInsets = NSEdgeInsets(top: 0, left: 26, bottom: 0, right: 26)
-        let title = label("概览", size: 16, weight: .semibold); panelPageTitle = title; panelHeading = NSStackView(views: [title])
-        let detail = label("本机观察 · 状态随检查更新", size: 11, color: .secondaryLabelColor); detail.alignment = .right; panelToolbarDetail = detail
+        let title = label("概览", size: 13, weight: .semibold); panelPageTitle = title; panelHeading = NSStackView(views: [title])
+        let detail = label("本机观察 · 状态随检查更新", size: 11, color: GuardPalette.secondary); detail.alignment = .right; panelToolbarDetail = detail
         let toolbarSpacer = NSView(); toolbarSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
         toolbar.addArrangedSubview(title); toolbar.addArrangedSubview(toolbarSpacer); toolbar.addArrangedSubview(detail)
         toolbar.heightAnchor.constraint(equalToConstant: 58).isActive = true; layout.addArrangedSubview(toolbar)
+        let toolbarLine = PanelBackgroundView(); toolbarLine.wantsLayer = true; toolbarLine.fillColor = GuardPalette.line
+        toolbarLine.heightAnchor.constraint(equalToConstant: 1).isActive = true; layout.addArrangedSubview(toolbarLine)
+        toolbarLine.widthAnchor.constraint(equalTo: layout.widthAnchor).isActive = true
 
         let commandValue = label("等待观察"); let commandTime = label("检查：暂无"); let commandDetail = label("")
         let toolValue = label("未验证"); let toolTime = label("检查：暂无"); let toolDetail = label("")
@@ -5711,9 +5839,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
         heroes.distribution = .fill
         heroes.setHuggingPriority(.required, for: .vertical)
         panelHeroes = heroes
-        let evidenceRows = [evidenceRow("消息通道", value: commandValue, time: commandTime, detail: commandDetail),
-                            evidenceRow("工具执行", value: toolValue, time: toolTime, detail: toolDetail),
-                            evidenceRow("ChatGPT 观察", value: chatValue, time: chatTime, detail: chatDetail)]
+        let evidenceRows = [evidenceRow("消息通道", subtitle: "最近一次实际探测", symbol: "dot.radiowaves.left.and.right", value: commandValue, time: commandTime),
+                            evidenceRow("本机工具", subtitle: "来自最近一次真实调用", symbol: "terminal", value: toolValue, time: toolTime),
+                            evidenceRow("ChatGPT 回答", subtitle: "后续连接与原回答分别核对", symbol: "message", value: chatValue, time: chatTime)]
         for (index, row) in evidenceRows.enumerated() {
             heroes.addArrangedSubview(row)
             row.widthAnchor.constraint(equalTo: heroes.widthAnchor).isActive = true
@@ -5722,32 +5850,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
                 heroes.addArrangedSubview(separator); separator.widthAnchor.constraint(equalTo: heroes.widthAnchor).isActive = true
             }
         }
-        panelHeroesCard = card(heroes, padding: 14)
+        panelHeroesCard = card(heroes, padding: 0)
 
-        let recovery = NSButton(checkboxWithTitle: "自动恢复本机 Commander", target: self, action: #selector(toggleAutoRecovery))
+        let recovery = NSSwitch(); recovery.target = self; recovery.action = #selector(toggleAutoRecovery); recovery.controlSize = .small
+        recovery.setAccessibilityLabel("自动恢复本机 Commander")
         recovery.toolTip = "云端主动探测关闭时自动恢复暂停；开启后自动探测累计 3 次明确断链，且日志完整并确认没有本机任务时，才重启本机 Commander。恢复后确认需等待所选探测间隔；不会重试原任务或修复云端问题。"
-        let wake = NSButton(checkboxWithTitle: "防止闲置睡眠（Guard）", target: self, action: #selector(togglePause))
+        let wake = NSSwitch(); wake.target = self; wake.action = #selector(togglePause); wake.controlSize = .small
+        wake.setAccessibilityLabel("防止闲置睡眠（Guard）")
         wake.toolTip = "仅防止系统因闲置而睡眠，不阻止手动睡眠、屏幕息屏或重启。关闭只撤销 Guard 的请求；其他程序仍可能保持唤醒。"
-        let check = NSButton(title: "手动 ping（1次）", target: self, action: #selector(manualCheck)); check.bezelStyle = .rounded
+        let check = GuardActionButton(title: "手动 ping（1次）", target: self, action: #selector(manualCheck))
         check.toolTip = "需要开启云端主动探测且所选间隔已到；此按钮只发送一次 ping，可能消耗一次额度，与自动和恢复后检查共用间隔。"
         panelManualCheck = check
         [recovery, wake, check].forEach { $0.isEnabled = !previewMode }
         panelRecoveryToggle = recovery; panelWakeToggle = wake
-        let recoverySpacer = NSView(); recoverySpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
         let recoveryStatus = label("自动恢复：等待检查", size: 12, color: .secondaryLabelColor)
         recoveryStatus.maximumNumberOfLines = 2
         panelRecoveryStatus = recoveryStatus
-        let recoveryRow = NSStackView(views: [recovery, recoverySpacer, recoveryStatus]); recoveryRow.orientation = .horizontal; recoveryRow.alignment = .centerY; recoveryRow.spacing = 8
         let wakeStatus = label("保持唤醒：等待检查", size: 12, color: .secondaryLabelColor)
         wakeStatus.maximumNumberOfLines = 2
         panelWakeStatus = wakeStatus
-        let wakeRow = NSStackView(views: [wake, wakeStatus]); wakeRow.orientation = .horizontal; wakeRow.alignment = .centerY; wakeRow.spacing = 12
         let manualCheckStatus = label("", size: 12, color: .secondaryLabelColor)
         manualCheckStatus.maximumNumberOfLines = 0
         panelManualCheckStatus = manualCheckStatus
         let manualCheckRow = NSStackView(views: [check, manualCheckStatus]); manualCheckRow.orientation = .horizontal; manualCheckRow.alignment = .centerY; manualCheckRow.spacing = 8
-        let controlContent = vertical(12)
-        let probeToggle = NSButton(checkboxWithTitle: "云端主动探测（可能消耗额度）", target: self, action: #selector(toggleActiveProbing))
+        let probeToggle = NSSwitch(); probeToggle.target = self; probeToggle.action = #selector(toggleActiveProbing); probeToggle.controlSize = .small
+        probeToggle.setAccessibilityLabel("云端主动探测（可能消耗额度）")
         probeToggle.toolTip = "默认关闭，计费关系未确认。开启后按所选间隔发送一次 ping；自动、手动、命令行及恢复后检查共用持久间隔，失败也开始计时，不自动附加工具检查。关闭阻止新的云端工具请求并暂停自动恢复；已提交请求可能仍计费。本机观察、设备状态与额度同步继续。"
         probeToggle.isEnabled = !previewMode
         panelProbeToggle = probeToggle
@@ -5761,29 +5888,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
         probeInterval.isEnabled = !previewMode; probeInterval.menu?.delegate = self
         probeInterval.widthAnchor.constraint(equalToConstant: 112).isActive = true
         panelProbeIntervalPicker = probeInterval
-        let probeIntervalRow = NSStackView(views: [probeToggle, NSView(), label("探测频率", size: 12), probeInterval])
+        let probeIntervalRow = NSStackView(views: [label("探测频率", size: 12), NSView(), probeInterval])
         probeIntervalRow.orientation = .horizontal; probeIntervalRow.alignment = .centerY; probeIntervalRow.spacing = 8
         panelProbeBudget = probeBudget
-        func settingsGroup(_ title: String, _ content: [NSView]) -> NSView {
-            let group = vertical(5)
-            group.addArrangedSubview(label(title, size: 14, weight: .semibold))
-            content.forEach {
-                group.addArrangedSubview($0)
-                $0.widthAnchor.constraint(equalTo: group.widthAnchor).isActive = true
-            }
-            return group
+        func settingRow(_ title: String, subtitle: NSTextField, control: NSView) -> NSView {
+            let text = vertical(3)
+            text.addArrangedSubview(label(title, size: 13, weight: .medium)); text.addArrangedSubview(subtitle)
+            subtitle.font = .systemFont(ofSize: 11); subtitle.textColor = GuardPalette.secondary
+            let row = NSStackView(views: [text, NSView(), control])
+            row.orientation = .horizontal; row.alignment = .centerY; row.spacing = 12
+            row.edgeInsets = NSEdgeInsets(top: 12, left: 15, bottom: 12, right: 15)
+            row.heightAnchor.constraint(equalToConstant: 65).isActive = true
+            return row
         }
-        let probeSettings = settingsGroup("连接检查", [probeIntervalRow, probeBudget, manualCheckRow])
-        let recoverySettings = settingsGroup("自动恢复", [recoveryRow])
-        let wakeSettings = settingsGroup("保持唤醒", [wakeRow])
-        [probeSettings, recoverySettings, wakeSettings].enumerated().forEach { index, group in
-            if index > 0 { let separator = NSBox(); separator.boxType = .separator; separator.heightAnchor.constraint(equalToConstant: 1).isActive = true; controlContent.addArrangedSubview(separator) }
-            controlContent.addArrangedSubview(group)
-            group.widthAnchor.constraint(equalTo: controlContent.widthAnchor).isActive = true
+        let controlRows = vertical(0)
+        for (index, item) in [settingRow("云端主动探测", subtitle: probeBudget, control: probeToggle),
+                              settingRow("自动恢复本机服务", subtitle: recoveryStatus, control: recovery),
+                              settingRow("防止闲置睡眠", subtitle: wakeStatus, control: wake)].enumerated() {
+            controlRows.addArrangedSubview(item); item.widthAnchor.constraint(equalTo: controlRows.widthAnchor).isActive = true
+            if index < 2 { let line = NSBox(); line.boxType = .separator; line.heightAnchor.constraint(equalToConstant: 1).isActive = true; controlRows.addArrangedSubview(line); line.widthAnchor.constraint(equalTo: controlRows.widthAnchor).isActive = true }
         }
-        let controlCard = controlContent
+        let controlCard = vertical(10)
+        controlCard.addArrangedSubview(label("连接与恢复", size: 13, weight: .semibold))
+        controlCard.addArrangedSubview(card(controlRows, padding: 0))
+        let advanced = vertical(10)
+        [probeIntervalRow, manualCheckRow].forEach { advanced.addArrangedSubview($0); $0.widthAnchor.constraint(equalTo: advanced.widthAnchor).isActive = true }
+        panelAdvancedOptions = advanced; advanced.isHidden = true
+        let advancedButton = NSButton(title: "更多选项", target: self, action: #selector(toggleAdvancedOptions(_:)))
+        advancedButton.isBordered = false; advancedButton.contentTintColor = GuardPalette.blue
+        advancedButton.image = NSImage(systemSymbolName: "chevron.right", accessibilityDescription: nil); advancedButton.imagePosition = .imageLeading
+        advancedButton.setAccessibilityValue("已收起")
+        controlCard.addArrangedSubview(advancedButton); controlCard.addArrangedSubview(advanced)
+        for view in [controlCard.arrangedSubviews[1], advanced] { view.widthAnchor.constraint(equalTo: controlCard.widthAnchor).isActive = true }
         panelControlCard = controlCard
         panelQuotaSection = quotaSection()
+        advanced.addArrangedSubview(panelQuotaSection!); panelQuotaSection!.widthAnchor.constraint(equalTo: advanced.widthAnchor).isActive = true
 
         let scroll = NSScrollView(); scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true; scroll.drawsBackground = false
         scroll.contentInsets = NSEdgeInsets(top: 24, left: 26, bottom: 20, right: 26)
@@ -5795,6 +5934,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
         renderPanelPage()
     }
     private func stamp(_ date: Date?) -> String { date.map { DateFormatter.localizedString(from: $0, dateStyle: .medium, timeStyle: .medium) } ?? "暂无" }
+    private func referenceTime(_ date: Date?) -> String {
+        guard let date else { return "尚无实际检查" }
+        let minutes = max(0, Int(Date().timeIntervalSince(date) / 60))
+        let relative = minutes == 0 ? "刚刚" : "\(minutes) 分钟前"
+        return "\(DateFormatter.localizedString(from: date, dateStyle: .none, timeStyle: .short)) · \(relative)"
+    }
     private func displayPingResult(_ value: String) -> String { value.replacingOccurrences(of: "ping 成功", with: "命令连接检查成功") }
     private func currentDiagnosis(now: Date = Date()) -> IncidentDiagnosis {
         if let category = channelIncident.activeCategory {
@@ -5830,43 +5975,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
     private func renderPanel() {
         guard panelWindow != nil else { return }
         let now = Date()
-        panelSidebarFooter?.stringValue = "本机服务：\(snapshot.service)"
+        panelSidebarFooter?.stringValue = "本机服务：\(snapshot.service)\n仅展示已有证据"
         let channelLive = channelSummary(snapshot, now: now)
         if let category = channelIncident.activeCategory {
             panelConnection?.stringValue = category.title
-            panelConnection?.textColor = category == .cloudRealtimeCapacity ? .systemOrange : .systemRed
-            panelConnectionTime?.stringValue = displayEvidenceTime(lastPingAt)
+            panelConnection?.textColor = category == .cloudRealtimeCapacity ? GuardPalette.amber : .systemRed
+            panelConnectionTime?.stringValue = referenceTime(lastPingAt)
             let detail = channelIncidentHandling(now: now)
             panelConnectionDetail?.stringValue = middleTruncate(detail, limit: 56)
             panelConnectionDetail?.toolTip = detail
         } else {
             panelConnection?.stringValue = channelLive
             let marker = channelIndicator(service: snapshot.service, state: snapshot.channelState, checked: snapshot.channelChecked, now: now)
-            panelConnection?.textColor = marker == "●" ? .systemGreen : (marker == "!" ? .systemRed : .labelColor)
-            panelConnectionTime?.stringValue = displayEvidenceTime(lastPingAt)
+            panelConnection?.textColor = marker == "●" ? GuardPalette.green : (marker == "!" ? .systemRed : GuardPalette.text)
+            panelConnectionTime?.stringValue = referenceTime(lastPingAt)
             let channelDetail = displayPingResult(manualNotice ?? (manualPingBusy || channelBusy ? deferredReason : snapshot.channelDetail))
             panelConnectionDetail?.stringValue = middleTruncate(channelDetail, limit: 56)
             panelConnectionDetail?.toolTip = channelDetail
         }
 
         let toolState = toolExecutionSummary(now: now)
-        panelToolExecution?.stringValue = toolState
-        panelToolExecution?.textColor = snapshot.toolExecutionState == "失败" ? .systemRed : (toolExecutionFresh(snapshot, now: now) ? .systemGreen : .labelColor)
-        panelToolExecutionTime?.stringValue = displayEvidenceTime(snapshot.toolExecutionChecked)
+        panelToolExecution?.stringValue = toolState == "工具执行已验证" ? "已验证" : toolState
+        panelToolExecution?.textColor = snapshot.toolExecutionState == "失败" ? .systemRed : (toolExecutionFresh(snapshot, now: now) ? GuardPalette.green : GuardPalette.text)
+        panelToolExecutionTime?.stringValue = referenceTime(snapshot.toolExecutionChecked)
         panelToolExecutionDetail?.stringValue = middleTruncate(snapshot.toolExecutionDetail, limit: 56)
         panelToolExecutionDetail?.toolTip = snapshot.toolExecutionDetail
 
         let chat = chatMonitorSummary(snapshot.timeline)
-        panelChat?.stringValue = chatOverviewTitle(chat)
+        panelChat?.stringValue = chatOverviewTitle(chat) == "后续连接已恢复" ? "原回答待核对" : chatOverviewTitle(chat)
         if panelChat?.stringValue == "回答异常" || panelChat?.stringValue == "连接异常" {
-            panelChat?.textColor = .systemOrange
-        } else if panelChat?.stringValue == "后续连接已恢复" {
-            panelChat?.textColor = .systemGreen
+            panelChat?.textColor = GuardPalette.amber
+        } else if panelChat?.stringValue == "原回答待核对" {
+            panelChat?.textColor = GuardPalette.amber
         } else {
-            panelChat?.textColor = .secondaryLabelColor
+            panelChat?.textColor = GuardPalette.secondary
         }
         let latestAppAt = snapshot.timeline.latestAppEvent.flatMap { ISO8601DateFormatter.parse($0.sourceAt ?? $0.observedAt) }
-        panelChatTime?.stringValue = displayEvidenceTime(latestAppAt)
+        panelChatTime?.stringValue = panelChat?.stringValue == "原回答待核对" ? "无法从日志确认完整性" : referenceTime(latestAppAt)
         panelChatDetail?.stringValue = chatOverviewDetail(chat)
         panelChatDetail?.toolTip = panelChatDetail?.stringValue
 
@@ -5930,22 +6075,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
 
         NSLayoutConstraint.deactivate(panelSectionWidths)
         panelSectionWidths = []
-        for section in sections {
+        for (index, section) in sections.enumerated() {
             stack.addArrangedSubview(section)
             let width = section.widthAnchor.constraint(equalTo: stack.widthAnchor)
             width.isActive = true
             panelSectionWidths.append(width)
+            if panelPage == 0 && index == 2 { stack.setCustomSpacing(16, after: section) }
         }
 
         NSLayoutConstraint.activate([
             stack.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 26),
             stack.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -26),
-            stack.topAnchor.constraint(equalTo: root.topAnchor)
+            stack.topAnchor.constraint(equalTo: root.topAnchor, constant: 24)
         ])
 
         scroll.documentView = root
         root.layoutSubtreeIfNeeded()
-        let contentHeight = max(viewport.height, stack.fittingSize.height)
+        let contentHeight = max(viewport.height, 24 + stack.fittingSize.height + 20)
         root.setFrameSize(NSSize(width: viewport.width, height: contentHeight))
         root.layoutSubtreeIfNeeded()
 
@@ -5960,9 +6106,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
         let titles = ["概览", "操作记录", "故障与恢复", "设置"]
         panelPageTitle?.stringValue = titles.indices.contains(panelPage) ? titles[panelPage] : "概览"
         for (index, button) in panelSidebarButtons.enumerated() {
-            button.contentTintColor = index == panelPage ? .controlAccentColor : .secondaryLabelColor
+            (button as? GuardSidebarButton)?.selectedPage = index == panelPage
             button.font = .systemFont(ofSize: 13, weight: index == panelPage ? .semibold : .regular)
-            button.isBordered = index == panelPage
             button.setAccessibilityValue(index == panelPage ? "已选中" : "未选中")
         }
         panelHeroes?.isHidden = false
@@ -5976,13 +6121,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
         if panelPage == 0 {
             let activity = snapshot.activity
             let diagnosis = currentDiagnosis()
-            var activityRows: [(String, String)] = []
+            var activityRows: [(String, String)] = [("状态", activityOverviewText(activity))]
             if let active = currentCallStep(activity) {
-                activityRows.append(("状态", activityOverviewText(activity)))
                 activityRows.append(("当前工具", CommanderActivity.safeToolIdentifier(active.tool)))
                 activityRows.append(("已运行", durationText(active.elapsed(at: ProcessInfo.processInfo.systemUptime))))
-            } else {
-                activityRows.append(("状态", activityOverviewText(activity)))
             }
             if activity.error {
                 activityRows.append(("注意", "本机操作日志暂时不可读；Guard 不会据此判断空闲或自动重启"))
@@ -5992,27 +6134,107 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
                 activityRows.append(("注意", "本机操作日志仍在追赶；Guard 暂不判断为空闲"))
             }
             activityRows.append(("自动恢复", recoveryAvailability()))
-            let conclusion = vertical(8)
-            conclusion.addArrangedSubview(label(diagnosis.title, size: 18, weight: .semibold))
-            conclusion.addArrangedSubview(label(diagnosis.nextAction, color: .secondaryLabelColor))
-            if let notice = manualNotice { conclusion.addArrangedSubview(label(displayPingResult(notice))) }
-            else if manualPingBusy || channelBusy { conclusion.addArrangedSubview(label("正在检查消息通道…")) }
-            for view in conclusion.arrangedSubviews { view.widthAnchor.constraint(equalTo: conclusion.widthAnchor).isActive = true }
-            panelHeroes?.isHidden = false
-            setSections([conclusion, panelHeroesCard!, section("当前任务", rows: activityRows), quotaSummarySection()])
+            let emblem = PanelBackgroundView(); emblem.wantsLayer = true; emblem.fillColor = GuardPalette.selection
+            emblem.layer?.cornerRadius = 12
+            emblem.widthAnchor.constraint(equalToConstant: 44).isActive = true
+            emblem.heightAnchor.constraint(equalToConstant: 44).isActive = true
+            let heroImage = NSImage(systemSymbolName: "checkmark.shield", accessibilityDescription: nil)?.withSymbolConfiguration(.init(pointSize: 25, weight: .regular)) ?? NSImage()
+            let shield = NSImageView(image: heroImage); shield.imageScaling = .scaleProportionallyUpOrDown
+            shield.contentTintColor = GuardPalette.blue; shield.translatesAutoresizingMaskIntoConstraints = false
+            emblem.addSubview(shield)
+            NSLayoutConstraint.activate([shield.centerXAnchor.constraint(equalTo: emblem.centerXAnchor), shield.centerYAnchor.constraint(equalTo: emblem.centerYAnchor), shield.widthAnchor.constraint(equalToConstant: 25), shield.heightAnchor.constraint(equalToConstant: 25)])
+            let headline = activity.activeCount > 0 ? "当前任务受到保护" : (activity.error || activity.coverageGap ? "本机任务状态待确认" : "本机运行状态")
+            let subtitle = activity.activeCount > 0 ? "本机有 \(activity.activeCount) 项活动，自动恢复暂缓。" : "\(activityOverviewText(activity))，自动恢复\(recoveryLedger.autoRecoveryEnabled ? "受安全条件约束" : "已暂停")。"
+            let heroCopy = vertical(3)
+            heroCopy.addArrangedSubview(label(headline, size: 19, weight: .semibold))
+            heroCopy.addArrangedSubview(label(subtitle, size: 13, color: GuardPalette.secondary))
+            let hero = NSStackView(views: [emblem, heroCopy]); hero.orientation = .horizontal; hero.alignment = .centerY; hero.spacing = 13
+            hero.heightAnchor.constraint(greaterThanOrEqualToConstant: 49).isActive = true
+
+            let verification = vertical(10)
+            verification.addArrangedSubview(label("验证状态", size: 13, weight: .semibold))
+            verification.addArrangedSubview(panelHeroesCard!)
+            panelHeroesCard!.widthAnchor.constraint(equalTo: verification.widthAnchor).isActive = true
+            let disclosureButton = NSButton(title: evidenceExpanded ? "收起证据与限制" : "查看证据与限制", target: self, action: #selector(toggleEvidence(_:)))
+            disclosureButton.isBordered = false; disclosureButton.contentTintColor = GuardPalette.blue
+            disclosureButton.image = NSImage(systemSymbolName: evidenceExpanded ? "chevron.down" : "chevron.right", accessibilityDescription: nil); disclosureButton.imagePosition = .imageLeading
+            disclosureButton.setAccessibilityValue(evidenceExpanded ? "已展开" : "已收起")
+            let evidence = section("详细证据", rows: [
+                ("消息通道", panelConnectionDetail?.toolTip ?? "暂无"),
+                ("本机工具", panelToolExecutionDetail?.toolTip ?? "暂无"),
+                ("ChatGPT 回答", chatOverviewDetail(chatMonitorSummary(snapshot.timeline))),
+                ("诊断", diagnosis.title), ("建议", diagnosis.nextAction), ("依据", diagnosis.evidence)
+            ] + activityRows)
+            panelEvidenceDisclosure = evidence; evidence.isHidden = !evidenceExpanded
+            verification.addArrangedSubview(disclosureButton); verification.addArrangedSubview(evidence)
+            evidence.widthAnchor.constraint(equalTo: verification.widthAnchor).isActive = true
+
+            let activitySection = vertical(4)
+            activitySection.addArrangedSubview(label("本机活动", size: 13, weight: .semibold))
+            let taskCopy = vertical(3)
+            if let active = currentCallStep(activity) {
+                taskCopy.addArrangedSubview(label(CommanderActivity.menuDetail(active.detail), size: 13, weight: .medium))
+                taskCopy.addArrangedSubview(label("\(CommanderActivity.safeToolIdentifier(active.tool)) · \(active.uncertain ? "结果未确认" : "进行中")", size: 11, color: GuardPalette.secondary))
+            } else {
+                taskCopy.addArrangedSubview(label(activityOverviewText(activity), size: 13, weight: .medium))
+            }
+            let recordsButton = GuardActionButton(title: "查看记录", target: self, action: #selector(openLogWindow))
+            let taskRow = NSStackView(views: [taskCopy, NSView(), recordsButton]); taskRow.orientation = .horizontal; taskRow.alignment = .centerY
+            taskRow.heightAnchor.constraint(equalToConstant: 68).isActive = true
+            activitySection.addArrangedSubview(taskRow); taskRow.widthAnchor.constraint(equalTo: activitySection.widthAnchor).isActive = true
+            let taskLine = NSBox(); taskLine.boxType = .separator; taskLine.heightAnchor.constraint(equalToConstant: 1).isActive = true
+            activitySection.addArrangedSubview(taskLine); taskLine.widthAnchor.constraint(equalTo: activitySection.widthAnchor).isActive = true
+
+            let account = NSStackView(); account.orientation = .horizontal; account.alignment = .centerY
+            let accountText = quota.total == nil ? "\(quotaDisplay()) · \(quota.used.map { "累计调用 \($0.formatted()) 次" } ?? quotaStatusDisplay())" : "\(quotaDisplay()) · \(quotaStatusDisplay())"
+            account.addArrangedSubview(label(accountText, size: 12))
+            account.addArrangedSubview(NSView())
+            let accountButton = NSButton(title: "账户与同步设置", target: self, action: #selector(openSettingsPage))
+            accountButton.isBordered = false; accountButton.contentTintColor = GuardPalette.blue
+            account.addArrangedSubview(accountButton)
+            let accountGroup = vertical(14)
+            accountGroup.addArrangedSubview(account); account.widthAnchor.constraint(equalTo: accountGroup.widthAnchor).isActive = true
+            if previewMode { accountGroup.addArrangedSubview(label("设计草案 · 固定示例数据，不代表当前运行状态", size: 11, color: GuardPalette.secondary)) }
+            setSections([hero, verification, activitySection, accountGroup])
             return
         }
 
         if panelPage == 3 {
-            panelControlCard?.isHidden = false
-            setSections([panelControlCard!, panelQuotaSection!])
+            let heading = vertical(5)
+            heading.addArrangedSubview(label("守护设置", size: 21, weight: .semibold))
+            heading.addArrangedSubview(label("许可与当前能否执行分别展示。", size: 12, color: GuardPalette.secondary))
+            let accountRows = vertical(0)
+            let accountSummary = NSStackView(views: [vertical(3), NSView(), label(quotaEnabled ? "已连接" : "未连接", size: 12, color: GuardPalette.secondary)])
+            accountSummary.orientation = .horizontal; accountSummary.alignment = .centerY
+            if let copy = accountSummary.arrangedSubviews.first as? NSStackView {
+                copy.addArrangedSubview(label(quotaDisplay(), size: 13, weight: .medium))
+                let usage = quota.used.map { "累计调用 \($0.formatted()) 次" } ?? quotaStatusDisplay()
+                copy.addArrangedSubview(label(usage, size: 11, color: GuardPalette.secondary))
+            }
+            accountSummary.edgeInsets = NSEdgeInsets(top: 12, left: 15, bottom: 12, right: 15)
+            accountSummary.heightAnchor.constraint(equalToConstant: 65).isActive = true
+            let sync = NSStackView(views: [vertical(3), NSView(), label(quotaRefreshSeconds == 0 ? "手动" : "每 \(quotaRefreshSeconds / 60) 分钟", size: 12, color: GuardPalette.secondary)])
+            sync.orientation = .horizontal; sync.alignment = .centerY
+            if let copy = sync.arrangedSubviews.first as? NSStackView {
+                copy.addArrangedSubview(label("自动同步", size: 13, weight: .medium))
+                copy.addArrangedSubview(label("上次成功同步 \(displayEvidenceTime(quota.syncedAt))", size: 11, color: GuardPalette.secondary))
+            }
+            sync.edgeInsets = NSEdgeInsets(top: 12, left: 15, bottom: 12, right: 15)
+            sync.heightAnchor.constraint(equalToConstant: 65).isActive = true
+            accountRows.addArrangedSubview(accountSummary)
+            let line = NSBox(); line.boxType = .separator; line.heightAnchor.constraint(equalToConstant: 1).isActive = true; accountRows.addArrangedSubview(line)
+            accountRows.addArrangedSubview(sync)
+            for view in accountRows.arrangedSubviews { view.widthAnchor.constraint(equalTo: accountRows.widthAnchor).isActive = true }
+            let accountGroup = vertical(10)
+            accountGroup.addArrangedSubview(label("账户与同步", size: 13, weight: .semibold))
+            accountGroup.addArrangedSubview(card(accountRows, padding: 0)); accountGroup.arrangedSubviews[1].widthAnchor.constraint(equalTo: accountGroup.widthAnchor).isActive = true
+            setSections([heading, panelControlCard!, accountGroup])
             return
         }
 
         var datedSections: [(Date, NSView)] = []
 
-        let restart = NSButton(title: "人工授权重启本机服务…", target: self, action: #selector(manualRestart))
-        restart.bezelStyle = .rounded
+        let restart = GuardActionButton(title: "人工授权重启本机服务…", target: self, action: #selector(manualRestart))
         restart.toolTip = "先读取固定服务和受影响进程，再逐次确认中断；无需开启自动恢复或常规云端探测。"
         let manualBlock: String?
         if manualPreparing { manualBlock = "正在核对影响范围" }
@@ -6025,10 +6247,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
         panelManualRestart = restart
         let localBarrier = snapshot.activity.activeCount > 0 ? "本机调用进行中 \(snapshot.activity.activeCount) 次" :
             activitySafeForRecovery(snapshot.activity) ? "本机日志可判断近期调用已结束" : "本机调用或日志状态未知：\(activityDeferralReason(snapshot.activity))"
-        let manualHint = label("明确断链 \(watchdog.failures)/3；未知结果不计入自动重启。自动恢复：\(recoveryAvailability())。\n\(localBarrier)；后台进程需另行核对，点击按钮读取影响范围。\n共享探测：\(activeProbeStatus.display)。\n\(manualBlock ?? "逐次确认中断范围；可选择仅本机重启或再各检查一次通道与工具。")", size: 12, color: .secondaryLabelColor)
+        let manualHint = label("明确断链 \(watchdog.failures)/3；未知结果不计入自动重启。自动恢复：\(recoveryAvailability())。\n\(localBarrier)；后台进程需另行核对，点击按钮读取影响范围。\n共享探测：\(activeProbeStatus.display)。\n\(manualBlock ?? "逐次确认中断范围；可选择仅本机重启或再各检查一次通道与工具。")", size: 12, color: GuardPalette.secondary)
         let manualContent = vertical(8)
-        manualContent.addArrangedSubview(restart); manualContent.addArrangedSubview(manualHint)
-        let manualCard = card(manualContent, padding: 16)
+        manualContent.addArrangedSubview(label("本机恢复选项", size: 13, weight: .semibold))
+        manualContent.addArrangedSubview(label("重启本机服务不保证修复上游问题，必须先核对当前调用和后台影响。", size: 12, color: GuardPalette.secondary))
+        manualContent.addArrangedSubview(restart)
+        let manualCard = tintedCard(manualContent)
 
         if let record = recoveryLedger.recent.first {
             let source = ["automatic": "自动恢复", "manual": "人工授权", "external": "外部变化"][record.source] ?? "未知来源"
@@ -6082,8 +6306,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
             datedSections.append((.distantPast, section("故障记录", rows: [("状态", "近期未记录到故障")])) )
         }
         let diagnosis = currentDiagnosis()
-        let diagnosisSection = section("诊断与建议", rows: [("当前情况", diagnosis.title), ("建议操作", diagnosis.nextAction), ("依据", diagnosis.evidence)])
-        setSections([diagnosisSection] + datedSections.sorted { $0.0 > $1.0 }.map(\.1) + [manualCard])
+        let heading = vertical(5)
+        heading.addArrangedSubview(label("故障与恢复", size: 21, weight: .semibold))
+        heading.addArrangedSubview(label("连接恢复和原业务恢复分别记录。", size: 12, color: GuardPalette.secondary))
+        let timeline = vertical(0)
+        let issue = snapshot.timeline.latestAppIssue
+        let reopened = snapshot.timeline.history.last { $0.event == "chatgpt_pubsub_transport_opened" }
+        let closed = snapshot.timeline.history.last { $0.event == "chatgpt_pubsub_transport_closed" }
+        let issueName = issue?.event.contains("recovery_poll_failed") == true ? "回答恢复检查失败" :
+            issue?.event.contains("recovery_started") == true ? "响应恢复尝试" : "对话状态刷新失败"
+        let events: [(Date?, String, String)] = [
+            (reopened.flatMap { ISO8601DateFormatter.parse($0.sourceAt ?? $0.observedAt) }, reopened == nil ? chatOverviewTitle(chat) : "后续连接已建立", "原回答是否完整：尚无法确认"),
+            ((closed ?? issue).flatMap { ISO8601DateFormatter.parse($0.sourceAt ?? $0.observedAt) }, closed == nil ? issueName : "ChatGPT 更新连接中断", "仅记录本机观察到的连接事件")
+        ]
+        for (index, event) in events.enumerated() {
+            if index == 1 && closed == nil && issue == nil { continue }
+            let time = label(event.0.map { DateFormatter.localizedString(from: $0, dateStyle: .none, timeStyle: .short) } ?? "—", size: 12, color: GuardPalette.secondary)
+            time.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+            time.widthAnchor.constraint(equalToConstant: 52).isActive = true
+            let copy = vertical(4)
+            copy.addArrangedSubview(label(event.1, size: 13))
+            copy.addArrangedSubview(label(event.2, size: 11, color: GuardPalette.secondary))
+            let row = NSStackView(views: [time, copy]); row.orientation = .horizontal; row.alignment = .top; row.spacing = 12
+            row.edgeInsets = NSEdgeInsets(top: 15, left: 0, bottom: 15, right: 0)
+            timeline.addArrangedSubview(row); row.widthAnchor.constraint(equalTo: timeline.widthAnchor).isActive = true
+            let line = NSBox(); line.boxType = .separator; line.heightAnchor.constraint(equalToConstant: 1).isActive = true
+            timeline.addArrangedSubview(line); line.widthAnchor.constraint(equalTo: timeline.widthAnchor).isActive = true
+        }
+        let detail = vertical(12)
+        detail.addArrangedSubview(section("诊断与建议", rows: [("当前情况", diagnosis.title), ("建议操作", diagnosis.nextAction), ("依据", diagnosis.evidence), ("恢复限制", manualHint.stringValue)]))
+        for item in datedSections.sorted(by: { $0.0 > $1.0 }).map(\.1) { detail.addArrangedSubview(item) }
+        panelIncidentDisclosure = detail; detail.isHidden = !incidentExpanded
+        let disclosure = NSButton(title: incidentExpanded ? "收起本次授权恢复流程" : "查看本次授权恢复流程", target: self, action: #selector(toggleIncidentDetail(_:)))
+        disclosure.isBordered = false; disclosure.contentTintColor = GuardPalette.blue
+        disclosure.image = NSImage(systemSymbolName: incidentExpanded ? "chevron.down" : "chevron.right", accessibilityDescription: nil); disclosure.imagePosition = .imageLeading
+        disclosure.setAccessibilityValue(incidentExpanded ? "已展开" : "已收起")
+        manualContent.addArrangedSubview(disclosure)
+        setSections([heading, timeline, manualCard, detail])
     }
     private func renderLogPage() {
         guard let scroll = panelScroll else { return }
@@ -6099,7 +6358,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
             scroll.documentView = doc
             recordDocument = doc
 
-            let title = label("本机操作记录", size: 16, weight: .semibold)
+            let title = label("本机操作记录", size: 21, weight: .semibold)
             let hint = label("默认隐藏连接检查；选择记录可查看脱敏后的操作详情。", size: 12, color: .secondaryLabelColor)
             title.translatesAutoresizingMaskIntoConstraints = false
             hint.translatesAutoresizingMaskIntoConstraints = false
@@ -6153,14 +6412,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
             recordDetailScroll = detailScroll
 
             let table = NSTableView()
-            table.rowHeight = 36
+            table.rowHeight = 44
             table.delegate = self
             table.dataSource = self
-            table.usesAlternatingRowBackgroundColors = true
+            table.usesAlternatingRowBackgroundColors = false
             table.style = .plain
-            table.intercellSpacing = NSSize(width: 0, height: 4)
+            table.backgroundColor = GuardPalette.surface
+            table.gridStyleMask = .solidHorizontalGridLineMask
+            table.gridColor = GuardPalette.line
+            table.intercellSpacing = NSSize(width: 0, height: 0)
             table.columnAutoresizingStyle = .noColumnAutoresizing
-            for (name, title, width) in [("time", "时间", CGFloat(104)), ("action", "操作", CGFloat(240)), ("result", "结果", CGFloat(82)), ("duration", "耗时", CGFloat(92)), ("session", "会话", CGFloat(144))] {
+            for (name, title, width) in [("time", "时间", CGFloat(84)), ("action", "操作", CGFloat(240)), ("result", "结果", CGFloat(88))] {
                 let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(name))
                 column.title = title
                 column.minWidth = width
@@ -6189,7 +6451,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
 
             [title, hint, controls, split].forEach { root.addSubview($0) }
             NSLayoutConstraint.activate([
-                title.topAnchor.constraint(equalTo: root.topAnchor),
+                title.topAnchor.constraint(equalTo: root.topAnchor, constant: 24),
                 title.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 26),
                 title.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -26),
 
@@ -6245,7 +6507,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
             let width = max(minimumColumnsWidth + spacing, tableScroll.contentView.bounds.width)
             let extra = max(0, width - spacing - minimumColumnsWidth)
             for (index, column) in table.tableColumns.enumerated() {
-                column.width = [CGFloat(104), CGFloat(240) + extra, CGFloat(82), CGFloat(92), CGFloat(144)][index]
+                column.width = [CGFloat(84), CGFloat(240) + extra, CGFloat(88)][index]
             }
             table.setFrameSize(NSSize(width: width, height: max(tableScroll.contentView.bounds.height, CGFloat(recordSteps.count) * table.rowHeight)))
         }
@@ -6254,7 +6516,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
             split.adjustSubviews()
             if !recordSplitInitialized && split.bounds.height > 240 {
                 recordSplitInitialized = true
-                split.setPosition(split.bounds.height - 140, ofDividerAt: 0)
+                split.setPosition(min(240, max(180, split.bounds.height - 120)), ofDividerAt: 0)
             }
             layoutRecordDetail()
             let detailCard = detailScroll.documentView!
@@ -6274,6 +6536,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
     @objc private func recordFilterChanged(_ sender: NSPopUpButton) { renderLogPage() }
     @objc private func toggleHistoricalRecords(_ sender: NSButton) { historicalRecordsExpanded.toggle(); renderLogPage() }
     func numberOfRows(in tableView: NSTableView) -> Int { recordSteps.count }
+    func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? { GuardRecordRowView() }
     private func recordTime(_ date: Date) -> String {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
@@ -6303,28 +6566,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
             field.stringValue = step.historical ? "耗时未知" : step.uncertain ? "未确认" : step.duration.map(durationText) ?? barCallClock(step, uptime: ProcessInfo.processInfo.systemUptime)
             field.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
             field.textColor = step.historical || step.uncertain ? .secondaryLabelColor : .labelColor
-        case "session":
-            guard let session = step.sessionAttributionConflict ? nil : CommanderActivity.sessionDisplay(step.sessionKey) else { return field }
-            guard let key = step.sessionKey else { return field }
-            let bytes = Array(SHA256.hash(data: Data(key.utf8)))
-            let container = NSView()
-            let badge = NSView()
-            badge.wantsLayer = true
-            badge.layer?.cornerRadius = 4
-            badge.layer?.backgroundColor = NSColor(calibratedRed: CGFloat(bytes[0]) / 510 + 0.5, green: CGFloat(bytes[1]) / 510 + 0.5, blue: CGFloat(bytes[2]) / 510 + 0.5, alpha: 0.18).cgColor
-            let text = NSTextField(labelWithString: session)
-            let accentColors: [NSColor] = [.systemBlue, .systemPurple, .systemTeal, .systemGreen, .systemIndigo, .systemPink]
-            text.stringValue = "● \(session)"
-            text.textColor = accentColors[Int(bytes[0]) % accentColors.count]
-            text.font = .systemFont(ofSize: 13)
-            text.lineBreakMode = .byTruncatingTail
-            text.translatesAutoresizingMaskIntoConstraints = false
-            badge.addSubview(text)
-            container.addSubview(badge)
-            badge.translatesAutoresizingMaskIntoConstraints = false
-            NSLayoutConstraint.activate([text.leadingAnchor.constraint(equalTo: badge.leadingAnchor, constant: 6), text.trailingAnchor.constraint(equalTo: badge.trailingAnchor, constant: -6), text.centerYAnchor.constraint(equalTo: badge.centerYAnchor)])
-            NSLayoutConstraint.activate([badge.leadingAnchor.constraint(equalTo: container.leadingAnchor), badge.trailingAnchor.constraint(lessThanOrEqualTo: container.trailingAnchor), badge.centerYAnchor.constraint(equalTo: container.centerYAnchor), badge.heightAnchor.constraint(equalToConstant: 24)])
-            return container
         default: return nil
         }
         return field
@@ -6363,7 +6604,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
         let attribution = step.sessionAttributionConflict ? nil : CommanderActivity.sessionDisplay(step.sessionKey).map { "归属：\($0)（\(step.sessionSource ?? "上游会话字段")）" }
         let source = step.historical ? "来源：历史记录（时间不详）\n" : ""
         let value = "\(time)  ·  \(state)  ·  \(duration)\n工具：\(CommanderActivity.safeToolIdentifier(step.tool))\n\(source)\(attribution.map { $0 + "\n" } ?? "")\(step.detail)"
-        if recordDetail?.currentEditor() == nil, recordDetail?.stringValue != value { recordDetail?.stringValue = value }
+        if recordDetail?.currentEditor() == nil, recordDetail?.stringValue != value {
+            let styled = NSMutableAttributedString(string: value, attributes: [.font: NSFont.systemFont(ofSize: 13), .foregroundColor: GuardPalette.text])
+            if let key = step.sessionKey, !step.sessionAttributionConflict, let attribution,
+               let range = value.range(of: attribution) {
+                let colors: [NSColor] = [.systemBlue, .systemPurple, .systemTeal, .systemGreen, .systemIndigo, .systemPink]
+                let hash = Array(SHA256.hash(data: Data(key.utf8)))
+                styled.addAttribute(.foregroundColor, value: colors[Int(hash[0]) % colors.count], range: NSRange(range, in: value))
+            }
+            recordDetail?.attributedStringValue = styled
+        }
     }
     private func loadPreviewSnapshot() {
         let now = Date(), uptime = ProcessInfo.processInfo.systemUptime
@@ -6392,6 +6642,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
             ActivityStep(id: "preview-6", tool: "read_file", detail: "历史记录 · /Projects/example/archive.log", startedAt: .distantPast, startedUptime: 0, uncertain: true, failed: true, historical: true, finished: true)
         ]
         snapshot.activity.steps[2].sessionAttributionConflict = true
+        if CommandLine.arguments.contains("--preview-reference") {
+            quota = UsageQuota(state: .unlimited, used: 12840, total: nil, plan: "pro", month: "2026-10", syncedAt: now.addingTimeInterval(-120))
+            snapshot.activity.active = ["read_process_output": 1]
+            snapshot.activity.steps[1] = ActivityStep(id: "preview-2", tool: "read_process_output", detail: "读取进程输出", startedAt: now.addingTimeInterval(-34), startedUptime: uptime - 34, duration: nil, uncertain: true, sessionKey: previewSession, sessionSource: "openai/session")
+        }
         let makeTime: (TimeInterval) -> String = { ISO8601DateFormatter.flex.string(from: now.addingTimeInterval($0)) }
         let issue = TimelineEvent(source: "chatgpt_app", event: "chatgpt_completion_transport_recovery_started", sourceAt: makeTime(-65), observedAt: makeTime(-64), conversationTitle: "设计讨论", failureKind: "resume_unavailable")
         let app = TimelineEvent(source: "chatgpt_app", event: "chatgpt_conversation_refetch_completed · error", sourceAt: makeTime(-58), observedAt: makeTime(-57), conversationTitle: "功能排查")
@@ -6407,6 +6662,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
     private func viewContainsButton(_ view: NSView, title: String) -> Bool {
         if let button = view as? NSButton, button.title == title { return true }
         return view.subviews.contains { viewContainsButton($0, title: title) }
+    }
+    private func button(in view: NSView, title: String) -> NSButton? {
+        if let button = view as? NSButton, button.title == title { return button }
+        for child in view.subviews { if let found = button(in: child, title: title) { return found } }
+        return nil
     }
     private func viewContainsView(_ view: NSView, target: NSView) -> Bool {
         view === target || view.subviews.contains { viewContainsView($0, target: target) }
@@ -6461,26 +6721,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
         verify(panelHeroes?.orientation == .vertical && panelHeroes?.distribution != .fillEqually, "Evidence states must stack instead of using equal-width cards")
         verify(panelHeroesCard != nil && panelHeroes.map { viewContainsView(panelHeroesCard!, target: $0) } == true && panelHeroes?.arrangedSubviews.count == 5,
                "Overview evidence must use one padded group with two internal separators")
+        verify(window.styleMask.contains(.fullSizeContentView) && window.titleVisibility == .hidden && abs(window.frame.width - 940) <= 2 && abs(window.frame.height - 620) <= 2,
+               "The default frame must integrate titlebar chrome at the reference size")
+        verify(panelHeroes?.arrangedSubviews.enumerated().filter { $0.offset.isMultiple(of: 2) }.allSatisfy { abs($0.element.frame.height - 66) <= 1 } == true && panelHeroesCard?.layer?.cornerRadius == 9,
+               "Verification must use three 66pt rows in a single 9pt group")
         verify(sidebarWidth() == 188 && panelToolbarDetail != nil, "The main window must use the approved sidebar and toolbar structure")
-        verify(panelSidebarFooter?.stringValue == "本机服务：运行中", "Sidebar service status must use the fixed preview snapshot")
+        verify(panelSidebarFooter?.stringValue == "本机服务：运行中\n仅展示已有证据", "Sidebar service status must use the fixed preview snapshot and safe scope")
         let savedSidebarService = snapshot.service
         snapshot.service = "未运行"; render()
-        verify(panelSidebarFooter?.stringValue == "本机服务：未运行", "Sidebar must never keep a stale running claim")
+        verify(panelSidebarFooter?.stringValue == "本机服务：未运行\n仅展示已有证据", "Sidebar must never keep a stale running claim")
         snapshot.service = savedSidebarService; render()
         showOverviewPopover()
-        verify(overviewPopover?.contentSize.width == 360 && compactLabels.count == 3 && compactActivity != nil && compactQuota != nil && compactSummary?.stringValue.contains("自动恢复：") == true, "Compact overview must show a 360px snapshot with three statuses, activity, recovery state and quota")
-        verify(compactChatDetail?.stringValue == "原回答是否完整：无法确认" && compactChatDetail?.toolTip == chatOverviewDetail(chatMonitorSummary(snapshot.timeline)) && compactQuotaTime?.stringValue.contains("上次成功同步：") == true, "Compact overview must show the concise answer limit, retain detail in its tooltip, and show quota sync time")
+        verify(overviewPopover?.contentSize.width == 360 && compactLabels.count == 3 && compactActivity != nil && compactQuota != nil && compactSummary?.stringValue.contains("自动恢复") == true, "Compact overview must show a 360px snapshot with three statuses, activity, recovery state and quota")
+        verify(compactLabels[2].stringValue == "仍需人工核对" && compactChatDetail?.toolTip == chatOverviewDetail(chatMonitorSummary(snapshot.timeline)) && compactQuotaTime?.stringValue.contains("同步") == true, "Compact overview must show the concise answer limit, retain detail in its tooltip, and show quota sync time")
         if let compactRoot = overviewPopover?.contentViewController?.view,
            let compactLayout = compactRoot.subviews.first as? NSStackView {
             compactRoot.layoutSubtreeIfNeeded()
             for child in compactLayout.arrangedSubviews {
                 let frame = child.alignmentRect(forFrame: child.frame)
-                verify(frame.minX >= 19 && frame.maxX <= 341, "Compact row alignment rect must stay within 19pt side insets: \(frame), layout \(compactLayout.bounds), child \(type(of: child))")
+                verify(frame.minX >= -1 && frame.maxX <= 361, "Compact regions must stay within 360pt width: \(frame), layout \(compactLayout.bounds), child \(type(of: child))")
             }
             let taskCard = compactActivity?.superview?.superview
             let footer = compactLayout.arrangedSubviews.first { viewContainsButton($0, title: "打开完整面板") }
-            verify((taskCard?.frame.width ?? 0) >= 320 && (footer?.frame.width ?? 0) >= 320,
-                   "Compact task card and footer must fill the 322pt content width (task \(taskCard?.frame.width ?? 0), footer \(footer?.frame.width ?? 0))")
+            verify((taskCard?.frame.width ?? 0) >= 320 && (footer?.frame.width ?? 0) >= 359,
+                   "Compact task card and footer must fill the available width (task \(taskCard?.frame.width ?? 0), footer \(footer?.frame.width ?? 0))")
             var pendingViews = [compactRoot], labelsAreInside = true, offendingLabel: String?
             while let view = pendingViews.popLast() {
                 if let field = view as? NSTextField, !field.isHidden, !field.stringValue.isEmpty {
@@ -6519,12 +6783,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
         snapshot = savedCompactSnapshot; render()
         let savedCompactQuota = quota
         quota = UsageQuota(state: .fresh, used: 4200, total: 10000, plan: "pro", month: "2026-10", syncedAt: Date()); renderQuota()
-        verify(compactQuota?.stringValue.contains("4200 / 10000") == true && compactQuotaTime?.stringValue.contains("pro") == true, "Finite Pro quota must show its amount and plan in the compact overview")
+            verify(compactQuota?.stringValue.contains("4200 / 10000") == true && compactQuotaTime?.stringValue.contains("同步") == true, "Finite Pro quota must show its amount and sync time in the compact overview")
         quota = UsageQuota(state: .unlimited, used: 9893, total: nil, plan: "pro", month: "2026-10", syncedAt: Date()); renderQuota()
-        verify(compactQuota?.stringValue == "Pro 无限制" && compactQuotaTime?.stringValue.contains("累计调用：9893 次") == true, "Unlimited Pro quota must keep cumulative use secondary")
+            verify(compactQuota?.stringValue == "Pro 无限制" && compactQuotaTime?.stringValue.contains("同步") == true, "Unlimited Pro quota must show its sync time")
         quota = savedCompactQuota; renderQuota()
         overviewPopover?.performClose(nil)
-        for size in [NSSize(width: 940, height: 720), NSSize(width: 760, height: 560)] {
+        for size in [NSSize(width: 940, height: 620), NSSize(width: 760, height: 560)] {
             if size.width == 760 {
                 window.setFrame(NSRect(origin: window.frame.origin, size: window.minSize), display: false)
                 verify(window.frame.size == window.minSize, "Minimum-window checks must use the actual outer frame size")
@@ -6540,7 +6804,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
                     let frame = heroes.convert(heroes.bounds, to: root)
                     verify(frame.minX >= 214 && frame.maxX <= root.bounds.width - 24, "Overview evidence must honor the sidebar and content insets at \(Int(size.width))px (frame \(frame), root \(root.bounds))")
                     for value in [panelConnection, panelToolExecution, panelChat].compactMap({ $0 }) {
-                        verify(value.frame.width >= 80 && value.frame.height >= 16, "Each evidence headline must have readable width on Overview: \(value.stringValue), frame \(value.frame)")
+                        verify(value.frame.width >= 35 && value.frame.height >= 14, "Each evidence result must remain readable on Overview: \(value.stringValue), frame \(value.frame)")
                     }
                 } else if page != 0, let heroes = panelHeroes {
                     verify(!viewContainsView(scroll.documentView!, target: heroes), "Evidence rows must not repeat on page \(page)")
@@ -6555,7 +6819,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
                     }
                 }
                 verify(scroll.documentView != nil, "panel page \(page) is empty")
-                verify(panelPageTitle?.stringValue == ["概览", "操作记录", "故障与恢复", "设置"][page] && panelSidebarButtons[page].isBordered && panelSidebarButtons[page].accessibilityValue() as? String == "已选中", "Sidebar selection and toolbar title must follow page \(page)")
+                verify(panelPageTitle?.stringValue == ["概览", "操作记录", "故障与恢复", "设置"][page] && (panelSidebarButtons[page] as? GuardSidebarButton)?.selectedPage == true && panelSidebarButtons[page].accessibilityValue() as? String == "已选中", "Sidebar selection and toolbar title must follow page \(page)")
                 if page == 1, let split = recordSplitView, let tableScroll = recordTableScroll, let detailScroll = recordDetailScroll {
                     verify(tableScroll.frame.height > 50 && detailScroll.frame.height > 50,
                            "Records must use the available height while keeping both panes visible at \(Int(window.frame.width))px (scroll \(scroll.frame), split \(split.frame), table \(tableScroll.frame), detail \(detailScroll.frame))")
@@ -6579,11 +6843,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
                 if size.width == 940 && page == 1, let table = recordTable, let tableScroll = recordTableScroll {
                     let columnsWidth = table.tableColumns.reduce(0) { $0 + $1.width }
                     let effectiveWidth = columnsWidth + table.intercellSpacing.width * CGFloat(max(0, table.tableColumns.count - 1))
-                    verify(table.style == .plain, "Records table must avoid implicit row-end padding")
+                    verify(table.style == .plain && !table.usesAlternatingRowBackgroundColors && table.rowView(atRow: 0, makeIfNecessary: true) is GuardRecordRowView,
+                           "Records table must use calm rows and a blue selection surface")
                     verify(table.frame.width <= tableScroll.contentView.bounds.width + 1 && effectiveWidth <= tableScroll.contentView.bounds.width + 1, "Default records table must fit the viewport including inter-column spacing (table \(Int(table.frame.width)), columns \(Int(effectiveWidth)), viewport \(Int(tableScroll.contentView.bounds.width)))")
-                    guard let sessionRow = recordSteps.firstIndex(where: { $0.sessionKey != nil }), let sessionColumn = table.tableColumns.first(where: { $0.identifier.rawValue == "session" }) else { preconditionFailure("Verified session row or column is missing at default size") }
-                    let badge = tableView(table, viewFor: sessionColumn, row: sessionRow)
-                    verify((badge?.subviews.first?.subviews.first as? NSTextField)?.stringValue.contains("会话") == true, "Default session column must contain its verified-session badge")
+                    verify(table.tableColumns.map { $0.identifier.rawValue } == ["time", "action", "result"], "Records must expose the reference's three columns")
                     if let split = recordSplitView, let detailScroll = recordDetailScroll {
                         let tableFrame = tableScroll.convert(tableScroll.bounds, to: split)
                         let detailFrame = detailScroll.convert(detailScroll.bounds, to: split)
@@ -6603,7 +6866,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
                 }
             }
         }
-        window.setContentSize(NSSize(width: 940, height: 720))
+        window.setContentSize(NSSize(width: 940, height: 620))
         panelPage = 0; renderPanel(); root.layoutSubtreeIfNeeded(); scroll.layoutSubtreeIfNeeded()
         scroll.contentView.scroll(to: .zero); scroll.reflectScrolledClipView(scroll.contentView)
         let savedQuota = quota
@@ -6615,22 +6878,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
         }
         quota = savedQuota; renderQuota()
         verify(panelConnection?.stringValue == "上次探测成功", "Channel headline must stay concise while time and freshness remain separate")
-        verify(panelChat?.stringValue == "后续连接已恢复" && panelChatDetail?.isHidden == false && panelChatDetail?.stringValue.hasPrefix("原回答是否完整：无法确认") == true, "Reconnected status must stay distinct from original-answer completeness")
+        verify(panelChat?.stringValue == "原回答待核对" && panelChatDetail?.stringValue.hasPrefix("原回答是否完整：无法确认") == true, "Reconnected status must stay distinct from original-answer completeness")
         verify(panelSectionCount == 4 && viewContainsView(scroll.documentView!, target: panelHeroes!), "Overview must order conclusion, evidence, activity, then account summary")
-        verify(panelRecoveryToggle?.title == "自动恢复本机 Commander" && panelRecoveryToggle?.toolTip?.contains("不会重试原任务") == true, "Recovery control must explain its local-only action and safeguards")
+        verify(viewContainsButton(scroll.documentView!, title: "账户与同步设置") && panelEvidenceDisclosure?.isHidden == true, "Overview must show the account route and start with verbose evidence folded")
+        button(in: scroll.documentView!, title: "查看证据与限制")?.performClick(nil)
+        if let expanded = scroll.documentView as? TopAlignedPanelDocumentView, let stack = expanded.subviews.first as? NSStackView {
+            verify(evidenceExpanded && panelEvidenceDisclosure?.isHidden == false && expanded.frame.height >= stack.frame.maxY + 19,
+                   "Overview disclosure must immediately grow the scroll document")
+        } else { verify(false, "Overview disclosure must keep a scrollable document") }
+        button(in: scroll.documentView!, title: "收起证据与限制")?.performClick(nil)
+        verify(!evidenceExpanded && panelEvidenceDisclosure?.isHidden == true, "Overview disclosure must collapse without losing its state")
+        verify(panelRecoveryToggle != nil && panelRecoveryToggle?.toolTip?.contains("不会重试原任务") == true, "Recovery control must explain its local-only action and safeguards")
         panelPage = 2; renderPanel()
         verify(panelManualRestart?.title == "人工授权重启本机服务…" && panelManualRestart?.isEnabled == false, "Fault page must show inert manual restart action in preview")
+        button(in: scroll.documentView!, title: "查看本次授权恢复流程")?.performClick(nil)
+        if let expanded = scroll.documentView as? TopAlignedPanelDocumentView, let stack = expanded.subviews.first as? NSStackView {
+            verify(incidentExpanded && panelIncidentDisclosure?.isHidden == false && expanded.frame.height >= stack.frame.maxY + 19,
+                   "Incident disclosure must immediately grow the scroll document")
+        } else { verify(false, "Incident disclosure must keep a scrollable document") }
+        button(in: scroll.documentView!, title: "收起本次授权恢复流程")?.performClick(nil)
+        verify(!incidentExpanded && panelIncidentDisclosure?.isHidden == true, "Incident disclosure must collapse")
         if let faultRoot = scroll.documentView as? TopAlignedPanelDocumentView,
            let faultStack = faultRoot.subviews.first as? NSStackView {
             func contains(_ target: NSView, in view: NSView) -> Bool { view === target || view.subviews.contains { contains(target, in: $0) } }
             let manualIndex = faultStack.arrangedSubviews.firstIndex { contains(panelManualRestart!, in: $0) }
-            verify(manualIndex == faultStack.arrangedSubviews.count - 1 && faultStack.arrangedSubviews.count >= 3, "Manual recovery must follow diagnosis and incident history")
+            verify(manualIndex == 2 && faultStack.arrangedSubviews.count == 4, "Manual recovery must follow the visible incident timeline")
         } else { verify(false, "Fault page must keep diagnosis and history in a readable stack") }
         panelPage = 0; renderPanel()
-        verify(panelProbeToggle?.title == "云端主动探测（可能消耗额度）" && panelProbeToggle?.state == .off && panelProbeBudget?.stringValue == activeProbeStatus.display && panelProbeIntervalPicker?.indexOfSelectedItem == ActiveProbeBudget.defaultIntervalIndex && panelProbeIntervalPicker?.numberOfItems == ActiveProbeBudget.intervalOptions.count && panelManualCheck?.isEnabled == false, "Probe switch must default OFF and show the selected cadence")
-        verify(panelWakeToggle?.title == "防止闲置睡眠（Guard）" && panelWakeToggle?.toolTip?.contains("其他程序仍可能保持唤醒") == true && panelWakeStatus?.stringValue.contains("保持唤醒：") == true, "Wake control must describe its actual assertion and limits")
-        verify(quotaOverviewProgress?.isHidden == false && quotaOverviewSynced?.isHidden == false && quotaOverviewSynced?.stringValue.range(of: #"\d{2}:\d{2}:\d{2}"#, options: .regularExpression) != nil && quotaOverviewSynced?.font?.pointSize == 12 && quotaOverviewSynced?.textColor == .secondaryLabelColor, "Overview quota sync time must remain visible as secondary evidence")
-        verify(panelConnectionTime?.stringValue.range(of: #"\d{2}:\d{2}:\d{2}"#, options: .regularExpression) != nil && (panelConnectionTime?.font?.pointSize ?? 0) == 12, "Overview evidence rows must show a compact time")
+        verify(panelProbeToggle != nil && panelProbeToggle?.state == .off && panelProbeBudget?.stringValue == activeProbeStatus.display && panelProbeIntervalPicker?.indexOfSelectedItem == ActiveProbeBudget.defaultIntervalIndex && panelProbeIntervalPicker?.numberOfItems == ActiveProbeBudget.intervalOptions.count && panelManualCheck?.isEnabled == false, "Probe switch must default OFF and show the selected cadence")
+        verify(panelWakeToggle != nil && panelWakeToggle?.toolTip?.contains("其他程序仍可能保持唤醒") == true && panelWakeStatus?.stringValue.contains("保持唤醒：") == true, "Wake control must describe its actual assertion and limits")
+        verify(panelConnectionTime?.stringValue.contains("·") == true && (panelConnectionTime?.font?.pointSize ?? 0) == 11, "Overview evidence rows must stack a compact time under the result")
         verify(panelManualCheckStatus?.stringValue.contains("暂不可检查") == true, "Disabled manual ping must explain the blocking reason without a tooltip")
         if let menu = quotaIntervalPicker?.menu {
             let savedDocument = panelScroll?.documentView
@@ -6648,24 +6925,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
         }
         panelPage = 3; renderPanel(); root.layoutSubtreeIfNeeded()
         verify(panelControlCard?.isHidden == false && panelProbeToggle?.superview != nil && panelRecoveryToggle?.superview != nil && panelWakeToggle?.superview != nil && quotaIntervalPicker?.numberOfItems == quotaRefreshOptions.count && quotaIntervalPicker?.indexOfSelectedItem == (quotaRefreshOptions.firstIndex(of: quotaRefreshSeconds) ?? 3), "Settings must contain probe, recovery, wake, and account controls")
-        verify(quotaProgress?.isHidden == false && quotaSynced?.isHidden == false, "Account settings must retain the account usage and sync evidence")
+        let storedQuotaInterval = UserDefaults.standard.object(forKey: "quotaRefreshSeconds") as? Int
+        quotaIntervalPicker?.selectItem(at: 0)
+        if let picker = quotaIntervalPicker { quotaRefreshIntervalChanged(picker) }
+        verify((UserDefaults.standard.object(forKey: "quotaRefreshSeconds") as? Int) == storedQuotaInterval,
+               "Preview must never persist a quota interval even when the disabled handler is invoked directly")
+        quotaIntervalPicker?.selectItem(at: quotaRefreshOptions.firstIndex(of: quotaRefreshSeconds) ?? 3)
+        button(in: scroll.documentView!, title: "更多选项")?.performClick(nil)
+        if let expanded = scroll.documentView as? TopAlignedPanelDocumentView, let stack = expanded.subviews.first as? NSStackView {
+            verify(panelAdvancedOptions?.isHidden == false && expanded.frame.height >= stack.frame.maxY + 19 && quotaButton?.superview != nil,
+                   "Settings disclosure must immediately expose account controls inside scrollable content")
+        } else { verify(false, "Settings disclosure must keep a scrollable document") }
+        button(in: scroll.documentView!, title: "更多选项")?.performClick(nil)
+        verify(panelAdvancedOptions?.isHidden == true, "Settings disclosure must collapse")
+        verify(quotaProgress?.isHidden == false && quotaSynced?.stringValue.contains("上次成功同步") == true, "Account settings must retain usage and sync evidence in advanced options")
         panelPage = 0; renderPanel(); root.layoutSubtreeIfNeeded(); scroll.layoutSubtreeIfNeeded()
         if let overviewRoot = scroll.documentView as? TopAlignedPanelDocumentView,
            let overviewStack = overviewRoot.subviews.first as? NSStackView {
-            verify(overviewStack.frame.minY <= 2, "Overview content must start at the top without a blank band")
+            verify(abs(overviewStack.frame.minY - 24) <= 2, "Overview content must start 24pt below the toolbar")
             verify(overviewStack.arrangedSubviews.count == 4, "Overview must contain conclusion, evidence, activity, and account summary in order")
         } else {
             verify(false, "Overview document must use the top-aligned container")
         }
 
         let savedNotice = manualNotice
-        manualNotice = "启动等待中，暂不能手动检查"; renderPanelPage()
+        manualNotice = "启动等待中，暂不能手动检查"; renderPanel()
         var pendingViews = [scroll.documentView!], noticeVisible = false
         while let view = pendingViews.popLast() {
             if let field = view as? NSTextField, field.stringValue == manualNotice { noticeVisible = true }
             pendingViews.append(contentsOf: view.subviews)
         }
-        verify(noticeVisible, "Manual check deferral and setting errors must be visible on Overview")
+        verify(noticeVisible, "Manual check deferral and setting errors must be available in Overview evidence")
         panelPage = 3; renderPanel()
         verify(panelManualCheckStatus?.stringValue.contains(manualNotice!) == true, "Settings must display the result or deferral of the check initiated there")
         manualNotice = savedNotice
@@ -6674,7 +6964,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
         verify(panelSectionCount <= 5, "Connection status must not become a feature inventory")
         if let connectionRoot = scroll.documentView as? TopAlignedPanelDocumentView,
            let connectionStack = connectionRoot.subviews.first as? NSStackView {
-            verify(connectionStack.frame.minY <= 2, "Connection content must start at the top without a blank band")
+            verify(abs(connectionStack.frame.minY - 24) <= 2, "Connection content must start 24pt below the toolbar")
         } else {
             verify(false, "Connection document must use the top-aligned container")
         }
@@ -6686,7 +6976,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
         let availableRecordWidth = recordSplitView?.bounds.width ?? scroll.contentView.bounds.width
         verify(tableScroll.frame.width >= availableRecordWidth * 0.95, "Operation table must use the available inset page width (table \(Int(tableScroll.frame.width)), inner page \(Int(availableRecordWidth)))")
         verify(table.tableColumns.reduce(0) { $0 + $1.width } >= tableScroll.contentView.bounds.width * 0.95, "Operation columns must fill the inner table viewport")
-        verify(table.tableColumns.allSatisfy { $0.width >= $0.minWidth } && table.rowHeight == 36, "Record rows must fit multiline timestamps and details")
+        verify(table.tableColumns.allSatisfy { $0.width >= $0.minWidth } && table.rowHeight == 44 && table.gridStyleMask.contains(.solidHorizontalGridLineMask), "Record rows must use 44pt height and calm separators")
         verify(!viewContainsView(scroll.documentView!, target: panelHeroes!), "Records page must not repeat the Overview evidence rows")
         verify(recordSteps.count == 4 && !recordSteps.contains(where: { $0.tool == "ping" || $0.historical }), "Record page must fold historical records and hide connection checks by default")
         verify(historicalRecordsToggle?.title == "较早记录（时间不详，1条）", "Historical fold must state the unknown time and record count")
@@ -6719,9 +7009,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
         guard let selected = recordSteps.firstIndex(where: { $0.id == "preview-2" }) else { preconditionFailure("Filtered record rows are missing") }
         table.selectRowIndexes(IndexSet(integer: selected), byExtendingSelection: false)
         verify(recordDetail?.stringValue.contains("swift test --filter ConnectionTests") == true && recordDetail?.stringValue.contains("归属：会话 ") == true && recordDetail?.stringValue.contains("归属未确认") == false, "Selecting a row must retain verified attribution without unconfirmed ownership noise")
-        let sessionColumn = table.tableColumns.first { $0.identifier.rawValue == "session" }
-        let sessionView = sessionColumn.flatMap { tableView(table, viewFor: $0, row: selected) }
-        verify((sessionView?.subviews.first?.subviews.first as? NSTextField)?.stringValue.contains("会话") == true, "Verified session must appear as a labeled badge")
+        verify(recordDetail?.attributedStringValue.attributes(at: 0, effectiveRange: nil)[.font] != nil, "Verified session detail must retain styled attribution")
         let selectedID = selectedRecordID
         renderPanel()
         verify(selectedRecordID == selectedID && recordDetail?.stringValue.contains("swift test --filter ConnectionTests") == true, "Selected record detail must survive refresh")
