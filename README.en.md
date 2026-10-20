@@ -54,7 +54,7 @@ Download or clone this repository, then run these commands in the project direct
 ./build/CommanderGuard.app/Contents/MacOS/CommanderGuard --self-test
 ```
 
-Open `build/CommanderGuard.app` in Finder after the build completes. Click its menu bar icon to open the panel. The source build is ad hoc signed locally; Developer ID notarization is not configured.
+Open `build/CommanderGuard.app` in Finder after the build completes. Click its menu bar icon for the compact overview, then open the full panel; right-click the icon for the utility menu. The source build is ad hoc signed locally; Developer ID notarization is not configured.
 
 “云端主动探测（可能消耗额度）” (active cloud probes, may use quota) defaults to OFF, including upgrades. The automatic-recovery permission defaults to ON for a new configuration, but recovery is paused while active probes are OFF. The panel shows the reason. Preventing idle sleep is independent and does not require probes.
 
@@ -82,7 +82,7 @@ The script builds the app, installs it to `~/Applications/CommanderGuard.app`, c
 
 ## Everyday use
 
-The panel has four pages, a resizable window, and support for system light and dark appearance. Overview puts the conclusion and next step first, followed by separate evidence, local activity and a compact usage summary. Persistent controls and account management live in Settings. Important times include both the clock time and the age of the evidence.
+The compact menu bar overview shows the three status layers, local activity and account summary, with entries for the full panel and “恢复与重启…” (Recovery and restart). The resizable full panel uses sidebar navigation for Overview, Activity records, Incidents and recovery, and Settings, supporting system light and dark appearance. Overview puts the conclusion and next step first, followed by separate evidence, local activity and a compact usage summary; other pages show relevant content only. Persistent controls and account management live in Settings. Important times include both the clock time and the age of the evidence.
 
 | Page | What to look for |
 |---|---|
@@ -137,7 +137,7 @@ An update connection reopening establishes only that connection's recovery; a re
 
 ## Authorize one restart
 
-Click “人工授权重启本机服务…” (Authorize one local-service restart) on “故障与恢复” (Incidents and recovery). Guard checks the managed service instance, presents affected background processes, local calls and cloud-check results, then asks for this restart only. A completed tool call does not establish that the background service it launched has stopped.
+Choose “恢复与重启…” (Recovery and restart) in the compact overview, or “故障与恢复” (Incidents and recovery) in the full panel sidebar, then click “人工授权重启本机服务…” (Authorize one local-service restart). Guard checks the managed service instance, presents affected background processes, local calls and cloud-check results, then asks for this restart only. A completed tool call does not establish that the background service it launched has stopped.
 
 - Canceling does not restart anything or change preferences. Consent expires after 60 seconds and applies only to the displayed service instance and impact. Guard rechecks before execution; a changed scope requires new consent.
 - This local action does not require automatic recovery or recurring active probes, and does not enable either preference. Failed identity or impact checks, concurrent execution and failed evidence storage cannot be overridden.
