@@ -28,11 +28,11 @@
 - [x] Review code, update docs, inspect live state, install Guard only preserving prefs, verify installed code/runtime/Commander unchanged; scoped local commit/tag, no push/merge. User final visual acceptance remains separate.
 
 ## STATE / VERIFY / GIT / NEXT
-STATE: Reference-fidelity rework installed and formal window opened for user inspection. All four pages and compact surface follow the approved composition. User final visual acceptance pending; heartbeat paused on delivery.
+STATE: Reference-fidelity rework installed and formal window opened for user inspection. All four pages and compact surface follow the approved composition. User approved the native UI appearance on 2026-10-21; a separate logo refresh was requested. Heartbeat remains paused.
 CAUSE: Earlier translation kept old controls and verbose stacks, losing the approved palette, spacing and hierarchy. This batch reproduces the actual composition and verifies screenshots instead of treating layout tests as visual approval.
 VERIFY: Optimized build, complete offline self-test, light/dark default/minimum UI checks, signed-copy checks, scoped code review and diff/public-document checks PASS. Actual light/dark main, all four pages and compact inspected; comparison.png preserves equal-size/equal-sample original versus native. Final sidebar padding/footer/hairline confirmed. Installed signature, tested-code equality, fresh state, LaunchAgent and preserved preferences PASS; Commander instances unchanged. Real restart drill and full VoiceOver NOT RUN. Existing channel anomaly remains outside this UI task.
 GIT: feature/authorized-recovery-20261019; scoped local commit and fix/reference-fidelity-20261021 tag identify this delivery. No push/merge.
-NEXT: User judges the installed appearance against the saved original/actual comparison. No further autonomous implementation or recovery drill while awaiting that feedback.
+NEXT: Native UI appearance accepted. Follow the current logo/install and local main-merge task in TODO; no recovery drill authorized.
 
 ## First visual comparison
 

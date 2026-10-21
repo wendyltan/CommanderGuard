@@ -235,7 +235,7 @@ UI 预览使用固定示例，不启动监控、恢复或额度请求，也不�
 ./build/CommanderGuard.app/Contents/MacOS/CommanderGuard --preview-ui --preview-dark --verify-ui
 ```
 
-实现使用原生 AppKit。应用图标为 `Assets/AppIcon.png` 和 `Assets/AppIcon.icns`，菜单栏使用单色盾牌与连接标识。界面结构参考 [Little Snitch](https://help.obdev.at/littlesnitch6/lsm-overview) 和 [Stats](https://github.com/exelban/stats)。
+实现使用原生 AppKit。品牌标识为蓝色盾牌内的终端提示符，与浅灰应用图标底色配合；菜单栏采用同形单色版本，窗口标识随浅深色主题着色。应用图标为 `Assets/AppIcon.png` 和 `Assets/AppIcon.icns`，共用矢量标识为 `Assets/BrandMark.pdf`。在仓库根目录执行 `swift Assets/GenerateIcon.swift` 可重新生成这三份资源，再执行 `./build.sh` 打包。界面结构参考 [Little Snitch](https://help.obdev.at/littlesnitch6/lsm-overview) 和 [Stats](https://github.com/exelban/stats)。
 
 ## 卸载
 

@@ -235,7 +235,7 @@ UI previews use fixed sample data. They do not start monitoring, recovery, or us
 ./build/CommanderGuard.app/Contents/MacOS/CommanderGuard --preview-ui --preview-dark --verify-ui
 ```
 
-The app uses native AppKit. Its icons are `Assets/AppIcon.png` and `Assets/AppIcon.icns`, with a monochrome shield and link symbol in the menu bar. UI structure draws on [Little Snitch](https://help.obdev.at/littlesnitch6/lsm-overview) and [Stats](https://github.com/exelban/stats).
+The app uses native AppKit. Its blue shield encloses a terminal prompt on a pale gray app-icon tile. The menu bar uses the same monochrome mark, while window marks follow the light/dark palette. App icons are `Assets/AppIcon.png` and `Assets/AppIcon.icns`; the shared vector mark is `Assets/BrandMark.pdf`. Run `swift Assets/GenerateIcon.swift` from the repository root to regenerate all three assets, then `./build.sh` to package them. UI structure draws on [Little Snitch](https://help.obdev.at/littlesnitch6/lsm-overview) and [Stats](https://github.com/exelban/stats).
 
 ## Uninstall
 

@@ -5,6 +5,7 @@ OUT="$PWD/build"
 mkdir -p "$OUT/CommanderGuard.app/Contents/MacOS"
 mkdir -p "$OUT/CommanderGuard.app/Contents/Resources"
 ditto Assets/AppIcon.icns "$OUT/CommanderGuard.app/Contents/Resources/AppIcon.icns"
+ditto Assets/BrandMark.pdf "$OUT/CommanderGuard.app/Contents/Resources/BrandMark.pdf"
 xcrun swiftc -O -module-cache-path "/private/tmp/CommanderGuard-SwiftModuleCache" CommanderGuard.swift -framework Cocoa -framework IOKit -o "$OUT/CommanderGuard.app/Contents/MacOS/CommanderGuard"
 cat > "$OUT/CommanderGuard.app/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>

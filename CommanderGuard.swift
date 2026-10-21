@@ -4202,7 +4202,10 @@ func selfTest() {
     try! Data(repeating: 32, count: 2 * 1024 * 1024 + 1).write(to: freshRoot.appendingPathComponent("too-large.log"))
     freshReader.poll(now: now)
     precondition(freshReader.summary.coverage.contains("覆盖有缺口"), "Skipping old bytes in a new path must still report a gap")
-    precondition(NSImage(systemSymbolName: "shield", accessibilityDescription: nil) != nil && NSImage(systemSymbolName: "link", accessibilityDescription: nil) != nil)
+    precondition(Bundle.main.url(forResource: "BrandMark", withExtension: "pdf") != nil, "The brand vector must ship in the app bundle")
+    let brandImage = GuardBrand.image(size: 18)
+    precondition(brandImage.isTemplate && brandImage.size == NSSize(width: 18, height: 18)
+                 && brandImage.representations.contains { $0 is NSPDFImageRep }, "The menu mark must remain a scalable template")
     let safeIdle = ActivitySummary(state: "未观察到新调用", idleProven: true)
     let recoveredAnswerDiagnosis = IncidentDiagnosis.make(
         timeline: TimelineSummary(coverage: "已覆盖当前日志", history: [issue, laterOpen, laterIdle], latestAppIssue: issue),
@@ -4246,6 +4249,20 @@ func selfTest() {
     precondition(missingCoverage.title.contains("覆盖") && missingCoverage.startedAt == nil, "An unrelated call timestamp cannot become a diagnostic gap start")
     precondition(IncidentDiagnosis.make(timeline: oldTimeline, activity: safeIdle, now: now).title.contains("较早"), "A successful probe must not clear an answer issue")
     print("CommanderGuard self-test passed")
+}
+
+private enum GuardBrand {
+    private static let mark = Bundle.main.url(forResource: "BrandMark", withExtension: "pdf")
+        .flatMap { NSImage(contentsOf: $0) }
+        ?? NSImage(systemSymbolName: "terminal", accessibilityDescription: "CommanderGuard")!
+
+    static func image(size: CGFloat) -> NSImage {
+        let image = mark.copy() as! NSImage
+        image.size = NSSize(width: size, height: size)
+        image.isTemplate = true
+        image.accessibilityDescription = "CommanderGuard"
+        return image
+    }
 }
 
 private enum GuardPalette {
@@ -4465,12 +4482,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
 
     func applicationDidFinishLaunching(_ n: Notification) {
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        let image = NSImage(size: NSSize(width: 18, height: 18), flipped: false) { _ in
-            NSImage(systemSymbolName: "shield", accessibilityDescription: nil)?.draw(in: NSRect(x: 1, y: 0, width: 16, height: 18))
-            NSImage(systemSymbolName: "link", accessibilityDescription: nil)?.draw(in: NSRect(x: 5, y: 6, width: 8, height: 7))
-            return true
-        }
-        image.isTemplate = true
+        let image = GuardBrand.image(size: 18)
         item.button?.image = image; item.button?.imagePosition = .imageLeading
         rebuild()
         if previewMode {
@@ -5590,7 +5602,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
             let header = NSStackView(views: [label("CommanderGuard", size: 13, weight: .semibold), NSView()])
             header.orientation = .horizontal; header.alignment = .centerY
             header.edgeInsets = NSEdgeInsets(top: 17, left: 19, bottom: 17, right: 19)
-            let shieldImage = NSImage(systemSymbolName: "checkmark.shield", accessibilityDescription: "CommanderGuard")?.withSymbolConfiguration(.init(pointSize: 17, weight: .regular)) ?? NSImage()
+            let shieldImage = GuardBrand.image(size: 17)
             let shield = NSImageView(image: shieldImage); shield.imageScaling = .scaleProportionallyUpOrDown
             shield.contentTintColor = GuardPalette.blue
             header.addArrangedSubview(shield)
@@ -5776,7 +5788,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
         NSLayoutConstraint.activate([sidebarStack.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor), sidebarStack.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor), sidebarStack.topAnchor.constraint(equalTo: sidebar.topAnchor), sidebarStack.bottomAnchor.constraint(equalTo: sidebar.bottomAnchor)])
         let brand = NSStackView(); brand.orientation = .horizontal; brand.alignment = .centerY; brand.spacing = 9
         brand.edgeInsets = NSEdgeInsets(top: 0, left: 8, bottom: 0, right: 0)
-        let brandImage = NSImage(systemSymbolName: "checkmark.shield", accessibilityDescription: "CommanderGuard")?.withSymbolConfiguration(.init(pointSize: 17, weight: .regular)) ?? NSImage()
+        let brandImage = GuardBrand.image(size: 17)
         let shield = NSImageView(image: brandImage); shield.imageScaling = .scaleProportionallyUpOrDown; shield.contentTintColor = GuardPalette.blue
         brand.addArrangedSubview(shield)
         let brandText = vertical(1); brandText.addArrangedSubview(label("CommanderGuard", size: 13, weight: .semibold)); brandText.addArrangedSubview(label("本机执行守护", size: 11, color: GuardPalette.secondary)); brand.addArrangedSubview(brandText)
@@ -6138,7 +6150,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
             emblem.layer?.cornerRadius = 12
             emblem.widthAnchor.constraint(equalToConstant: 44).isActive = true
             emblem.heightAnchor.constraint(equalToConstant: 44).isActive = true
-            let heroImage = NSImage(systemSymbolName: "checkmark.shield", accessibilityDescription: nil)?.withSymbolConfiguration(.init(pointSize: 25, weight: .regular)) ?? NSImage()
+            let heroImage = GuardBrand.image(size: 25)
             let shield = NSImageView(image: heroImage); shield.imageScaling = .scaleProportionallyUpOrDown
             shield.contentTintColor = GuardPalette.blue; shield.translatesAutoresizingMaskIntoConstraints = false
             emblem.addSubview(shield)
