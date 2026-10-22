@@ -678,6 +678,8 @@ struct Snapshot {
     var channelDetail = "等待 Commander 与日志完成启动"
     var channelFailures = 0
     var channelChecked: Date?
+    var channelDisconnectedAt: Date?
+    var channelResolvedAt: Date?
     var toolExecutionState = "未验证"
     var toolExecutionDetail = "尚未检查本机工具执行"
     var toolExecutionChecked: Date?
@@ -1481,19 +1483,53 @@ func serviceRestartConfirmed(oldPID: Int32, newPID: Int32?, currentPID: Int32?, 
     return newPID != oldPID && currentPID == newPID && oldProcessExited && newStarted == currentStarted
 }
 
-func channelIndicator(service: String, state: String, checked: Date?, now: Date) -> String {
-    if service == "未运行" || state == "通道异常" || state == "通道不可用" { return "!" }
-    guard service == "运行中", let checked, now.timeIntervalSince(checked) >= 0, now.timeIntervalSince(checked) <= 75 else { return "?" }
+func recentChannelToolSuccess(_ snapshot: Snapshot, now: Date) -> Date? {
+    guard let success = recentSuccessfulToolExecution(snapshot.activity, now: now) else { return nil }
+    if let disconnectedAt = snapshot.channelDisconnectedAt, disconnectedAt > success { return nil }
+    if snapshot.channelResolvedAt == nil, ["通道异常", "通道不可用", "恢复尚未确认"].contains(snapshot.channelState),
+       let checked = snapshot.channelChecked, checked > success { return nil }
+    return success
+}
+
+func channelIndicator(service: String, state: String, checked: Date?, successfulToolAt: Date? = nil, disconnectedAt: Date? = nil, resolvedAt: Date? = nil, now: Date) -> String {
+    if service == "未运行" { return "!" }
+    guard service == "运行中" else { return "?" }
+    if let successfulToolAt, now.timeIntervalSince(successfulToolAt) >= 0,
+       now.timeIntervalSince(successfulToolAt) <= toolExecutionEvidenceTTL,
+       !(disconnectedAt.map { $0 > successfulToolAt } ?? false),
+       !(["通道异常", "通道不可用", "恢复尚未确认"].contains(state) && (checked.map { $0 > successfulToolAt } ?? false)) { return "●" }
+    let disconnectIsCurrent = disconnectedAt.map { $0 > (resolvedAt ?? .distantPast) } ?? false
+    if disconnectIsCurrent || ((state == "通道异常" || state == "通道不可用") && disconnectedAt == nil) { return "!" }
+    guard let checked, now.timeIntervalSince(checked) >= 0, now.timeIntervalSince(checked) <= 75 else { return "?" }
     return state == "通道畅通" || state == "通道已恢复" ? "●" : "?"
 }
 
 func channelSummary(_ snapshot: Snapshot, now: Date) -> String {
     if snapshot.service == "未运行" { return "Commander 服务未运行" }
+    let disconnectIsCurrent = snapshot.channelDisconnectedAt.map { $0 > (snapshot.channelResolvedAt ?? .distantPast) } ?? false
+    if disconnectIsCurrent { return "通道不可用" }
+    if snapshot.service == "运行中", recentChannelToolSuccess(snapshot, now: now) != nil { return "通道正常" }
+    if snapshot.service != "运行中" { return "通道待确认" }
     if snapshot.channelState == "通道畅通" || snapshot.channelState == "通道已恢复" {
-        guard let checked = snapshot.channelChecked, checked <= now else { return "探测结果待核对" }
-        return "上次探测成功"
+        guard let checked = snapshot.channelChecked, now.timeIntervalSince(checked) >= 0, now.timeIntervalSince(checked) <= 75 else { return "通道待确认" }
+        return "通道正常"
     }
-    return ["启动宽限": "启动等待中", "通道异常": "异常", "通道不可用": "不可用", "通道状态未知": "未确认", "正在恢复通道": "正在恢复", "恢复尚未确认": "恢复尚未确认"][snapshot.channelState] ?? snapshot.channelState
+    if ["通道异常", "通道不可用"].contains(snapshot.channelState) {
+        return snapshot.channelDisconnectedAt == nil ? snapshot.channelState : "通道待确认"
+    }
+    if ["启动宽限", "通道状态未知", "未主动验证"].contains(snapshot.channelState) { return "通道待确认" }
+    return ["启动宽限": "通道待确认", "通道异常": "通道异常", "通道不可用": "通道不可用", "通道状态未知": "通道待确认", "未主动验证": "通道待确认", "正在恢复通道": "通道恢复中", "恢复尚未确认": "通道恢复尚未确认"][snapshot.channelState] ?? snapshot.channelState
+}
+
+func channelEvidenceDetail(_ snapshot: Snapshot, now: Date) -> String {
+    if let success = recentChannelToolSuccess(snapshot, now: now) {
+        let evidence = "实际工具调用成功 \(displayEvidenceTime(success, now: now))"
+        return snapshot.channelDetail.contains("自动连接检查暂不可用") ? "\(evidence)；\(MCPChannelProbe.unsupportedMessage)" : evidence
+    }
+    if let disconnectedAt = snapshot.channelDisconnectedAt, disconnectedAt > (snapshot.channelResolvedAt ?? .distantPast) { return "最近明确观察到设备断连 \(displayEvidenceTime(disconnectedAt, now: now))" }
+    if snapshot.channelDetail.contains("自动连接检查暂不可用") { return MCPChannelProbe.unsupportedMessage }
+    if channelSummary(snapshot, now: now) == "通道待确认" { return "暂时无法确认连接状态，不代表已经断开" }
+    return snapshot.channelDetail
 }
 
 func displayEvidenceTime(_ date: Date?, now: Date = Date()) -> String {
@@ -2727,9 +2763,9 @@ enum ManualVerificationStage {
     static func begin(_ stage: String) -> String? {
         switch stage { case "ping": return "ping_submitted"; case "tool": return "tool_submitted"; default: return nil }
     }
-    static func afterResult(_ stage: String, submitted: Bool) -> String? {
+    static func afterResult(_ stage: String, submitted: Bool, unsupported: Bool = false) -> String? {
         switch stage {
-        case "ping_submitted": return submitted ? "tool" : "ping"
+        case "ping_submitted": return submitted ? "tool" : (unsupported ? nil : "ping")
         case "tool_submitted": return submitted ? nil : "tool"
         default: return nil
         }
@@ -2918,6 +2954,10 @@ final class ActiveProbeBudget {
 final class MCPChannelProbe: NSObject, URLSessionDataDelegate, URLSessionTaskDelegate {
     private static let endpoint = URL(string: "https://mcp.desktopcommander.app/mcp")!
     private static let maxResponseBytes = 16 * 1024
+    private static let unsupportedLock = NSLock()
+    private static var unsupportedValue = false
+    static let unsupportedMessage = "自动连接检查暂不可用"
+    private static let unsupportedDiagnostic = "自动连接检查暂不可用（云端未提供 ping）"
     private var session: URLSession!
     private var completion: ((ChannelProbeResult) -> Void)?
     private var body = Data()
@@ -2926,8 +2966,18 @@ final class MCPChannelProbe: NSObject, URLSessionDataDelegate, URLSessionTaskDel
     private var deviceID = ""
     private(set) var submitted = false
 
+    static var unsupportedInSession: Bool {
+        unsupportedLock.lock(); defer { unsupportedLock.unlock() }
+        return unsupportedValue
+    }
+    static func recordUnsupportedResult(_ result: ChannelProbeResult) {
+        guard case .unknown(let message) = result, message == unsupportedDiagnostic else { return }
+        unsupportedLock.lock(); unsupportedValue = true; unsupportedLock.unlock()
+    }
+
     func run(budget: ActiveProbeBudget = .shared, allowWhenDisabled: Bool = false, _ done: @escaping (ChannelProbeResult) -> Void) {
         completion = done; submitted = false
+        if Self.unsupportedInSession { finish(.unknown(Self.unsupportedMessage)); return }
         if let reason = allowWhenDisabled ? budget.status().manualVerificationBlockReason : budget.status().blockReason { finish(.unknown(reason)); return }
         let file = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".desktop-commander-device/device.json")
         guard let data = try? Data(contentsOf: file), let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
@@ -2967,7 +3017,9 @@ final class MCPChannelProbe: NSObject, URLSessionDataDelegate, URLSessionTaskDel
     }
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         guard error == nil, http?.statusCode == 200 else { finish(.unknown("MCP 网络请求未完成")); return }
-        finish(Self.classify(body, id: requestID, deviceID: deviceID))
+        let result = Self.classify(body, id: requestID, deviceID: deviceID)
+        Self.recordUnsupportedResult(result)
+        finish(result)
     }
 
     private func finish(_ result: ChannelProbeResult) {
@@ -2999,6 +3051,9 @@ final class MCPChannelProbe: NSObject, URLSessionDataDelegate, URLSessionTaskDel
         }
         if isError, texts.count == 1, structuredCode == "INVALID_ARGUMENT", Self.registeredDevicesOffline(first, deviceID: deviceID) {
             return .noLiveConnection
+        }
+        if isError, texts.count == 1, first.range(of: #"\bTool ping not found\b"#, options: .regularExpression) != nil {
+            return .unknown(unsupportedDiagnostic)
         }
         guard !isError else { return .unknown("MCP 服务返回工具错误") }
         guard texts.count == 2, first.range(of: #"^pong \d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z$"#, options: .regularExpression) != nil,
@@ -3469,6 +3524,24 @@ func selfTest() {
     }
     let pong: [String: Any] = ["jsonrpc": "2.0", "id": "request", "result": ["content": [["type": "text", "text": "pong 2026-10-03T02:00:18.395Z"], ["type": "text", "text": "\n[executed on device: Mac-mini.local (\(device))]"]]]]
     precondition(classifyProbe(pong) == 0 && classifyProbe(pong, id: "other") == 2)
+    precondition(!MCPChannelProbe.unsupportedInSession)
+    let unsupportedPing: [String: Any] = ["jsonrpc": "2.0", "id": "request", "result": ["isError": true, "content": [["type": "text", "text": "Error: Tool ping not found."]]]]
+    if case .unknown(let reason) = MCPChannelProbe.classify(try! JSONSerialization.data(withJSONObject: unsupportedPing), id: "request", deviceID: device) {
+        precondition(reason.contains(MCPChannelProbe.unsupportedMessage))
+    } else { preconditionFailure("Fixed unsupported ping phrase must remain unknown and unavailable") }
+    precondition(classifyProbe(unsupportedPing, id: "other") == 2, "A mismatched JSON-RPC id must not classify as unsupported")
+    var fileNotFound = unsupportedPing
+    fileNotFound["result"] = ["isError": true, "content": [["type": "text", "text": "Error: File ping not found."]]]
+    precondition(classifyProbe(fileNotFound) == 2, "File errors must not disable ping")
+    var genericNotFound = unsupportedPing
+    genericNotFound["result"] = ["isError": true, "content": [["type": "text", "text": "Tool output not found."]]]
+    precondition(classifyProbe(genericNotFound) == 2, "Generic not-found errors must not disable ping")
+    var nonErrorPhrase = unsupportedPing
+    nonErrorPhrase["result"] = ["isError": false, "content": [["type": "text", "text": "Tool ping not found"]]]
+    precondition(classifyProbe(nonErrorPhrase) == 2, "A non-error phrase must not disable ping")
+    var multipleErrorTexts = unsupportedPing
+    multipleErrorTexts["result"] = ["isError": true, "content": [["type": "text", "text": "Tool ping not found"], ["type": "text", "text": "other"]]]
+    precondition(classifyProbe(multipleErrorTexts) == 2, "Ambiguous error bodies must not disable ping")
     var falsePong = pong; falsePong["result"] = ["isError": true, "content": [["type": "text", "text": "pong 2026-10-03T02:00:18.395Z"], ["type": "text", "text": "\n[executed on device: Mac-mini.local (\(device))]"]]]
     precondition(classifyProbe(falsePong) == 2)
     let noLive = "This Desktop Commander device has no live connection and cannot receive commands right now. Restart the terminal running it, then try again. [device: Mac-mini.local (\(device))]"
@@ -3568,15 +3641,34 @@ func selfTest() {
     precondition(wakePreventionSummary(enabled: true, serviceRunning: false, assertionActive: false) == "等待 Commander 服务运行")
     precondition(wakePreventionSummary(enabled: false, serviceRunning: true, assertionActive: false) == "已关闭")
     var displaySnapshot = Snapshot(service: "运行中", channelState: "通道畅通", channelChecked: now)
-    precondition(channelSummary(displaySnapshot, now: now).contains("上次探测成功"))
+    precondition(channelSummary(displaySnapshot, now: now) == "通道正常")
     for age in [76.0, 600.0, 3600.0] {
-        precondition(channelSummary(displaySnapshot, now: now.addingTimeInterval(age)) == "上次探测成功" && channelIndicator(service: displaySnapshot.service, state: displaySnapshot.channelState, checked: displaySnapshot.channelChecked, now: now.addingTimeInterval(age)) == "?")
+        precondition(channelSummary(displaySnapshot, now: now.addingTimeInterval(age)) == "通道待确认" && channelIndicator(service: displaySnapshot.service, state: displaySnapshot.channelState, checked: displaySnapshot.channelChecked, now: now.addingTimeInterval(age)) == "?")
     }
     displaySnapshot.channelChecked = nil
-    precondition(channelSummary(displaySnapshot, now: now) == "探测结果待核对")
+    precondition(channelSummary(displaySnapshot, now: now) == "通道待确认" && channelEvidenceDetail(displaySnapshot, now: now) == "暂时无法确认连接状态，不代表已经断开")
     displaySnapshot.channelChecked = now.addingTimeInterval(1)
-    precondition(channelSummary(displaySnapshot, now: now) == "探测结果待核对")
+    precondition(channelSummary(displaySnapshot, now: now) == "通道待确认")
+    let successfulTool = ActivityStep(id: "real-success", tool: "read_file", detail: "读取文件", startedAt: now.addingTimeInterval(-30), startedUptime: 70, duration: 0.2, finished: true)
+    displaySnapshot.activity.steps = [successfulTool]
+    displaySnapshot.channelState = "通道状态未知"
+    precondition(channelSummary(displaySnapshot, now: now) == "通道正常" && channelEvidenceDetail(displaySnapshot, now: now).contains("实际工具调用成功"), "Unknown probe must not override a recent real tool success")
+    precondition(channelIndicator(service: displaySnapshot.service, state: displaySnapshot.channelState, checked: displaySnapshot.channelChecked, successfulToolAt: recentChannelToolSuccess(displaySnapshot, now: now), now: now) == "●")
+    precondition(channelSummary(displaySnapshot, now: now.addingTimeInterval(91)) == "通道待确认", "Expired tool evidence must become unconfirmed")
+    displaySnapshot.channelDisconnectedAt = now.addingTimeInterval(1); displaySnapshot.channelState = "通道状态未知"; displaySnapshot.channelChecked = now.addingTimeInterval(2)
+    precondition(channelSummary(displaySnapshot, now: now.addingTimeInterval(3)) == "通道不可用", "A newer explicit disconnect must survive a later unknown probe")
+    displaySnapshot.activity.steps = [ActivityStep(id: "newer-success", tool: "read_file", detail: "读取文件", startedAt: now.addingTimeInterval(1), startedUptime: 101, duration: 0.2, finished: true)]
+    displaySnapshot.channelResolvedAt = now.addingTimeInterval(1.2)
+    precondition(channelSummary(displaySnapshot, now: now.addingTimeInterval(2)) == "通道正常", "A newer real success must clear an older explicit disconnect for display")
+    precondition(channelSummary(displaySnapshot, now: now.addingTimeInterval(122)) == "通道待确认", "Expired newer success must not revive an older disconnect")
+    displaySnapshot.activity.steps = [ActivityStep(id: "future-success", tool: "read_file", detail: "读取文件", startedAt: now.addingTimeInterval(3), startedUptime: 103, duration: 0.2, finished: true)]
+    displaySnapshot.channelDisconnectedAt = nil; displaySnapshot.channelResolvedAt = nil; displaySnapshot.channelState = "通道状态未知"
+    precondition(channelSummary(displaySnapshot, now: now) == "通道待确认", "Future-dated tool evidence must be rejected")
+    displaySnapshot.service = "未知"
+    displaySnapshot.activity.steps = [successfulTool]
+    precondition(channelSummary(displaySnapshot, now: now) == "通道待确认" && channelIndicator(service: displaySnapshot.service, state: displaySnapshot.channelState, checked: now, successfulToolAt: now, now: now) == "?", "An unknown service state must not turn cached success green")
     displaySnapshot.channelChecked = now
+    displaySnapshot.activity.steps = []
     displaySnapshot.service = "未运行"
     precondition(channelSummary(displaySnapshot, now: now) == "Commander 服务未运行")
     precondition(CloudState.classify(status: "online", lastSeen: fresh, now: now) == "服务器登记在线")
@@ -3760,6 +3852,7 @@ func selfTest() {
     precondition(ManualVerificationStage.afterResult("tool_submitted", submitted: true) == nil)
     precondition(ManualVerificationStage.afterInterruption("ping_submitted") == "tool" && ManualVerificationStage.afterInterruption("tool_submitted") == nil)
     precondition(ManualVerificationStage.afterResult("ping_submitted", submitted: false) == "ping")
+    precondition(ManualVerificationStage.afterResult("ping_submitted", submitted: false, unsupported: true) == nil, "Known unsupported ping must terminate manual verification without claiming success")
     recordSample.newPID = 201; recordSample.newStarted = "Fri Oct  9 20:11:02 2026"; recordSample.verificationStage = "ping"
     var queued = ChannelRecoveryLedger(recent: [recordSample])
     let queueFile = dir.appendingPathComponent("manual-queue.json")
@@ -4248,6 +4341,14 @@ func selfTest() {
     let missingCoverage = IncidentDiagnosis.make(timeline: TimelineSummary(coverage: "读取失败"), activity: ActivitySummary(state: "未观察到新调用", observed: now.addingTimeInterval(-600)), now: now)
     precondition(missingCoverage.title.contains("覆盖") && missingCoverage.startedAt == nil, "An unrelated call timestamp cannot become a diagnostic gap start")
     precondition(IncidentDiagnosis.make(timeline: oldTimeline, activity: safeIdle, now: now).title.contains("较早"), "A successful probe must not clear an answer issue")
+    let unsupportedData = try! JSONSerialization.data(withJSONObject: unsupportedPing)
+    let unsupportedResult = MCPChannelProbe.classify(unsupportedData, id: "request", deviceID: device)
+    MCPChannelProbe.recordUnsupportedResult(unsupportedResult)
+    let suppressed = MCPChannelProbe()
+    let suppressedBudget = ActiveProbeBudget(directory: dir.appendingPathComponent("unsupported-probe-budget"))
+    var suppressionReason: String?
+    suppressed.run(budget: suppressedBudget, allowWhenDisabled: true) { if case .unknown(let reason) = $0 { suppressionReason = reason } }
+    precondition(suppressionReason == MCPChannelProbe.unsupportedMessage && !suppressed.submitted && suppressedBudget.status(now: now).lastSubmittedAt == nil, "Known unsupported ping must be suppressed without reserving a probe slot")
     print("CommanderGuard self-test passed")
 }
 
@@ -4587,6 +4688,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
             }
             return "无活动故障"
         }
+        if let reason = pingUnavailableReason { return "复查已暂停 · \(reason)" }
         if let reason = activeProbeStatus.blockReason { return "复查已暂停 · \(reason)" }
         if channelBusy || manualPingBusy { return "正在复查 · \(category.title)" }
         if let next = channelIncident.nextRecheck, next > now {
@@ -4647,6 +4749,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
     private var activeProbeStatus: ActiveProbeBudget.Status {
         previewMode ? ActiveProbeBudget.Status(enabled: false, intervalSeconds: ActiveProbeBudget.defaultIntervalSeconds, lastSubmittedAt: nil, now: Date(), error: nil) : ActiveProbeBudget.shared.status()
     }
+    private var pingUnavailableReason: String? {
+        MCPChannelProbe.unsupportedInSession ? MCPChannelProbe.unsupportedMessage : nil
+    }
     /// A confirmed manual choice owns the next two distinct shared probe slots.
     private func continueManualVerification() -> Bool {
         guard let record = recoveryLedger.recent.first, record.source == "manual",
@@ -4692,15 +4797,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
                     self.lastRecoveryOutcome = "服务身份或恢复记录已变化；探测结果未归入本次恢复"; self.render(); return
                 }
                 var updated = self.recoveryLedger
+                let unsupported = MCPChannelProbe.unsupportedInSession
                 _ = updated.updateManual(matching: record) { item in
-                    item.verificationStage = ManualVerificationStage.afterResult("ping_submitted", submitted: probe.submitted)
+                    item.verificationStage = ManualVerificationStage.afterResult("ping_submitted", submitted: probe.submitted, unsupported: unsupported)
                     if probe.submitted {
                         switch result { case .healthy: item.channel = "healthy"; case .noLiveConnection: item.channel = "offline"; case .unknown: item.channel = "failed" }
                     }
                 }
                 if updated.save(to: self.recoveryURL) { self.recoveryLedger = updated }
                 else { self.lastRecoveryOutcome = "ping 结果已观察，但记录写入失败" }
+                if !probe.submitted && unsupported { self.lastRecoveryOutcome = "自动连接检查暂不可用；本次通道验证未完成" }
                 if probe.submitted { self.recordProbe(result, now: Date(), manual: true) }
+                else if unsupported {
+                    self.snapshot.channelState = "通道状态未知"
+                    self.snapshot.channelDetail = "自动连接检查暂不可用：当前 MCP 服务不提供 ping"
+                }
                 self.render()
             } }
         } else {
@@ -4740,6 +4851,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
     private func pollChannel() {
         let now = Date()
         if continueManualVerification() { return }
+        if pingUnavailableReason != nil { return }
         if let reason = activeProbeStatus.blockReason {
             deferredReason = reason
             if snapshot.channelChecked == nil {
@@ -4783,6 +4895,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
         if case .healthy = result, let pending = pendingRecoveryVerification {
             verifyPendingRecovery(now: now, currentPID: servicePID(), oldProcessExited: kill(pending.old, 0) == -1 && errno == ESRCH)
         }
+        if case .healthy = result { snapshot.channelResolvedAt = now }
         lastPingAt = now; lastPingResult = probeDescription(result); deferredReason = "未延后"
         manualNotice = nil
         if manual { watchdog.observedManual(result, now: now) }
@@ -4791,6 +4904,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
         snapshot.channelFailures = watchdog.failures; snapshot.channelChecked = now
 
         if case .noLiveConnection = result {
+            snapshot.channelDisconnectedAt = now
             _ = channelIncident.observe(.channelDisruption, at: now)
         }
         channelIncident.lastProbeAt = now
@@ -4839,6 +4953,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
     }
     private func refreshToolExecutionFromActivity(_ activity: ActivitySummary, now: Date = Date()) {
         guard let evidence = recentSuccessfulToolExecution(activity, now: now) else { return }
+        if snapshot.channelResolvedAt.map({ evidence > $0 }) ?? true { snapshot.channelResolvedAt = evidence }
         guard snapshot.toolExecutionChecked.map({ evidence > $0 }) ?? true else { return }
         snapshot.toolExecutionState = "已验证"
         snapshot.toolExecutionDetail = "复用最近真实工具调用成功记录"
@@ -4863,6 +4978,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
         return "调用状态尚未确认"
     }
     @objc private func manualCheck() {
+        if let reason = pingUnavailableReason { manualCheckBlocked(reason); return }
         if let reason = activeProbeStatus.blockReason { manualCheckBlocked(reason); return }
         guard !watchdog.recovering else { manualCheckBlocked("自动恢复处理中，暂不能手动检查"); return }
         guard !channelBusy, !manualPingBusy else { manualCheckBlocked("已有连接检查进行中"); return }
@@ -5195,7 +5311,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
         let clockText: (Date) -> String = { DateFormatter.localizedString(from: $0, dateStyle: .none, timeStyle: .medium) }
         let now = Date()
         let activeIncident = channelIncident.activeCategory
-        let connection = activeIncident == nil ? channelIndicator(service: snapshot.service, state: snapshot.channelState, checked: snapshot.channelChecked, now: now) : "!"
+        let toolSuccessAt = recentChannelToolSuccess(snapshot, now: now)
+        let connection = activeIncident == nil ? channelIndicator(service: snapshot.service, state: snapshot.channelState, checked: snapshot.channelChecked, successfulToolAt: toolSuccessAt, disconnectedAt: snapshot.channelDisconnectedAt, resolvedAt: snapshot.channelResolvedAt, now: now) : "!"
         let channelLiveSummary = channelSummary(snapshot, now: now)
         let channelHeadline = activeIncident?.title ?? channelLiveSummary
         let menuChannel: String
@@ -5203,12 +5320,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
             menuChannel = "! 通道故障"
         } else if snapshot.service == "未运行" {
             menuChannel = "! 服务未运行"
-        } else if snapshot.channelState == "通道异常" || snapshot.channelState == "通道不可用" {
+        } else if connection == "!" {
             menuChannel = "! 通道异常"
-        } else if snapshot.channelState == "通道畅通" || snapshot.channelState == "通道已恢复" {
-            menuChannel = connection == "●" ? "● 通道正常" : "? 上次成功 \(snapshot.channelChecked.map { DateFormatter.localizedString(from: $0, dateStyle: .none, timeStyle: .short) } ?? "时间未知")"
+        } else if connection == "●" {
+            menuChannel = "● 通道正常"
         } else {
-            menuChannel = "? 通道未确认"
+            menuChannel = "? \(channelLiveSummary)"
         }
         let connectionText = "Commander 服务\(snapshot.service == "运行中" ? "运行中" : (snapshot.service == "未运行" ? "未运行" : "状态未知"))"
         summaryLines[0].title = activeIncident.map { "消息通道：\($0.title) · \(channelIncidentHandling(now: now))" } ?? "消息通道：\(channelLiveSummary)"
@@ -5238,7 +5355,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
         let origin = "消息通道与本机工具执行分别验证；任一层成功都不代表 ChatGPT 原回答完成。\(conversationLabelNote(snapshot.timeline.conversationLabelsVerifiedAt)) 无新事件不表示空闲或完成。"
         let age = activity.observed.map { DateFormatter.localizedString(from: $0, dateStyle: .none, timeStyle: .medium) } ?? "未知"
         let incidentTooltip = activeIncident.map { "\n当前故障：\($0.title)\n处置：\(channelIncidentHandling(now: now))\n首次发现：\(prominentStamp(channelIncident.firstSeen)) · 最近发生：\(prominentStamp(channelIncident.lastSeen))" } ?? (channelIncident.recentCategory.map { "\n最近故障：\($0.title) · \(channelIncident.recoveredAt == nil ? "恢复未确认" : "已恢复 \(prominentStamp(channelIncident.recoveredAt))")" } ?? "")
-        item.button?.toolTip = "\(connectionText)\n消息通道当前健康：\(channelLiveSummary) · \(displayPingResult(snapshot.channelDetail))\(incidentTooltip)\n工具执行：\(toolExecutionSummary(now: now)) · \(snapshot.toolExecutionDetail)\n\(returnedStep == nil ? "" : "本机调用已返回 · ")\(barAction)\(barDuration.map { " · 调用耗时 \($0)" } ?? "") · \(callStatus) · \(age)\n\(manualNotice.map { "手动检查：\(displayPingResult($0))\n" } ?? "")\(origin)"
+        item.button?.toolTip = "\(connectionText)\n消息通道当前健康：\(channelLiveSummary) · \(displayPingResult(channelEvidenceDetail(snapshot, now: now)))\(incidentTooltip)\n工具执行：\(toolExecutionSummary(now: now)) · \(snapshot.toolExecutionDetail)\n\(returnedStep == nil ? "" : "本机调用已返回 · ")\(barAction)\(barDuration.map { " · 调用耗时 \($0)" } ?? "") · \(callStatus) · \(age)\n\(manualNotice.map { "手动检查：\(displayPingResult($0))\n" } ?? "")\(origin)"
         if !previewMode { writeStatus() }
         renderCompactOverview()
         if panelWindow?.isVisible == true { renderPanel() }
@@ -5247,14 +5364,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
         guard recoveryLedger.autoRecoveryEnabled else { return "已关闭" }
         if let reason = activeProbeStatus.permissionBlockReason { return "已暂停 · \(reason)" }
         if localRestartSuppressed(for: channelIncident, at: Date()) {
-            return "云端容量异常 · 不重启本机 · 退避复查"
+            return pingUnavailableReason == nil ? "云端容量异常 · 不重启本机 · 退避复查" : "云端容量异常 · 不重启本机 · 复查已暂停"
         }
         if watchdog.recovering { return "恢复中" }
         guard recoveryLedger.canAttempt(at: Date()) else { return "已开启 · 冷却中" }
         guard snapshot.service == "运行中" else { return "已开启 · 等待 Commander 服务" }
         if !activitySafeForRecovery(snapshot.activity) { return "已开启 · 暂缓：\(activityDeferralReason(snapshot.activity))" }
+        if let reason = pingUnavailableReason { return "已开启 · 暂缓：\(reason)" }
         if channelIncident.activeCategory != nil { return "已开启 · \(channelIncidentHandling())" }
-        return channelIndicator(service: snapshot.service, state: snapshot.channelState, checked: snapshot.channelChecked, now: Date()) == "●"
+        let now = Date()
+        return channelIndicator(service: snapshot.service, state: snapshot.channelState, checked: snapshot.channelChecked, successfulToolAt: recentChannelToolSuccess(snapshot, now: now), disconnectedAt: snapshot.channelDisconnectedAt, resolvedAt: snapshot.channelResolvedAt, now: now) == "●"
             ? "已开启 · 监测中，当前无需恢复" : "已开启 · 等待下一次通道检查"
     }
     private func durationText(_ value: TimeInterval?) -> String {
@@ -5486,6 +5605,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
         let chat = chatMonitorSummary(snapshot.timeline)
         let diagnosis = currentDiagnosis()
         var object: [String: Any] = ["chatgpt": ["answer": chat.answer, "update_connection": chat.connection, "recent_issue": chat.history as Any? ?? NSNull(), "coverage": snapshot.timeline.coverage, "delivery_timeout_directly_observable": false, "limitation": chat.deliveryLimit], "service": snapshot.service, "cloud": snapshot.cloud, "last_seen": snapshot.lastSeen.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "checked_at": ISO8601DateFormatter.flex.string(from: snapshot.checked), "error_count": snapshot.errorCount, "paused": paused, "idle_prevention": assertion != 0, "message": snapshot.message, "channel": ["state": snapshot.channelState, "detail": snapshot.channelDetail, "consecutive_no_live": snapshot.channelFailures, "checked_at": snapshot.channelChecked.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "auto_recovery_enabled": recoveryLedger.autoRecoveryEnabled, "last_recovery_attempt": recoveryLedger.lastAttempt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "last_ping_at": lastPingAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "last_ping_result": lastPingResult, "check_deferred_reason": deferredReason, "recovery_status": recoveryAvailability(), "last_recovery_result": lastRecoveryOutcome as Any? ?? NSNull()], "menu": ["menubar_title": item.button?.title ?? "", "menubar_has_icon": item.button?.image != nil, "connection": summaryLines[0].title, "channel": summaryLines[0].title, "tool_execution": summaryLines[1].title, "action": summaryLines[2].title, "recovery": summaryLines[3].title, "chatgpt": summaryLines[4].title, "execution_step_rows": rows, "execution_steps": safeSteps, "tool_call_elapsed_seconds": callElapsed as Any? ?? NSNull(), "tool_call_state": currentState, "recent_actions": snapshot.activity.recent], "activity": ["state": snapshot.activity.state, "tool": CommanderActivity.safeToolIdentifier(snapshot.activity.tool), "active_count": snapshot.activity.activeCount, "observed_at": snapshot.activity.observed.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "recent": snapshot.activity.recent, "error": snapshot.activity.error, "coverage_gap": snapshot.activity.coverageGap, "gap_reason": snapshot.activity.gapReason, "gap_first_at": snapshot.activity.gapFirstAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "gap_last_at": snapshot.activity.gapLastAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "backlog_bytes": snapshot.activity.backlogBytes, "catching_up": snapshot.activity.catchingUp, "pending_line": snapshot.activity.pendingLine, "idle_proven": snapshot.activity.idleProven], "timeline": ["coverage": snapshot.timeline.coverage, "commander_errors_this_run": snapshot.timeline.commanderErrors, "conversation_labels_verified_at": snapshot.timeline.conversationLabelsVerifiedAt as Any? ?? NSNull(), "last_chatgpt_app_event": lastAppEvent, "events": timelineRows]]
+        let displayNow = Date()
+        let displayedChannelState = channelIncident.activeCategory?.title ?? channelSummary(snapshot, now: displayNow)
+        let displayedChannelTime = channelIncident.activeCategory != nil ? channelIncident.lastSeen ?? channelIncident.firstSeen
+            : recentChannelToolSuccess(snapshot, now: displayNow)
+                ?? (snapshot.channelDisconnectedAt.map { $0 > (snapshot.channelResolvedAt ?? .distantPast) } == true ? snapshot.channelDisconnectedAt : nil)
+                ?? (displayedChannelState == "通道正常" ? snapshot.channelChecked : nil)
+        if var channel = object["channel"] as? [String: Any] {
+            channel["display_state"] = displayedChannelState
+            channel["display_detail"] = channelIncident.activeCategory.map { _ in channelIncidentHandling(now: displayNow) } ?? channelEvidenceDetail(snapshot, now: displayNow)
+            channel["evidence_at"] = displayedChannelTime.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull()
+            object["channel"] = channel
+        }
         let probeBudget = activeProbeStatus
         object["recovery_attempts"] = recoveryLedger.recent.map { record in
             ["source": record.source, "started_at": ISO8601DateFormatter.flex.string(from: record.startedAt),
@@ -5687,6 +5818,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
         let now = Date()
         let channel = channelSummary(snapshot, now: now)
         compactLabels[0].stringValue = channelIncident.activeCategory?.title ?? channel
+        compactLabels[0].toolTip = channelEvidenceDetail(snapshot, now: now)
         compactLabels[0].textColor = channelIncident.activeCategory == nil ? GuardPalette.secondary : GuardPalette.amber
         let tool = toolExecutionSummary(now: now)
         compactLabels[1].stringValue = tool == "工具执行已验证" ? "最近一次已验证" : tool
@@ -5851,7 +5983,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
         heroes.distribution = .fill
         heroes.setHuggingPriority(.required, for: .vertical)
         panelHeroes = heroes
-        let evidenceRows = [evidenceRow("消息通道", subtitle: "最近一次实际探测", symbol: "dot.radiowaves.left.and.right", value: commandValue, time: commandTime),
+        let evidenceRows = [evidenceRow("消息通道", subtitle: "近期调用与连接检查", symbol: "dot.radiowaves.left.and.right", value: commandValue, time: commandTime),
                             evidenceRow("本机工具", subtitle: "来自最近一次真实调用", symbol: "terminal", value: toolValue, time: toolTime),
                             evidenceRow("ChatGPT 回答", subtitle: "后续连接与原回答分别核对", symbol: "message", value: chatValue, time: chatTime)]
         for (index, row) in evidenceRows.enumerated() {
@@ -5890,7 +6022,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
         probeToggle.toolTip = "默认关闭，计费关系未确认。开启后按所选间隔发送一次 ping；自动、手动、命令行及恢复后检查共用持久间隔，失败也开始计时，不自动附加工具检查。关闭阻止新的云端工具请求并暂停自动恢复；已提交请求可能仍计费。本机观察、设备状态与额度同步继续。"
         probeToggle.isEnabled = !previewMode
         panelProbeToggle = probeToggle
-        let probeBudget = label(activeProbeStatus.display, size: 12, weight: .semibold)
+        let probeBudget = label(pingUnavailableReason ?? activeProbeStatus.display, size: 12, weight: .semibold)
         probeBudget.font = .systemFont(ofSize: 12, weight: .regular)
         probeBudget.textColor = .secondaryLabelColor
         let probeInterval = NSPopUpButton()
@@ -5971,14 +6103,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
                                      nextAction: action,
                                      evidence: evidence)
         }
+        let displayedChannelState = channelSummary(snapshot, now: now)
+        let diagnosisChannelState: String
+        switch displayedChannelState {
+        case "通道正常": diagnosisChannelState = "通道畅通"
+        case "通道待确认" where ["通道异常", "通道不可用"].contains(snapshot.channelState): diagnosisChannelState = "通道状态未知"
+        default: diagnosisChannelState = snapshot.channelState
+        }
         let base = IncidentDiagnosis.make(timeline: snapshot.timeline, activity: snapshot.activity,
-                                          service: snapshot.service, channelState: snapshot.channelState, now: now)
+                                          service: snapshot.service, channelState: diagnosisChannelState, now: now)
         if channelIncident.recoveredAt != nil,
-           ["通道畅通", "通道已恢复"].contains(snapshot.channelState),
+           displayedChannelState == "通道正常",
            base.title.contains("Commander 连接近期出现异常") {
             return IncidentDiagnosis(title: "当前消息通道已恢复",
                                      startedAt: nil,
-                                     lastSeenAt: snapshot.channelChecked,
+                                     lastSeenAt: recentChannelToolSuccess(snapshot, now: now) ?? snapshot.channelChecked,
                                      nextAction: "无需因最近故障记录重复重启；继续观察当前通道和工具执行状态。",
                                      evidence: "当前健康状态与最近故障记录分开保存；故障和恢复时间可在“故障与恢复”中查看。")
         }
@@ -5998,10 +6137,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
             panelConnectionDetail?.toolTip = detail
         } else {
             panelConnection?.stringValue = channelLive
-            let marker = channelIndicator(service: snapshot.service, state: snapshot.channelState, checked: snapshot.channelChecked, now: now)
+            let toolSuccessAt = recentChannelToolSuccess(snapshot, now: now)
+            let marker = channelIndicator(service: snapshot.service, state: snapshot.channelState, checked: snapshot.channelChecked, successfulToolAt: toolSuccessAt, disconnectedAt: snapshot.channelDisconnectedAt, resolvedAt: snapshot.channelResolvedAt, now: now)
             panelConnection?.textColor = marker == "●" ? GuardPalette.green : (marker == "!" ? .systemRed : GuardPalette.text)
-            panelConnectionTime?.stringValue = referenceTime(lastPingAt)
-            let channelDetail = displayPingResult(manualNotice ?? (manualPingBusy || channelBusy ? deferredReason : snapshot.channelDetail))
+            panelConnectionTime?.stringValue = referenceTime(toolSuccessAt ?? lastPingAt)
+            let evidenceDetail = toolSuccessAt != nil || channelLive == "通道待确认" ? channelEvidenceDetail(snapshot, now: now) : displayPingResult(manualPingBusy || channelBusy ? deferredReason : snapshot.channelDetail)
+            let channelDetail = [manualNotice.map(displayPingResult), evidenceDetail].compactMap { $0 }.joined(separator: "；")
             panelConnectionDetail?.stringValue = middleTruncate(channelDetail, limit: 56)
             panelConnectionDetail?.toolTip = channelDetail
         }
@@ -6030,10 +6171,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
 
         let probeStatus = activeProbeStatus
         panelProbeToggle?.state = probeStatus.enabled ? .on : .off
-        panelProbeBudget?.stringValue = probeStatus.display
+        panelProbeBudget?.stringValue = pingUnavailableReason ?? probeStatus.display
         if !probeIntervalMenuOpen { panelProbeIntervalPicker?.selectItem(at: ActiveProbeBudget.intervalOptions.firstIndex(of: probeStatus.intervalSeconds) ?? ActiveProbeBudget.defaultIntervalIndex) }
-        panelManualCheck?.isEnabled = !previewMode && probeStatus.blockReason == nil && !manualPingBusy && !channelBusy && !watchdog.recovering
+        panelManualCheck?.isEnabled = !previewMode && pingUnavailableReason == nil && probeStatus.blockReason == nil && !manualPingBusy && !channelBusy && !watchdog.recovering
         let manualReason = (previewMode ? "预览中，按钮不会发送请求" : nil)
+            ?? pingUnavailableReason
             ?? probeStatus.blockReason
             ?? (watchdog.recovering ? "自动恢复处理中，暂不能检查" : nil)
             ?? (channelBusy || manualPingBusy ? "已有检查进行中" : nil)
@@ -6788,8 +6930,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
         showPanel(page: 0)
         showOverviewPopover()
         let savedCompactSnapshot = snapshot
-        snapshot.channelState = "通道状态未知"; snapshot.channelChecked = nil; snapshot.toolExecutionState = "工具执行状态未知"; render()
-        verify(compactLabels[0].stringValue == "未确认" && compactLabels[1].stringValue.contains("未知"), "Compact status rows must represent unknown evidence explicitly")
+        let uiNow = Date()
+        snapshot.activity.steps = [ActivityStep(id: "ui-real-success", tool: "read_file", detail: "读取文件", startedAt: uiNow.addingTimeInterval(-20), startedUptime: ProcessInfo.processInfo.systemUptime - 20, duration: 0.2, finished: true)]
+        snapshot.channelState = "通道状态未知"; snapshot.channelChecked = uiNow; snapshot.channelDisconnectedAt = nil; snapshot.channelResolvedAt = nil
+        snapshot.channelDetail = "自动连接检查暂不可用"
+        render()
+        verify(compactLabels[0].stringValue == "通道正常" && compactLabels[0].toolTip?.contains("实际工具调用成功") == true && compactLabels[0].toolTip?.contains("自动连接检查暂不可用") == true,
+               "Compact channel row must show recent real success and its time despite an unknown unsupported probe")
+        snapshot.channelState = "通道不可用"
+        snapshot.channelChecked = uiNow.addingTimeInterval(-30)
+        snapshot.channelDisconnectedAt = uiNow.addingTimeInterval(-30)
+        snapshot.channelResolvedAt = uiNow.addingTimeInterval(-19.8)
+        render()
+        verify(compactLabels[0].stringValue == "通道正常" && !currentDiagnosis(now: uiNow).title.contains("命令通道检查异常"),
+               "A newer trusted tool success must resolve diagnosis wording for the older raw disconnect")
+        snapshot.channelDisconnectedAt = uiNow.addingTimeInterval(1); snapshot.channelDetail = "设备仍离线"
+        render()
+        verify(compactLabels[0].stringValue == "通道不可用", "A newer explicit disconnect must override compact recent-success evidence")
+        snapshot.activity.steps = []; snapshot.channelDisconnectedAt = nil; snapshot.channelResolvedAt = nil
+        snapshot.channelState = "通道状态未知"; snapshot.channelChecked = nil; snapshot.channelDetail = ""
+        snapshot.toolExecutionState = "工具执行状态未知"; render()
+        verify(compactLabels[0].stringValue == "通道待确认" && compactLabels[0].toolTip == "暂时无法确认连接状态，不代表已经断开" && compactLabels[1].stringValue.contains("未知"),
+               "Compact status rows must represent unknown evidence explicitly")
         snapshot.toolExecutionState = "工具执行 " + String(repeating: "状态待确认 ", count: 12); render()
         verify(overviewPopover!.contentSize.height > 340 && compactLabels[1].frame.height > 16, "Long status text must wrap and expand the compact popover")
         snapshot = savedCompactSnapshot; render()
@@ -6889,7 +7051,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
             verify(quotaDisplay() == "Pro 无限制" && quotaStatusDisplay().contains("累计调用：9893 次"), "Pro unlimited label and count must survive \(state.rawValue) status")
         }
         quota = savedQuota; renderQuota()
-        verify(panelConnection?.stringValue == "上次探测成功", "Channel headline must stay concise while time and freshness remain separate")
+        verify(panelConnection?.stringValue == "通道正常", "Channel headline must stay concise while time and freshness remain separate")
         verify(panelChat?.stringValue == "原回答待核对" && panelChatDetail?.stringValue.hasPrefix("原回答是否完整：无法确认") == true, "Reconnected status must stay distinct from original-answer completeness")
         verify(panelSectionCount == 4 && viewContainsView(scroll.documentView!, target: panelHeroes!), "Overview must order conclusion, evidence, activity, then account summary")
         verify(viewContainsButton(scroll.documentView!, title: "账户与同步设置") && panelEvidenceDisclosure?.isHidden == true, "Overview must show the account route and start with verbose evidence folded")
@@ -6967,7 +7129,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
             if let field = view as? NSTextField, field.stringValue == manualNotice { noticeVisible = true }
             pendingViews.append(contentsOf: view.subviews)
         }
-        verify(noticeVisible, "Manual check deferral and setting errors must be available in Overview evidence")
+        verify(noticeVisible || panelConnectionDetail?.toolTip?.contains(manualNotice!) == true,
+               "Manual check deferral and setting errors must remain visible or inspectable in Overview evidence")
         panelPage = 3; renderPanel()
         verify(panelManualCheckStatus?.stringValue.contains(manualNotice!) == true, "Settings must display the result or deferral of the check initiated there")
         manualNotice = savedNotice
@@ -7032,6 +7195,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
         snapshot.activity.steps = previewSteps; renderLogPage()
         verify(item.button?.image?.isTemplate == true && item.button?.title.contains("通道正常") == true && item.button?.title.contains("DC ") == false, "Menu bar must show an icon and scoped live status; title=\(item.button?.title ?? "nil"), icon=\(item.button?.image?.isTemplate.description ?? "nil"), channel=\(snapshot.channelState)")
         verify(panelPageTitle?.stringValue == "操作记录" && !viewContainsView(scroll.documentView!, target: panelHeroes!), "Records page must keep its title without repeated evidence rows")
+        let unavailableSample: [String: Any] = ["jsonrpc": "2.0", "id": "ui-unavailable", "result": ["isError": true, "content": [["type": "text", "text": "Tool ping not found"]]]]
+        MCPChannelProbe.recordUnsupportedResult(MCPChannelProbe.classify(try! JSONSerialization.data(withJSONObject: unavailableSample), id: "ui-unavailable", deviceID: "00000000-0000-4000-8000-000000000001"))
+        _ = channelIncident.observe(.channelDisruption, at: Date())
+        verify(channelIncidentHandling().contains(MCPChannelProbe.unsupportedMessage), "Unsupported checks must explain that incident rechecks are paused")
+        showPanel(page: 3); renderPanel()
+        verify(panelProbeBudget?.stringValue == MCPChannelProbe.unsupportedMessage, "Probe settings must not promise another unsupported check")
         print("CommanderGuard UI check passed")
     }
 }
