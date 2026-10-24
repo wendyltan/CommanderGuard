@@ -107,6 +107,8 @@ This shows Desktop Commander cloud tool calls usage, separate from your ChatGPT 
 
 Automatic syncing reuses one Guard-owned headless Chrome session and parks it on about:blank between reads. The process stays running and uses some memory. Switching to manual mode closes an idle session; an active read finishes before the session closes. In manual mode, each refresh also closes Chrome after the read. Pausing, signing in, quitting Guard, or a failed read releases the session. macOS may add a Chrome recent-app entry on first launch; Guard does not clear existing entries or change global Dock settings. Only clicking Sign in opens the dedicated login window; automatic sync failures do not open one.
 
+If the dedicated profile has an expired, malformed, or unverified browser lock, syncing reports an explicit error rather than remaining in a connecting state. Guard does not automatically remove these locks or sign the account out.
+
 The dedicated browser has its own sign-in profile. It cannot reuse your everyday Chrome Google session, so the first connection needs a separate sign-in; subsequent upgrades retain that profile. Guard does not copy cookies or account data from your everyday browser. Chrome retains authentication in its dedicated profile; Guard receives only validated usage numbers, plan, and month.
 
 “暂停” (pause) stops future requests and cancels an active usage read without signing out. Unlimited Pro plans have no finite progress bar. Temporary failures retain the last successful values and actual sync time. The stale threshold follows the selected interval, with a minimum of fifteen minutes. Expired authentication requires signing in again.

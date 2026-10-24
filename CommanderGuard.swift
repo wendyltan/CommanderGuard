@@ -78,13 +78,14 @@ final class HeadlessQuotaBrowser {
         case success(UsageQuota), loginRequired, loginOpen, unavailable(String), cancelled
     }
     enum Failure: Error, LocalizedError {
-        case unavailable, profile, busy, timeout, cancelled, protocolError
+        case unavailable, profile, busy, timeout, cancelled, protocolError, lockState
         var errorDescription: String? {
             switch self {
             case .profile: return "专用浏览器资料目录不可用"
             case .busy: return "请先关闭专用登录浏览器"
             case .timeout: return "额度读取超时"
             case .cancelled: return "额度读取已取消"
+            case .lockState: return "专用浏览器被占用或状态异常，暂不能同步"
             default: return "专用浏览器暂时无法读取额度"
             }
         }
@@ -127,8 +128,8 @@ final class HeadlessQuotaBrowser {
                     let lockFD = try Self.acquireProfile(profile)
                     var keepLock = false
                     defer { if !keepLock { flock(lockFD, LOCK_UN); close(lockFD) } }
-                    if try Self.hasBrowserLock(profile) { outcome = .loginOpen }
-                    else if !Self.loginRequested(profile) { outcome = .loginRequired }
+                    try Self.ensureNoBrowserLock(profile)
+                    if !Self.loginRequested(profile) { outcome = .loginRequired }
                     else {
                         if isCancelled() { throw Failure.cancelled }
                         browser = try PipeBrowser(executable: executable, profile: profile, cancelled: { [self] in isCancelled() })
@@ -142,7 +143,6 @@ final class HeadlessQuotaBrowser {
             } catch let error as Failure {
                 switch error {
                 case .cancelled: outcome = .cancelled
-                case .busy: outcome = .loginOpen
                 default: outcome = .unavailable(error.localizedDescription)
                 }
             } catch { outcome = .unavailable("专用浏览器暂时无法读取额度") }
@@ -206,7 +206,7 @@ final class HeadlessQuotaBrowser {
         let fd = try Self.acquireProfile(profile)
         var keepLock = false
         defer { if !keepLock { flock(fd, LOCK_UN); close(fd) } }
-        if try Self.hasBrowserLock(profile) { return false }
+        try Self.ensureNoBrowserLock(profile)
         let process = Process()
         process.executableURL = executable
         process.arguments = Self.arguments(profile: profile, headless: false)
@@ -315,12 +315,11 @@ final class HeadlessQuotaBrowser {
         guard flock(fd, LOCK_EX | LOCK_NB) == 0 else { close(fd); throw Failure.busy }
         return fd
     }
-    private static func hasBrowserLock(_ profile: URL) throws -> Bool {
+    private static func ensureNoBrowserLock(_ profile: URL) throws {
+        let lock = profile.appendingPathComponent("SingletonLock")
         var info = stat()
-        // Fail closed even for an abandoned Chrome SingletonLock; never remove another process's lock.
-        if lstat(profile.appendingPathComponent("SingletonLock").path, &info) == 0 { return true }
-        guard errno == ENOENT else { throw Failure.profile }
-        return false
+        if lstat(lock.path, &info) == 0 { throw Failure.lockState }
+        guard errno == ENOENT else { throw Failure.lockState }
     }
     /// Called only for an owned child after termination, while its profile flock is held.
     private static func clearExitedOwnedBrowserLock(_ profile: URL, pid: pid_t) {
@@ -583,7 +582,7 @@ final class HeadlessQuotaBrowser {
             guard try browser.probe() == target else { throw Failure.protocolError }
         } catch { browser.finish(); throw error }
         browser.finish()
-        guard !(try hasBrowserLock(profile)) else { throw Failure.profile }
+        try ensureNoBrowserLock(profile)
     }
 
     static func runOfflineChecks() throws {
@@ -621,8 +620,7 @@ final class HeadlessQuotaBrowser {
         finishingBrowser.browserLockFD = try acquireProfile(scratch)
         guard symlink("owned-host-\(finishingBrowser.browser!.processID)", scratch.appendingPathComponent("SingletonLock").path) == 0 else { throw Failure.profile }
         finishingBrowser.finishBrowser()
-        let abandonedOwnedLock = try hasBrowserLock(scratch)
-        precondition(!abandonedOwnedLock, "headless finish must clear its exited child's lock")
+        try ensureNoBrowserLock(scratch)
         let link = scratch.appendingPathComponent("linked-profile")
         guard symlink(scratch.path, link.path) == 0 else { throw Failure.profile }
         do { try validateDirectory(link, privateMode: true); preconditionFailure("symlink profile accepted") } catch Failure.profile {}
@@ -638,22 +636,40 @@ final class HeadlessQuotaBrowser {
         ownedLogin.waitUntilExit(); login.loginProcess = nil
         precondition(!login.hasOwnedLogin && !login.finishOwnedLogin())
         let browserLock = scratch.appendingPathComponent("SingletonLock")
+        let localHost = ProcessInfo.processInfo.hostName
         let child = Process(); child.executableURL = URL(fileURLWithPath: "/usr/bin/true")
         try child.run(); child.waitUntilExit()
         let exitedPID = child.processIdentifier
         guard kill(exitedPID, 0) == -1, errno == ESRCH else { throw Failure.unavailable }
-        guard symlink("owned-host-\(exitedPID)", browserLock.path) == 0 else { throw Failure.profile }
+        guard symlink("\(localHost)-\(exitedPID)", browserLock.path) == 0 else { throw Failure.profile }
+        do { try ensureNoBrowserLock(scratch); preconditionFailure("stale browser lock accepted") } catch Failure.lockState {}
+        guard (try? FileManager.default.destinationOfSymbolicLink(atPath: browserLock.path)) == "\(localHost)-\(exitedPID)" else { throw Failure.profile }
         clearExitedOwnedBrowserLock(scratch, pid: getpid())
-        let runningLockPreserved = try hasBrowserLock(scratch); precondition(runningLockPreserved, "running or mismatched PID lock must be preserved")
+        guard (try? FileManager.default.destinationOfSymbolicLink(atPath: browserLock.path)) == "\(localHost)-\(exitedPID)" else { throw Failure.profile }
         clearExitedOwnedBrowserLock(scratch, pid: exitedPID)
-        let ownedLockCleared = !(try hasBrowserLock(scratch)); precondition(ownedLockCleared, "known exited child lock must be cleared")
+        var clearedLockInfo = stat()
+        guard lstat(browserLock.path, &clearedLockInfo) != 0, errno == ENOENT else { throw Failure.profile }
         guard symlink("unknown-host-999999", browserLock.path) == 0 else { throw Failure.profile }
+        do { try ensureNoBrowserLock(scratch); preconditionFailure("unknown browser lock accepted") } catch Failure.lockState {}
+        guard (try? FileManager.default.destinationOfSymbolicLink(atPath: browserLock.path)) == "unknown-host-999999" else { throw Failure.profile }
         clearExitedOwnedBrowserLock(scratch, pid: exitedPID)
-        let unknownLockPreserved = try hasBrowserLock(scratch); precondition(unknownLockPreserved, "unknown PID lock must be preserved")
+        guard (try? FileManager.default.destinationOfSymbolicLink(atPath: browserLock.path)) == "unknown-host-999999" else { throw Failure.profile }
+        guard unlink(browserLock.path) == 0 else { throw Failure.profile }
+        guard symlink("\(localHost)-\(getpid())", browserLock.path) == 0 else { throw Failure.profile }
+        do { try ensureNoBrowserLock(scratch); preconditionFailure("active external browser lock accepted") } catch Failure.lockState {}
+        guard unlink(browserLock.path) == 0 else { throw Failure.profile }
+        guard symlink("foreign-host-\(getpid())", browserLock.path) == 0 else { throw Failure.profile }
+        do { try ensureNoBrowserLock(scratch); preconditionFailure("foreign-host browser lock accepted") } catch Failure.lockState {}
+        guard (try? FileManager.default.destinationOfSymbolicLink(atPath: browserLock.path)) == "foreign-host-\(getpid())" else { throw Failure.profile }
+        guard unlink(browserLock.path) == 0 else { throw Failure.profile }
+        guard symlink("malformed-lock", browserLock.path) == 0 else { throw Failure.profile }
+        do { try ensureNoBrowserLock(scratch); preconditionFailure("malformed browser lock accepted") } catch Failure.lockState {}
+        guard (try? FileManager.default.destinationOfSymbolicLink(atPath: browserLock.path)) == "malformed-lock" else { throw Failure.profile }
         guard unlink(browserLock.path) == 0 else { throw Failure.profile }
         try Data().write(to: browserLock)
+        do { try ensureNoBrowserLock(scratch); preconditionFailure("regular-file browser lock accepted") } catch Failure.lockState {}
         clearExitedOwnedBrowserLock(scratch, pid: exitedPID)
-        let fileLockPreserved = try hasBrowserLock(scratch); precondition(fileLockPreserved, "non-symlink lock must be preserved")
+        guard (try Data(contentsOf: browserLock)).isEmpty else { throw Failure.profile }
         guard unlink(browserLock.path) == 0 else { throw Failure.profile }
         let headless = arguments(profile: profileURL, headless: true)
         let visible = arguments(profile: profileURL, headless: false)
