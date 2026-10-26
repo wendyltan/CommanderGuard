@@ -188,11 +188,14 @@ State files live in `~/Library/Application Support/CommanderGuard/`:
 | File | Contents |
 |---|---|
 | `status.json` | Service, channel, tool execution, call state, and optional usage summary |
+
 | `timeline.jsonl` | Redacted events, capped at 1 MiB with one rotated copy |
 | `channel-incident.json` | Current and recent channel categories, timestamps, backoff, and recovery state |
 | `channel-decisions.jsonl` | Probe and recovery decisions, capped at 512 KiB with one rotated copy |
 | `channel-recovery.json` | Automatic-recovery preference, cooldown and up to five sanitized recovery records; no replayable restart consent |
 | `active-probe-budget.json` | Probe permission, interval and last request time, without credentials; relaunches do not reset it; upgrading an old ledger switches probing OFF |
+
+The status snapshot is independent of the one-second UI refresh: critical fault transitions are persisted immediately, regular activity changes at least 10 seconds apart, and stable state receives a 30-second heartbeat. Event JSONL files remain event-driven.
 
 Session attribution accepts only upstream `_meta["openai/session"]` or `origin_context_id`. Raw identifiers are SHA-256 hashed into short anonymous fingerprints. Missing fields produce no attribution label; conflicting fields still show “归属冲突” (attribution conflict). Timing, the foreground chat, terminal processes, and `origin_instance` are not attribution evidence.
 

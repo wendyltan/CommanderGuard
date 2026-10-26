@@ -2595,6 +2595,27 @@ struct ChannelIncidentState: Codable {
     }
 }
 
+// Decouple the on-screen 1-second refresh from durable status snapshots.
+struct StatusPersistenceGate {
+    private(set) var lastKey: String?
+    private(set) var lastCriticalKey: String?
+    private(set) var lastWritten = Date.distantPast
+    let minimumInterval: TimeInterval = 10
+    let heartbeat: TimeInterval = 30
+
+    func shouldPersist(key: String, criticalKey: String, now: Date) -> Bool {
+        if lastKey == nil || criticalKey != lastCriticalKey { return true }
+        let elapsed = now.timeIntervalSince(lastWritten)
+        return elapsed >= heartbeat || (elapsed >= minimumInterval && key != lastKey)
+    }
+
+    mutating func didPersist(key: String, criticalKey: String, now: Date) {
+        lastKey = key
+        lastCriticalKey = criticalKey
+        lastWritten = now
+    }
+}
+
 struct ChannelDecisionRecord: Codable {
     let at: Date
     let kind: String
@@ -3500,6 +3521,17 @@ private func selfTestActiveProbeBudget(dir: URL, now: Date) {
 
 func selfTest() {
     let now = Date(timeIntervalSince1970: 2_000_000_000)
+    var persistence = StatusPersistenceGate()
+    precondition(persistence.shouldPersist(key: "healthy", criticalKey: "ok", now: now))
+    persistence.didPersist(key: "healthy", criticalKey: "ok", now: now)
+    precondition(!persistence.shouldPersist(key: "healthy", criticalKey: "ok", now: now.addingTimeInterval(1)))
+    precondition(!persistence.shouldPersist(key: "activity", criticalKey: "ok", now: now.addingTimeInterval(1)))
+    precondition(persistence.shouldPersist(key: "activity", criticalKey: "ok", now: now.addingTimeInterval(10)))
+    precondition(!persistence.shouldPersist(key: "healthy", criticalKey: "ok", now: now.addingTimeInterval(29)))
+    precondition(persistence.shouldPersist(key: "healthy", criticalKey: "ok", now: now.addingTimeInterval(30)))
+    precondition(persistence.shouldPersist(key: "error", criticalKey: "failure", now: now.addingTimeInterval(1)))
+    persistence.didPersist(key: "error", criticalKey: "failure", now: now.addingTimeInterval(1))
+    precondition(!persistence.shouldPersist(key: "error", criticalKey: "failure", now: now.addingTimeInterval(2)))
     func quota(_ usage: [String: Any]) -> UsageQuota? {
         guard let data = try? JSONSerialization.data(withJSONObject: ["usage": usage]) else { return nil }
         return UsageQuota.parse(data, now: now)
@@ -4488,6 +4520,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
     private let recoveryURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/CommanderGuard/channel-recovery.json")
     private var recoveryLedger = ChannelRecoveryLedger.load(from: FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/CommanderGuard/channel-recovery.json"))
     private let channelIncidentURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/CommanderGuard/channel-incident.json")
+    private var statusPersistenceGate = StatusPersistenceGate()
     private let channelDecisionURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/CommanderGuard/channel-decisions.jsonl")
     private lazy var channelIncident = previewMode ? ChannelIncidentState(now: Date()) : ChannelIncidentState.load(from: channelIncidentURL, now: Date())
     private lazy var channelDecisionJournal = ChannelDecisionJournal(url: channelDecisionURL)
@@ -5607,6 +5640,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
         return "\(prefix)…\(suffix)"
     }
     private func writeStatus() {
+        let now = Date()
+        // Only durable state transitions (not elapsed seconds or checked_at) bypass
+        // the 10-second minimum; stable state gets a 30-second heartbeat.
+        // The 1-second menu/UI refresh stays unchanged.
+        let key = [
+            snapshot.service, snapshot.cloud, snapshot.channelState,
+            snapshot.activity.state, snapshot.activity.tool,
+            String(snapshot.activity.activeCount), snapshot.toolExecutionState,
+            String(snapshot.errorCount), quota.state.rawValue,
+            channelIncident.activeCategory?.rawValue ?? "",
+            String(watchdog.recovering),
+        ].joined(separator: "|")
+        let criticalKey = [
+            snapshot.service, snapshot.channelState,
+            channelIncident.activeCategory?.rawValue ?? "",
+            String(watchdog.recovering),
+        ].joined(separator: "|")
+        guard statusPersistenceGate.shouldPersist(key: key, criticalKey: criticalKey, now: now) else { return }
         ageQuota()
         let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/CommanderGuard", isDirectory: true)
         do { try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true) }
@@ -5666,7 +5717,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
         object["tool_history"] = ["state": snapshot.toolHistory.state, "source_available": snapshot.toolHistory.sourceAvailable, "bootstrap_limited": snapshot.toolHistory.bootstrapLimited, "coverage_gap": snapshot.toolHistory.coverageGap, "gap_reason": snapshot.toolHistory.gapReason, "malformed_lines": snapshot.toolHistory.malformedLines, "backlog_bytes": snapshot.toolHistory.backlogBytes, "latest": latestHistory, "limitation": "结构化历史无可靠调用编号，不按时间与会话或 stdout 记录合并"]
         object["diagnosis"] = ["title": diagnosis.title, "started_at": diagnosis.startedAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "last_seen_at": diagnosis.lastSeenAt.map(ISO8601DateFormatter.flex.string(from:)) as Any? ?? NSNull(), "next_action": diagnosis.nextAction, "evidence": diagnosis.evidence]
         guard let d = try? JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys]) else { return }
-        do { try d.write(to: dir.appendingPathComponent("status.json"), options: .atomic) }
+        do {
+            try d.write(to: dir.appendingPathComponent("status.json"), options: .atomic)
+            statusPersistenceGate.didPersist(key: key, criticalKey: criticalKey, now: now)
+        }
         catch { fputs("CommanderGuard: unable to write sanitized status file\n", stderr) }
     }
     @objc private func togglePause() { paused.toggle(); UserDefaults.standard.set(!paused, forKey: "keepAwakeEnabled"); updateGuard(); render() }
