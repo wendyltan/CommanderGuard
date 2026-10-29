@@ -1,6 +1,6 @@
 # CommanderGuard 工作规范
 
-适用范围：本仓库所有代码、测试、安装脚本及文档。上层共享协作约定同时适用；开始工作前读取当前 Git、README、TODO 与实际运行状态。
+适用范围：本仓库所有代码、测试、安装脚本及文档。先读 `/Volumes/ExtSSD/AGENTS.md`；外接盘不可用时读 `/Users/wuwendi/.config/agent-workstyle/AGENTS.md`。本文件补充共享协作约定；开始工作前按任务核对当前 Git、README、TODO 与实际运行状态。
 
 ## 每次功能变更的交付要求
 
