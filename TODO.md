@@ -334,3 +334,13 @@
 - [x] 提交本地fix commit/tag；未推送。
 
 限制：不修改全局Dock设置或删除旧条目，首次启动仍可能显示Chrome图标。后台常驻一个自有Chrome进程会占用内存；仅手动或暂停可释放。已确认日常Chrome现有窗口可操作，未关闭用户正在使用的Chrome来演练首次重新启动。
+
+
+## 2026-11-02 · CommanderGuard quota / channel repair
+
+- [x] Diagnose current profile's old Chrome SingletonLock with a no-longer-running local PID; replace permanent refusal with guarded orphan recovery (local host, >=120s age, dead PID, private flock and stable symlink identity). Unknown or live ownership still fails closed.
+- [x] Diagnose obsolete RemoteDesktopCommander stdout/stderr log path: current installation only exposes rotating `~/.claude-server-commander/tool-history.jsonl`. Use recent structured tool receipts for channel/tool liveness display, without equating a response with cloud completion or proving idle; explicit disconnect and 120s TTL still take priority.
+- [x] Real installed-app quota sync: 2026-11-02 20:48:22 CST official usage parsed successfully (Pro, unlimited, nonzero used count); previous 2026-10-26 orphaned SingletonLock was safely retired, new Guard-owned Chrome process and lock established, no forced sign-in. Commander service PIDs 25771/25777 unchanged.
+- [x] Installed app signature and SHA-256 match freshly built app; installed binary self-test, light and dark UI assertions pass. Status reports a recent structured remote-tool receipt and `通道正常`; the legacy activity stdout is still unavailable, so idle confirmation and automatic recovery remain fail-closed.
+- [x] Historical LaunchAgent disabled flag persists. Installer now respects macOS's disabled override (previous bootstrap returned code 5) and opens Guard without silently enabling auto-start. Installed Guard currently runs as a LaunchServices app; no auto-start claim.
+- [ ] Human UI acceptance: check quota last successful sync, channel after a real command, 120-second stale fallback and panel layout; no paid active MCP probe needed.

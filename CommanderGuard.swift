@@ -128,7 +128,7 @@ final class HeadlessQuotaBrowser {
                     let lockFD = try Self.acquireProfile(profile)
                     var keepLock = false
                     defer { if !keepLock { flock(lockFD, LOCK_UN); close(lockFD) } }
-                    try Self.ensureNoBrowserLock(profile)
+                    try Self.ensureNoBrowserLock(profile, recoverStale: true)
                     if !Self.loginRequested(profile) { outcome = .loginRequired }
                     else {
                         if isCancelled() { throw Failure.cancelled }
@@ -206,7 +206,7 @@ final class HeadlessQuotaBrowser {
         let fd = try Self.acquireProfile(profile)
         var keepLock = false
         defer { if !keepLock { flock(fd, LOCK_UN); close(fd) } }
-        try Self.ensureNoBrowserLock(profile)
+        try Self.ensureNoBrowserLock(profile, recoverStale: true)
         let process = Process()
         process.executableURL = executable
         process.arguments = Self.arguments(profile: profile, headless: false)
@@ -315,10 +315,61 @@ final class HeadlessQuotaBrowser {
         guard flock(fd, LOCK_EX | LOCK_NB) == 0 else { close(fd); throw Failure.busy }
         return fd
     }
-    private static func ensureNoBrowserLock(_ profile: URL) throws {
+    // Chrome's SingletonLock can survive an OS crash or abrupt termination.
+    // Only our isolated profile, while its .commander-guard.lock flock is held,
+    // may recover a demonstrably orphaned *local* Chrome PID. Never touch an
+    // unknown, recent, foreign-host or live-process lock.
+    private static func lockHostIsLocal(_ host: String) -> Bool {
+        let name = ProcessInfo.processInfo.hostName.lowercased()
+        let label = host.lowercased()
+        if label == name || label == String(name.split(separator: ".").first ?? "") { return true }
+        var list: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&list) == 0, let list else { return false }
+        defer { freeifaddrs(list) }
+        var current: UnsafeMutablePointer<ifaddrs>? = list
+        while let item = current {
+            defer { current = item.pointee.ifa_next }
+            guard let addr = item.pointee.ifa_addr, addr.pointee.sa_family == sa_family_t(AF_INET) else { continue }
+            var ipv4 = UnsafeRawPointer(addr).assumingMemoryBound(to: sockaddr_in.self).pointee.sin_addr
+            var buffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+            let found = withUnsafePointer(to: &ipv4) { inet_ntop(AF_INET, $0, &buffer, socklen_t(buffer.count)) }
+            if found != nil && label == String(cString: buffer) { return true }
+        }
+        return false
+    }
+
+    private static func reclaimOrphanedBrowserLock(_ profile: URL, minimumAge: TimeInterval = 120) -> Bool {
+        let lock = profile.appendingPathComponent("SingletonLock")
+        var first = stat(), current = stat()
+        guard lstat(lock.path, &first) == 0,
+              (first.st_mode & S_IFMT) == S_IFLNK, first.st_uid == geteuid(),
+              Date().timeIntervalSince1970 - Double(first.st_mtimespec.tv_sec) >= minimumAge,
+              let target = try? FileManager.default.destinationOfSymbolicLink(atPath: lock.path),
+              let dash = target.lastIndex(of: "-"), dash != target.startIndex,
+              let pid = Int32(target[target.index(after: dash)...]), pid > 0,
+              let host = Optional(String(target[..<dash])),
+              host.range(of: #"^[A-Za-z0-9.:-]{1,128}$"#, options: .regularExpression) != nil,
+              lockHostIsLocal(host),
+              kill(pid, 0) == -1, errno == ESRCH,
+              lstat(lock.path, &current) == 0, current.st_dev == first.st_dev,
+              current.st_ino == first.st_ino, current.st_mode == first.st_mode,
+              current.st_uid == first.st_uid, current.st_mtimespec.tv_sec == first.st_mtimespec.tv_sec,
+              current.st_mtimespec.tv_nsec == first.st_mtimespec.tv_nsec,
+              (try? FileManager.default.destinationOfSymbolicLink(atPath: lock.path)) == target else { return false }
+        return unlink(lock.path) == 0
+    }
+
+    private static func ensureNoBrowserLock(_ profile: URL, recoverStale: Bool = false, minimumAge: TimeInterval = 120) throws {
         let lock = profile.appendingPathComponent("SingletonLock")
         var info = stat()
-        if lstat(lock.path, &info) == 0 { throw Failure.lockState }
+        if lstat(lock.path, &info) == 0 {
+            if recoverStale && reclaimOrphanedBrowserLock(profile, minimumAge: minimumAge) {
+                var after = stat()
+                guard lstat(lock.path, &after) == -1, errno == ENOENT else { throw Failure.lockState }
+                return
+            }
+            throw Failure.lockState
+        }
         guard errno == ENOENT else { throw Failure.lockState }
     }
     /// Called only for an owned child after termination, while its profile flock is held.
@@ -644,6 +695,10 @@ final class HeadlessQuotaBrowser {
         guard symlink("\(localHost)-\(exitedPID)", browserLock.path) == 0 else { throw Failure.profile }
         do { try ensureNoBrowserLock(scratch); preconditionFailure("stale browser lock accepted") } catch Failure.lockState {}
         guard (try? FileManager.default.destinationOfSymbolicLink(atPath: browserLock.path)) == "\(localHost)-\(exitedPID)" else { throw Failure.profile }
+        try ensureNoBrowserLock(scratch, recoverStale: true, minimumAge: 0)
+        var retiredInfo = stat()
+        guard lstat(browserLock.path, &retiredInfo) == -1, errno == ENOENT else { throw Failure.profile }
+        guard symlink("\(localHost)-\(exitedPID)", browserLock.path) == 0 else { throw Failure.profile }
         clearExitedOwnedBrowserLock(scratch, pid: getpid())
         guard (try? FileManager.default.destinationOfSymbolicLink(atPath: browserLock.path)) == "\(localHost)-\(exitedPID)" else { throw Failure.profile }
         clearExitedOwnedBrowserLock(scratch, pid: exitedPID)
@@ -1480,6 +1535,27 @@ func recentSuccessfulToolExecution(_ activity: ActivitySummary, now: Date, maxAg
     }.max()
 }
 
+// A structured tool receipt is evidence of the local Remote MCP channel,
+// even if the older stdout.log activity stream has disappeared. It does not
+// prove a started shell process has finished or that ChatGPT saw its result.
+func recentStructuredToolReceipt(_ history: ToolHistorySummary, now: Date, maxAge: TimeInterval = toolExecutionEvidenceTTL) -> Date? {
+    guard history.sourceAvailable else { return nil }
+    let deviceTools: Set<String> = [
+        "start_process", "read_process_output", "interact_with_process",
+        "read_file", "read_multiple_files", "write_file", "edit_block",
+        "list_directory", "list_processes", "get_config", "get_file_info",
+        "start_search", "get_more_search_results", "list_sessions"
+    ]
+    return history.recent.compactMap { record -> Date? in
+        guard deviceTools.contains(record.tool), record.returned, !record.failed,
+              let duration = record.duration, duration.isFinite,
+              duration >= 0, duration <= 120 else { return nil }
+        let completed = record.timestamp.addingTimeInterval(duration)
+        let age = now.timeIntervalSince(completed)
+        return age >= 0 && age <= maxAge ? completed : nil
+    }.max()
+}
+
 func toolExecutionFresh(_ snapshot: Snapshot, now: Date, maxAge: TimeInterval = toolExecutionEvidenceTTL) -> Bool {
     guard snapshot.toolExecutionState == "已验证", let checked = snapshot.toolExecutionChecked else { return false }
     let age = now.timeIntervalSince(checked)
@@ -1500,7 +1576,9 @@ func serviceRestartConfirmed(oldPID: Int32, newPID: Int32?, currentPID: Int32?, 
 }
 
 func recentChannelToolSuccess(_ snapshot: Snapshot, now: Date) -> Date? {
-    guard let success = recentSuccessfulToolExecution(snapshot.activity, now: now) else { return nil }
+    guard let success = [recentSuccessfulToolExecution(snapshot.activity, now: now),
+                         recentStructuredToolReceipt(snapshot.toolHistory, now: now)]
+        .compactMap({ $0 }).max() else { return nil }
     if let disconnectedAt = snapshot.channelDisconnectedAt, disconnectedAt > success { return nil }
     if snapshot.channelResolvedAt == nil, ["通道异常", "通道不可用", "恢复尚未确认"].contains(snapshot.channelState),
        let checked = snapshot.channelChecked, checked > success { return nil }
@@ -1539,7 +1617,9 @@ func channelSummary(_ snapshot: Snapshot, now: Date) -> String {
 
 func channelEvidenceDetail(_ snapshot: Snapshot, now: Date) -> String {
     if let success = recentChannelToolSuccess(snapshot, now: now) {
-        let evidence = "实际工具调用成功 \(displayEvidenceTime(success, now: now))"
+        let source = recentStructuredToolReceipt(snapshot.toolHistory, now: now).map { $0 == success } == true
+            ? "结构化工具历史：远程调用已返回" : "实际工具调用成功"
+        let evidence = "\(source) \(displayEvidenceTime(success, now: now))"
         return snapshot.channelDetail.contains("自动连接检查暂不可用") ? "\(evidence)；\(MCPChannelProbe.unsupportedMessage)" : evidence
     }
     if let disconnectedAt = snapshot.channelDisconnectedAt, disconnectedAt > (snapshot.channelResolvedAt ?? .distantPast) { return "最近明确观察到设备断连 \(displayEvidenceTime(disconnectedAt, now: now))" }
@@ -3694,6 +3774,17 @@ func selfTest() {
         precondition(channelSummary(displaySnapshot, now: now.addingTimeInterval(age)) == "通道待确认" && channelIndicator(service: displaySnapshot.service, state: displaySnapshot.channelState, checked: displaySnapshot.channelChecked, now: now.addingTimeInterval(age)) == "?")
     }
     displaySnapshot.channelChecked = nil
+    var newHistory = ToolHistorySummary()
+    newHistory.sourceAvailable = true
+    newHistory.recent = [ToolHistoryRecord(fingerprint: "receipt", timestamp: now.addingTimeInterval(-30),
+                                          tool: "start_process", duration: 0.2, returned: true, failed: false)]
+    displaySnapshot.toolHistory = newHistory
+    precondition(channelSummary(displaySnapshot, now: now) == "通道正常" &&
+                 channelEvidenceDetail(displaySnapshot, now: now).contains("结构化工具历史"),
+                 "Recent command receipts must show channel health without obsolete stdout.log")
+    precondition(channelSummary(displaySnapshot, now: now.addingTimeInterval(125)) == "通道待确认",
+                 "Historic command receipts must not remain green after expiry")
+    displaySnapshot.toolHistory = ToolHistorySummary()
     precondition(channelSummary(displaySnapshot, now: now) == "通道待确认" && channelEvidenceDetail(displaySnapshot, now: now) == "暂时无法确认连接状态，不代表已经断开")
     displaySnapshot.channelChecked = now.addingTimeInterval(1)
     precondition(channelSummary(displaySnapshot, now: now) == "通道待确认")
@@ -4005,6 +4096,17 @@ func selfTest() {
     precondition(historyReader.summary.sourceAvailable && historyReader.summary.recent.count == 2 && !historyReader.summary.coverageGap)
     precondition(historyReader.summary.latest?.tool == "read_file" && historyReader.summary.latest?.duration == 0.025 && historyReader.summary.latest?.resultLabel == "工具调用已返回")
     precondition(historyReader.summary.recent.first(where: { $0.tool == "start_process" })?.processCaveat == "调用已返回；后台进程仍可能运行")
+    let localReceipt = recentStructuredToolReceipt(historyReader.summary, now: ISO8601DateFormatter.parse(secondHistoryTime)!.addingTimeInterval(1))!
+    precondition(abs(localReceipt.timeIntervalSince(ISO8601DateFormatter.parse(firstHistoryTime)!.addingTimeInterval(1.5))) < 0.01)
+    precondition(recentStructuredToolReceipt(historyReader.summary, now: localReceipt.addingTimeInterval(121)) == nil)
+    var failedHistory = ToolHistorySummary()
+    failedHistory.sourceAvailable = true
+    failedHistory.recent = [ToolHistoryRecord(fingerprint: "bad", timestamp: now, tool: "start_process",
+                                            duration: 0.2, returned: true, failed: true)]
+    precondition(recentStructuredToolReceipt(failedHistory, now: now.addingTimeInterval(1)) == nil)
+    failedHistory.recent = [ToolHistoryRecord(fingerprint: "registry", timestamp: now, tool: "list_devices",
+                                             duration: 0.2, returned: true, failed: false)]
+    precondition(recentStructuredToolReceipt(failedHistory, now: now.addingTimeInterval(1)) == nil)
     let partialLine = historyLine(time: "2026-10-05T01:02:05.000Z", tool: "list_directory", duration: 7).dropLast()
     let partialHandle = try! FileHandle(forWritingTo: historyFile); try! partialHandle.seekToEnd(); try! partialHandle.write(contentsOf: partialLine); try! partialHandle.close()
     historyReader.poll(); precondition(historyReader.summary.recent.count == 2)
@@ -5001,11 +5103,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSp
         render()
     }
     private func refreshToolExecutionFromActivity(_ activity: ActivitySummary, now: Date = Date()) {
-        guard let evidence = recentSuccessfulToolExecution(activity, now: now) else { return }
+        let legacy = recentSuccessfulToolExecution(activity, now: now)
+        let structured = recentStructuredToolReceipt(snapshot.toolHistory, now: now)
+        guard let evidence = [legacy, structured].compactMap({ $0 }).max() else { return }
         if snapshot.channelResolvedAt.map({ evidence > $0 }) ?? true { snapshot.channelResolvedAt = evidence }
         guard snapshot.toolExecutionChecked.map({ evidence > $0 }) ?? true else { return }
         snapshot.toolExecutionState = "已验证"
-        snapshot.toolExecutionDetail = "复用最近真实工具调用成功记录"
+        snapshot.toolExecutionDetail = evidence == structured
+            ? "结构化历史：远程工具已返回；不等于后台命令执行完成"
+            : "复用最近真实工具调用成功记录"
         snapshot.toolExecutionChecked = evidence
         toolProbeDeferredReason = "无需额外探测"
     }

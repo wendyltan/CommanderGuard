@@ -52,5 +52,14 @@ cat > "$PLIST" <<PLIST
 <key>StandardErrorPath</key><string>$HOME/Library/Logs/CommanderGuard/stderr.log</string>
 </dict></plist>
 PLIST
-launchctl bootstrap "gui/$(id -u)" "$PLIST"
-echo "Installed CommanderGuard. Existing Remote Desktop Commander service was not changed."
+# Respect an existing launchd disabled override. macOS returns bootstrap
+# error 5 for disabled labels; never silently overwrite the user's preference.
+# In that case launch this app once for the current login session.
+if launchctl print-disabled "gui/$(id -u)" 2>/dev/null | grep -Fq '"com.wuwendi.commander-guard" => disabled'; then
+  /usr/bin/open -a "$APP"
+  echo "CommanderGuard installed and opened. Existing disabled LaunchAgent preference was preserved."
+else
+  launchctl bootstrap "gui/$(id -u)" "$PLIST"
+  echo "CommanderGuard installed and registered with launchd."
+fi
+echo "Existing Remote Desktop Commander service was not changed."
