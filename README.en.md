@@ -8,24 +8,44 @@
 
 <p align="center"><a href="README.md">中文</a> · English</p>
 
-Your device shows as online, but remote tools fail to run. CommanderGuard observes the message channel and local tool execution separately. Active cloud probes are OFF by default to avoid continuously sending potentially metered tool requests while idle. It also observes some ChatGPT App connection events and can show your Desktop Commander cloud tool calls usage.
+<p align="center">
+  <a href="#what-it-does">What it does</a> ·
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#everyday-use">Everyday use</a> ·
+  <a href="#troubleshooting">Troubleshooting</a> ·
+  <a href="#when-automatic-recovery-runs">Automatic recovery</a> ·
+  <a href="#data-and-privacy">Data and privacy</a>
+</p>
+
+---
+
+Your device shows as online, but remote tools fail to run. CommanderGuard observes the **message channel**, **local tool execution**, and **ChatGPT connection events** separately, presenting evidence per layer. It can also display your Desktop Commander cloud tool calls usage in the overview.
 
 This project is for macOS users who already use [Remote Desktop Commander](https://github.com/desktop-commander/remote-desktop-commander). The app UI is currently in Chinese. Automatic recovery depends on a specific local service and log layout; check the compatibility requirements below before installing.
 
+> [!IMPORTANT]
+> Active cloud probes are OFF by default to avoid continuously sending potentially metered tool requests while idle. **A successful check establishes the state of that layer only**: device registration, a successful `ping`, a returned local tool call, and a complete ChatGPT answer each need their own evidence. Guard does not resend chat messages or retry business tasks.
+
 ## What it does
+
+```mermaid
+flowchart LR
+    DEV["Device registration<br/>device.json"] -->|"does not prove channel"| CH["Message channel layer<br/>Structured history / optional ping"]
+    CH -->|"does not prove execution"| TOOL["Local tool execution layer<br/>Local logs / tool-history"]
+    TOOL -->|"does not prove full reply"| CHAT["ChatGPT observation layer<br/>Desktop App stream & resume logs"]
+    CH -.->|"3 explicit disconnects + idle + cooldown"| REC["Automatic recovery / one-time consent restart"]
+```
 
 | Feature | What you can see or do |
 |---|---|
-| Live status | Menu bar icon and text show channel status; the panel tracks the message channel, tool execution, and ChatGPT answer state separately |
-| Optional active probes | OFF by default; choose a device `ping` every 5, 10, 15, or 30 minutes, or 1, 2, 3, or 6 hours; all entry points share that interval |
-| Automatic recovery | After repeated explicit disconnects, checks tasks, logs, processes, and cooldown before deciding whether to restart the managed Commander service |
-| One-time restart | Review interruption impact and authorize one restart of the managed service; recurring settings remain unchanged |
-| Activity records | Up to 100 recent local calls, with search, filters, redacted details, and anonymous session attribution when reliable upstream metadata exists |
-| Cloud usage | Uses the official usage page in Chrome to display used, included, and remaining calls, progress, and the last successful sync time |
-| ChatGPT observation | Reads local logs for some stream, resume, and update-connection events, separating current status from past incidents |
-| Keep awake | Can prevent idle system sleep while the Commander service is running |
-
-A successful check establishes the state of that layer only. Device registration, a successful `ping`, a returned local tool call, and a complete ChatGPT answer each need their own evidence. Guard does not resend chat messages or retry business tasks.
+| **Live status** | Menu bar icon and text show channel status; the panel tracks the message channel, tool execution, and ChatGPT answer state separately |
+| **Optional active probes** | OFF by default; choose a device `ping` every 5, 10, 15, or 30 minutes, or 1, 2, 3, or 6 hours; all entry points share that interval |
+| **Automatic recovery** | After repeated explicit disconnects, checks tasks, logs, processes, and cooldown before deciding whether to restart the managed Commander service |
+| **One-time restart** | Review interruption impact and authorize one restart of the managed service; recurring settings remain unchanged |
+| **Activity records** | Up to 100 recent local calls, with search, filters, redacted details, and anonymous session attribution when reliable upstream metadata exists |
+| **Cloud usage** | Uses the official usage page in Chrome to display used, included, and remaining calls, progress, and the last successful sync time |
+| **ChatGPT observation** | Reads local logs for some stream, resume, and update-connection events, separating current status from past incidents |
+| **Keep awake** | Can prevent idle system sleep while the Commander service is running |
 
 ## Quick start
 
@@ -33,7 +53,7 @@ A successful check establishes the state of that layer only. Device registration
 
 You need macOS, a working Swift compiler, and an installed, signed-in, paired Remote Desktop Commander. The build uses the system AppKit and IOKit frameworks without additional Swift package dependencies. Install Xcode Command Line Tools if you do not have the compiler.
 
-The current version expects the following layout. There are no settings for custom paths or service labels yet:
+The current version expects the following layout (there are no settings for custom paths or service labels yet):
 
 | Item | Expected location |
 |---|---|
@@ -70,7 +90,11 @@ OFF blocks new `tools/call` requests and pauses automatic recovery. Submitted re
 
 ### Optional: use the existing installer
 
-**`install.sh` is currently tied to a maintainer-specific deployment layout and is not a general-purpose installer. For other environments, use the source build above; do not run this script unchanged.**
+> [!WARNING]
+> **`install.sh` is currently tied to a maintainer-specific deployment layout and is not a general-purpose installer. For other environments, use the source build above; do not run this script unchanged.**
+
+<details>
+<summary>Details for environments matching the maintainer layout</summary>
 
 Once your setup matches that layout, run:
 
@@ -80,16 +104,18 @@ Once your setup matches that layout, run:
 
 The script builds the app, installs it to `~/Applications/CommanderGuard.app`, creates a desktop shortcut and login LaunchAgent, and restarts CommanderGuard. Before replacing the installed app, it sends TERM to CommanderGuard processes at that exact install path and waits up to 10 seconds; if one is still running, installation stops without overwriting the app. Preferences and the dedicated Chrome sign-in profile are preserved. Installation does not restart or modify Remote Desktop Commander. Once Guard starts, its recovery toggle and safety checks determine whether automatic recovery can run. The login LaunchAgent attempts to relaunch Guard after an unsuccessful exit; a normal quit does not trigger relaunch. The installer preserves an existing macOS disabled LaunchAgent override and opens Guard for the current session without silently re-enabling login startup.
 
+</details>
+
 ## Everyday use
 
 The compact menu bar overview shows the three status layers, local activity and account summary, with entries for the full panel and “恢复与重启…” (Recovery and restart). The resizable full panel uses sidebar navigation for Overview, Activity records, Incidents and recovery, and Settings, supporting system light and dark appearance. Overview uses a concise summary and three verification rows, with results and check times stacked on the right. Local activity and usage stay compact. Expand “查看证据与限制” (Evidence and limits) for the full diagnosis and evidence; other pages show relevant content only. Persistent controls and account management live in Settings. Important times include both the clock time and the age of the evidence.
 
 | Page | What to look for |
 |---|---|
-| 概览 (Overview) | The conclusion and next step; separate channel, tool and ChatGPT evidence with times; local activity, recovery deferral reason and a usage summary |
-| 操作记录 (Activity) | The table shows time, action and result; duration and anonymous session attribution appear in the selected detail, retaining stable session colors. `ping` is hidden by default; older records with unknown times can be expanded separately. Search, filters and the independently scrollable, adjustable detail region remain available |
-| 故障与恢复 (Incidents and recovery) | Diagnosis and guidance first, then incident and recovery evidence; local recovery follows the explanation and retains impact checks and per-attempt confirmation |
-| 设置 (Settings) | Grouped switches show probe permission, automatic recovery permission and effective state, and keep-awake status. “更多选项” (More options) provides interval, manual ping and account sign-in/refresh/pause controls; account and sync status form their own group |
+| **概览 (Overview)** | The conclusion and next step; separate channel, tool and ChatGPT evidence with times; local activity, recovery deferral reason and a usage summary |
+| **操作记录 (Activity)** | The table shows time, action and result; duration and anonymous session attribution appear in the selected detail, retaining stable session colors. `ping` is hidden by default; older records with unknown times can be expanded separately. Search, filters and the independently scrollable, adjustable detail region remain available |
+| **故障与恢复 (Incidents and recovery)** | Diagnosis and guidance first, then incident and recovery evidence; local recovery follows the explanation and retains impact checks and per-attempt confirmation |
+| **设置 (Settings)** | Grouped switches show probe permission, automatic recovery permission and effective state, and keep-awake status. “更多选项” (More options) provides interval, manual ping and account sign-in/refresh/pause controls; account and sync status form their own group |
 
 The menu bar keeps updating a short status. Guard now observes both explicit execution successes from the legacy local activity log and recent remote-tool receipts in Desktop Commander's structured history. A verified receipt within 120 seconds can show “通道正常” (channel normal), with its source and time. A tool receipt does not establish that a background process or the original ChatGPT task completed. An inconclusive connection check does not override that recent success, but a newer explicit disconnect, a stopped service, and active incidents still take precedence. Without valid success evidence, “通道待确认” (channel awaiting confirmation) does not mean the device is disconnected. Successful `ping` checks retain their own short validity window; stale checks remain historical evidence only. Waiting for the next check is not a new failure.
 
@@ -113,7 +139,8 @@ The dedicated browser has its own sign-in profile. It cannot reuse your everyday
 
 “暂停” (pause) stops future requests and cancels an active usage read without signing out. Unlimited Pro plans have no finite progress bar. Temporary failures retain the last successful values and actual sync time. The stale threshold follows the selected interval, with a minimum of fifteen minutes. Expired authentication requires signing in again.
 
-The usage endpoint is the read-only interface currently used by the official website, rather than a guaranteed public API. Website changes may break syncing. See the [official Chrome Headless guide](https://developer.chrome.com/docs/automation-and-testing/headless) for its window-free mode.
+> [!NOTE]
+> The usage endpoint is the read-only interface currently used by the official website, rather than a guaranteed public API. Website changes may break syncing. See the [official Chrome Headless guide](https://developer.chrome.com/docs/automation-and-testing/headless) for its window-free mode.
 
 ## Troubleshooting
 
@@ -188,7 +215,6 @@ State files live in `~/Library/Application Support/CommanderGuard/`:
 | File | Contents |
 |---|---|
 | `status.json` | Service, channel, tool execution, call state, and optional usage summary |
-
 | `timeline.jsonl` | Redacted events, capped at 1 MiB with one rotated copy |
 | `channel-incident.json` | Current and recent channel categories, timestamps, backoff, and recovery state |
 | `channel-decisions.jsonl` | Probe and recovery decisions, capped at 512 KiB with one rotated copy |
